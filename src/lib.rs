@@ -1,14 +1,19 @@
-use either::Either::{self, Left};
 use fetch_data::hash_download;
 use miette::{IntoDiagnostic, miette};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use serde_yaml::from_str;
-use walkdir::WalkDir;
-use std::{collections::HashMap, env::temp_dir, fs::{create_dir_all, read_to_string}, path::PathBuf, process::Command};
+use std::{
+    collections::HashMap,
+    env::temp_dir,
+    fs::{copy, create_dir_all, read_to_string},
+    path::PathBuf,
+    process::Command,
+};
 use tracing::info;
 use url::Url;
-#[derive(Serialize, Deserialize)]
+use walkdir::WalkDir;
+#[derive(Serialize, Deserialize, Default)]
 pub struct ConfigFile {
     name: String,
     version: Vec<String>,
@@ -22,17 +27,28 @@ impl ConfigFile {
     }
     pub fn run(&self) -> miette::Result<()> {
         info!("Resolving dependencies.");
-        let dep = self.dependencies.par_iter().map(|dep| -> miette::Result<String> {
-            let loaded = Self::load(dep.to_path_buf())?;
-            if loaded.name == self.name {
-                return Err(miette!("Recursive dependencies are not allowed"))
-            }
-            loaded.run()?;
-            Ok(loaded.name)
-        });
+        let dep = if !self.dependencies.is_empty() {
+            self.dependencies
+                .par_iter()
+                .map(|dep| -> miette::Result<String> {
+                    let loaded = Self::load(dep.to_path_buf())?;
+                    if loaded.name == self.name {
+                        return Err(miette!("Recursive dependencies are not allowed."));
+                    }
+                    loaded.run()?;
+                    Ok(loaded.name)
+                })
+        } else {};
         info!("Making package {}", self.name);
-        create_dir_all(temp_dir().join(&self.name)).into_diagnostic()?;
-        dep.try_for_each(|dep|);
+        let path = temp_dir().join(&self.name);
+        create_dir_all(path.join("deps")).into_diagnostic()?;
+        if !self.dependencies.is_empty() {
+            dep.try_for_each(move |dep| -> miette::Result<()> {
+                copy(temp_dir().join(dep?), path.join("deps").join(dep?.clone()))
+                    .into_diagnostic()?;
+                Ok(())
+            });
+        }
         Ok(())
     }
 }
@@ -47,20 +63,14 @@ impl Metadata {
         Ok(Self {
             name: dir.file_name().unwrap().display().to_string(),
             version,
-            dependencies: WalkDir::new(dir).into_iter().map(|item| item.unwrap().into_path()).collect()
+            dependencies: WalkDir::new(dir)
+                .into_iter()
+                .map(|item| item.unwrap().into_path())
+                .collect(),
         })
     }
 }
-impl Default for ConfigFile {
-    fn default() -> Self {
-        Self {
-            dependencies: Left(vec![]),
-            name: "".to_string(),
-            version: vec![],
-            steps: vec![],
-        }
-    }
-}
+
 #[derive(Serialize, Deserialize, Default)]
 pub struct Step {
     stage: Stage,
