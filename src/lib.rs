@@ -3,15 +3,53 @@ use fetch_data::hash_download;
 use miette::{IntoDiagnostic, miette};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
-use std::{collections::HashMap, env::temp_dir, path::PathBuf, process::Command};
+use serde_yaml::from_str;
+use walkdir::WalkDir;
+use std::{collections::HashMap, env::temp_dir, fs::{create_dir_all, read_to_string}, path::PathBuf, process::Command};
 use tracing::info;
 use url::Url;
 #[derive(Serialize, Deserialize)]
 pub struct ConfigFile {
     name: String,
     version: Vec<String>,
-    dependencies: Either<Vec<PathBuf>, Vec<Url>>,
+    dependencies: Vec<PathBuf>,
     steps: Vec<Step>,
+}
+impl ConfigFile {
+    fn load(path: PathBuf) -> miette::Result<Self> {
+        let config_file = from_str(&read_to_string(path).into_diagnostic()?).into_diagnostic()?;
+        Ok(config_file)
+    }
+    pub fn run(&self) -> miette::Result<()> {
+        info!("Resolving dependencies.");
+        let dep = self.dependencies.par_iter().map(|dep| -> miette::Result<String> {
+            let loaded = Self::load(dep.to_path_buf())?;
+            if loaded.name == self.name {
+                return Err(miette!("Recursive dependencies are not allowed"))
+            }
+            loaded.run()?;
+            Ok(loaded.name)
+        });
+        info!("Making package {}", self.name);
+        create_dir_all(temp_dir().join(&self.name)).into_diagnostic()?;
+        dep.try_for_each(|dep|);
+        Ok(())
+    }
+}
+#[derive(Serialize, Deserialize)]
+pub struct Metadata {
+    name: String,
+    version: Vec<String>,
+    dependencies: Vec<PathBuf>,
+}
+impl Metadata {
+    fn create(dir: PathBuf, version: Vec<String>) -> miette::Result<Self> {
+        Ok(Self {
+            name: dir.file_name().unwrap().display().to_string(),
+            version,
+            dependencies: WalkDir::new(dir).into_iter().map(|item| item.unwrap().into_path()).collect()
+        })
+    }
 }
 impl Default for ConfigFile {
     fn default() -> Self {
