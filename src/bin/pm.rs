@@ -5,13 +5,13 @@ use pm::ConfigFile;
 use serde_yaml::from_str;
 #[derive(Parser)]
 #[clap(name = "pm", version, about = "A package manager")]
-struct CLI {
+struct Arge {
     #[arg(short, long)]
     build: Option<PathBuf>
 }
 
 fn main() -> miette::Result<()> {
-    let args = CLI::parse();
+    let args = Arge::parse();
     if let Some(build) = args.build {
         let cfg_file = from_str::<ConfigFile>(&read_to_string(build).into_diagnostic()?).into_diagnostic()?;
         cfg_file.run()?;

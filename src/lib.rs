@@ -67,7 +67,7 @@ impl ConfigFile {
         if !self.steps.is_empty() {
             self.steps
                 .iter()
-                .try_for_each(|step| -> miette::Result<()> { step.execute() })?;
+                .try_for_each(|step| -> miette::Result<()> { step.execute(&self.name) })?;
         }
         write(
             path.join("metadata"),
