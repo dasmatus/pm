@@ -7,7 +7,7 @@ use std::{
     collections::HashMap,
     env::temp_dir,
     fs::{copy, create_dir_all, read_to_string},
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::Command,
 };
 use tracing::info;
@@ -27,27 +27,28 @@ impl ConfigFile {
     }
     pub fn run(&self) -> miette::Result<()> {
         info!("Resolving dependencies.");
-        let dep = if !self.dependencies.is_empty() {
-            self.dependencies
-                .par_iter()
-                .map(|dep| -> miette::Result<String> {
+        self.dependencies
+            .par_iter()
+            .try_for_each(|dep| -> miette::Result<()> {
+                if !self.dependencies.is_empty() {
                     let loaded = Self::load(dep.to_path_buf())?;
                     if loaded.name == self.name {
                         return Err(miette!("Recursive dependencies are not allowed."));
                     }
                     loaded.run()?;
-                    Ok(loaded.name)
-                })
-        } else {};
-        info!("Making package {}", self.name);
+                }
+                Ok(())
+            })?;
+        info!("Making package {}, version {:?}", self.name, self.version);
         let path = temp_dir().join(&self.name);
         create_dir_all(path.join("deps")).into_diagnostic()?;
         if !self.dependencies.is_empty() {
-            dep.try_for_each(move |dep| -> miette::Result<()> {
-                copy(temp_dir().join(dep?), path.join("deps").join(dep?.clone()))
-                    .into_diagnostic()?;
-                Ok(())
-            });
+            self.dependencies
+                .par_iter()
+                .try_for_each(move |dep| -> miette::Result<()> {
+                    copy(temp_dir().join(dep), path.join("deps").join(dep)).into_diagnostic()?;
+                    Ok(())
+                })?;
         }
         Ok(())
     }
@@ -63,7 +64,7 @@ impl Metadata {
         Ok(Self {
             name: dir.file_name().unwrap().display().to_string(),
             version,
-            dependencies: WalkDir::new(dir)
+            dependencies: WalkDir::new(dir.join("deps"))
                 .into_iter()
                 .map(|item| item.unwrap().into_path())
                 .collect(),
@@ -93,6 +94,7 @@ impl Step {
                     if hash != *sha256 {
                         return Err(miette!("Invalid hash: expected {hash}, found {sha256}"));
                     }
+                    info!("{url} downloaded.");
                     Ok(())
                 })
         } else {
