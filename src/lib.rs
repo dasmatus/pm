@@ -2,11 +2,11 @@ use fetch_data::hash_download;
 use miette::{IntoDiagnostic, miette};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
-use serde_yaml::from_str;
+use serde_yaml::{from_str, to_string};
 use std::{
     collections::HashMap,
     env::temp_dir,
-    fs::{copy, create_dir_all, read_to_string},
+    fs::{copy, create_dir_all, read_to_string, rename, write},
     path::{Path, PathBuf},
     process::Command,
 };
@@ -25,12 +25,26 @@ impl ConfigFile {
         let config_file = from_str(&read_to_string(path).into_diagnostic()?).into_diagnostic()?;
         Ok(config_file)
     }
+    fn package(&self) -> miette::Result<PathBuf> {
+        info!("Packaging {}", self.name);
+        let polish = temp_dir().join(format!("{}.tar.xz", self.name));
+        Command::new("tar")
+            .arg("-Czvf")
+            .arg(&polish)
+            .arg(temp_dir().join(&self.name))
+            .status()
+            .unwrap();
+        rename(polish, temp_dir().join(format!("{}.cpkg", self.name))).into_diagnostic()?;
+        Ok(temp_dir()
+            .join(format!("/tmp/{}.cpkg", self.name))
+            .to_path_buf())
+    }
     pub fn run(&self) -> miette::Result<()> {
         info!("Resolving dependencies.");
         self.dependencies
             .par_iter()
             .try_for_each(|dep| -> miette::Result<()> {
-                if !self.dependencies.is_empty() {
+                if !self.dependencies.is_empty() && !temp_dir().join(dep).exists() {
                     let loaded = Self::load(dep.to_path_buf())?;
                     if loaded.name == self.name {
                         return Err(miette!("Recursive dependencies are not allowed."));
@@ -45,12 +59,38 @@ impl ConfigFile {
         if !self.dependencies.is_empty() {
             self.dependencies
                 .par_iter()
-                .try_for_each(move |dep| -> miette::Result<()> {
+                .try_for_each(|dep| -> miette::Result<()> {
                     copy(temp_dir().join(dep), path.join("deps").join(dep)).into_diagnostic()?;
                     Ok(())
                 })?;
         }
+        if !self.steps.is_empty() {
+            self.steps
+                .iter()
+                .try_for_each(|step| -> miette::Result<()> { step.execute() })?;
+        }
+        write(
+            path.join("metadata"),
+            to_string::<Metadata>(&Metadata::create(path, self.version.clone()).unwrap())
+                .into_diagnostic()?,
+        )
+        .into_diagnostic()?;
+        if !self
+            .dependencies
+            .contains(&Path::new(&self.name).to_path_buf())
+        {
+            let pkg = self.package()?;
+            info!("DONE, located at {}", pkg.display())
+        }
+
         Ok(())
+    }
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn dependencies(&self) -> &[PathBuf] {
+        &self.dependencies
     }
 }
 #[derive(Serialize, Deserialize)]
@@ -81,7 +121,7 @@ pub struct Step {
 }
 
 impl Step {
-    fn execute(&self) -> miette::Result<()> {
+    fn execute(&self, name: &str) -> miette::Result<()> {
         if let Some(url_sha256s) = &self.dl_urls {
             url_sha256s
                 .par_iter()
@@ -105,6 +145,7 @@ impl Step {
                     let split: Vec<String> = cmd.split_whitespace().map(|it| it.into()).collect();
                     Command::new(split[0].clone())
                         .args(split[1..split.len()].to_vec())
+                        .env("DESTDIR", temp_dir().join(name).join("pkg"))
                         .status()
                         .into_diagnostic()?;
                     Ok(())
