@@ -1,8 +1,9 @@
-use std::{collections::HashMap, env::temp_dir, process::Command};
+use std::{collections::HashMap,  process::Command};
 
 use fetch_data::hash_download;
 use miette::{miette, IntoDiagnostic};
 use serde::{Deserialize, Serialize};
+use tempfile::TempDir;
 use tracing::info;
 use url::Url;
 use rayon::prelude::*;
@@ -16,13 +17,15 @@ pub struct Step {
 
 impl Step {
     pub(crate) fn execute(&self, name: &str) -> miette::Result<()> {
+        let tmpdir = TempDir::new().into_diagnostic()?;
+        let tmpdir = tmpdir.path();
         if let Some(url_sha256s) = &self.dl_urls {
             url_sha256s
                 .par_iter()
                 .try_for_each(|(url, sha256)| -> miette::Result<()> {
                     let hash = hash_download(
                         url,
-                        temp_dir().join(url.to_file_path().unwrap().file_name().unwrap()),
+                        tmpdir.join(url.to_file_path().unwrap().file_name().unwrap()),
                     )
                     .into_diagnostic()?;
                     if hash != *sha256 {
@@ -42,7 +45,7 @@ impl Step {
                         .collect();
                     Command::new(split[0].clone())
                         .args(split[1..split.len()].to_vec())
-                        .env("DESTDIR", temp_dir().join(name).join("pkg"))
+                        .env("DESTDIR", tmpdir.join(name).join("pkg"))
                         .status()
                         .into_diagnostic()?;
                     Ok(())
