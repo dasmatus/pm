@@ -1,12 +1,12 @@
-use std::{collections::HashMap,  process::Command};
+use std::{collections::HashMap, process::Command};
 
 use fetch_data::hash_download;
-use miette::{miette, IntoDiagnostic};
+use miette::{IntoDiagnostic, miette};
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use tempfile::TempDir;
 use tracing::info;
 use url::Url;
-use rayon::prelude::*;
 #[derive(Serialize, Deserialize, Default)]
 pub struct Step {
     stage: Stage,

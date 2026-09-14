@@ -1,18 +1,24 @@
 use std::{
-    
     fs::{copy, create_dir_all, read_to_string, rename},
     path::{Path, PathBuf},
     process::Command,
 };
 
-use crate::{step::Step, metadata::Metadata};
+use crate::{
+    metadata::{
+        LibraryType::{Dynamic, Static},
+        Metadata, Type,
+    },
+    step::Step,
+};
 use miette::{IntoDiagnostic, miette};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use serde_yaml::{from_str, to_string};
-use tempfile::{TempDir, env::temp_dir};
 use std::fs::write;
+use tempfile::{TempDir, env::temp_dir};
 use tracing::info;
+use walkdir::WalkDir;
 
 #[derive(Serialize, Deserialize, Default)]
 pub struct ConfigFile {
@@ -72,10 +78,29 @@ impl ConfigFile {
                 .iter()
                 .try_for_each(|step| -> miette::Result<()> { step.execute(&self.name) })?;
         }
+        // collect files
+        let files_type = WalkDir::new(&path)
+            .into_iter()
+            .map(|item| -> (PathBuf, Type) {
+                let path1 = item.unwrap().into_path();
+                let mut r#type = Type::Binary;
+                if path1.metadata().unwrap().is_file() {
+                    let fext = path1.extension().unwrap();
+                    if fext.eq("so") {
+                        r#type = Type::Library(Dynamic)
+                    } else if fext.eq("a") {
+                        r#type = Type::Library(Static)
+                    }
+                }
+                (path1, r#type)
+            })
+            .collect();
         write(
             path.join("metadata"),
-            to_string::<Metadata>(&Metadata::create(path, self.version.clone()).unwrap())
-                .into_diagnostic()?,
+            to_string::<Metadata>(
+                &Metadata::create(path, self.version.clone(), files_type).unwrap(),
+            )
+            .into_diagnostic()?,
         )
         .into_diagnostic()?;
         if !self
