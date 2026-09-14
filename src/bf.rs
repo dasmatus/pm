@@ -13,7 +13,6 @@ use miette::{IntoDiagnostic, miette};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use serde_yaml::{from_str, to_string};
-use url::Url;
 use std::fs::write;
 use tempfile::{TempDir, env::temp_dir};
 use tracing::info;
