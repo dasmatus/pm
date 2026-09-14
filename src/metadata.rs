@@ -1,7 +1,4 @@
-use std::{
-    collections::HashMap,
-    path::PathBuf,
-};
+use std::{collections::HashMap, path::PathBuf};
 
 use serde::{Deserialize, Serialize};
 use walkdir::WalkDir;

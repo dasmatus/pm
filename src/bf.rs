@@ -1,5 +1,8 @@
 use std::{
-    collections::HashMap, fs::{copy, create_dir_all, read_to_string, rename}, path::{Path, PathBuf}, process::Command
+    collections::HashMap,
+    fs::{copy, create_dir_all, read_to_string, rename},
+    path::{Path, PathBuf},
+    process::Command,
 };
 
 use crate::{
@@ -26,6 +29,7 @@ pub struct ConfigFile {
     steps: Vec<Step>,
 }
 impl ConfigFile {
+    #[must_use]
     pub fn generate() -> Self {
         Self {
             name: "example".into(),
@@ -34,24 +38,29 @@ impl ConfigFile {
             steps: [Step {
                 stage: crate::step::Stage::Prepare,
                 dl_urls: Some(HashMap::new()),
-                name: "".to_string(),
-                run: vec![]
-            }].to_vec()
+                name: String::new(),
+                run: vec![],
+            }]
+            .to_vec(),
         }
     }
     fn load(path: PathBuf) -> miette::Result<Self> {
         let config_file = from_str(&read_to_string(path).into_diagnostic()?).into_diagnostic()?;
         Ok(config_file)
     }
+
+// todo: make a package for analyzing source code and binaries using strace so that we can add more [`Metadata`] about the package's permissions to it.
+    
     fn package(&self) -> miette::Result<PathBuf> {
         info!("Packaging {}", self.name);
         let tmpdir = TempDir::new().into_diagnostic()?;
         let tmpdir = tmpdir.path();
         let polish = tmpdir.join(format!("{}.tar.xz", self.name));
         Command::new("tar")
-            .arg("-Czvf")
-            .arg(&polish)
+            .arg("-czvf")
             .arg(tmpdir.join(&self.name))
+            .arg("-C")
+            .arg(&polish)
             .status()
             .unwrap();
         rename(polish, tmpdir.join(format!("{}.cpkg", self.name))).into_diagnostic()?;
@@ -98,9 +107,9 @@ impl ConfigFile {
                 if path1.metadata().unwrap().is_file() {
                     let fext = path1.extension().unwrap();
                     if fext.eq("so") {
-                        r#type = Type::Library(Dynamic)
+                        r#type = Type::Library(Dynamic);
                     } else if fext.eq("a") {
-                        r#type = Type::Library(Static)
+                        r#type = Type::Library(Static);
                     }
                 }
                 (path1, r#type)

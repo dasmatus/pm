@@ -1,5 +1,5 @@
 use clap::Parser;
-use miette::IntoDiagnostic;
+use miette::{IntoDiagnostic, miette};
 use pm::{bf::ConfigFile, run::PackageRunner};
 use serde_yaml::{from_str, to_string};
 use std::{
@@ -22,9 +22,13 @@ fn main() -> miette::Result<()> {
     let args = Arge::parse();
     fmt().without_time().init();
     if let Some(build) = args.build {
-        let cfg_file =
-            from_str::<ConfigFile>(&read_to_string(build).into_diagnostic()?).into_diagnostic()?;
-        cfg_file.run()?;
+        if build.exists() {
+            let cfg_file =
+                from_str::<ConfigFile>(&read_to_string(&build).into_diagnostic()?).into_diagnostic()?;
+            cfg_file.run()?;
+        } else {
+            return Err(miette!("The path {} does not exist.", build.display()))
+        }
     } else if let Some(generate) = args.generate {
         write(
             generate,
