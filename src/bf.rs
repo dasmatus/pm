@@ -1,7 +1,5 @@
 use std::{
-    fs::{copy, create_dir_all, read_to_string, rename},
-    path::{Path, PathBuf},
-    process::Command,
+    collections::HashMap, fs::{copy, create_dir_all, read_to_string, rename}, path::{Path, PathBuf}, process::Command
 };
 
 use crate::{
@@ -15,6 +13,7 @@ use miette::{IntoDiagnostic, miette};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use serde_yaml::{from_str, to_string};
+use url::Url;
 use std::fs::write;
 use tempfile::{TempDir, env::temp_dir};
 use tracing::info;
@@ -28,6 +27,19 @@ pub struct ConfigFile {
     steps: Vec<Step>,
 }
 impl ConfigFile {
+    pub fn generate() -> Self {
+        Self {
+            name: "example".into(),
+            version: ["0".into(), "1".into(), "0".into()].to_vec(),
+            dependencies: [Path::new("/tmp").to_path_buf()].to_vec(),
+            steps: [Step {
+                stage: crate::step::Stage::Prepare,
+                dl_urls: Some(HashMap::new()),
+                name: "".to_string(),
+                run: vec![]
+            }].to_vec()
+        }
+    }
     fn load(path: PathBuf) -> miette::Result<Self> {
         let config_file = from_str(&read_to_string(path).into_diagnostic()?).into_diagnostic()?;
         Ok(config_file)
@@ -95,6 +107,7 @@ impl ConfigFile {
                 (path1, r#type)
             })
             .collect();
+        info!("Finishing up.");
         write(
             path.join("metadata"),
             to_string::<Metadata>(

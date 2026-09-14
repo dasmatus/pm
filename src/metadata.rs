@@ -13,12 +13,12 @@ pub struct Metadata {
     dependencies: Vec<PathBuf>,
     entrypoints: HashMap<PathBuf, Type>,
 }
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Type {
     Binary,
     Library(LibraryType),
 }
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 pub enum LibraryType {
     Static,
     Dynamic,

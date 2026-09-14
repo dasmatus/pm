@@ -7,12 +7,12 @@ use serde::{Deserialize, Serialize};
 use tempfile::TempDir;
 use tracing::info;
 use url::Url;
-#[derive(Serialize, Deserialize, Default)]
+#[derive(Serialize, Deserialize, Default, Clone)]
 pub struct Step {
-    stage: Stage,
-    dl_urls: Option<HashMap<Url, String>>,
-    name: String,
-    run: Vec<String>,
+    pub stage: Stage,
+    pub dl_urls: Option<HashMap<Url, String>>,
+    pub name: String,
+    pub run: Vec<String>,
 }
 
 impl Step {
@@ -54,7 +54,7 @@ impl Step {
     }
 }
 
-#[derive(Serialize, Deserialize, Default, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Serialize, Deserialize, Default, Debug, PartialEq, Eq, PartialOrd, Ord, Clone)]
 pub enum Stage {
     #[default]
     Prepare,

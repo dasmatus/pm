@@ -1,6 +1,6 @@
 use clap::Parser;
 use miette::IntoDiagnostic;
-use pm::bf::ConfigFile;
+use pm::{bf::ConfigFile, run::PackageRunner};
 use serde_yaml::{from_str, to_string};
 use std::{
     fs::{read_to_string, write},
@@ -28,10 +28,11 @@ fn main() -> miette::Result<()> {
     } else if let Some(generate) = args.generate {
         write(
             generate,
-            to_string(&ConfigFile::default()).into_diagnostic()?,
+            to_string(&ConfigFile::generate()).into_diagnostic()?,
         )
         .into_diagnostic()?;
-    } else if let Some(_run) = args.run {
+    } else if let Some(run) = args.run {
+        PackageRunner::new(run).run(None)?;
     }
     Ok(())
 }
