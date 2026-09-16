@@ -1,5 +1,6 @@
 use std::{
     collections::HashMap,
+    ffi::OsStr,
     fs::{copy, create_dir_all, read_to_string, rename},
     path::{Path, PathBuf},
     process::Command,
@@ -20,6 +21,33 @@ use std::fs::write;
 use tempfile::{TempDir, env::temp_dir};
 use tracing::info;
 use walkdir::WalkDir;
+
+/// Classifies every file under `root` as an entrypoint, lazily.
+///
+/// Nothing is allocated up front: the walk only advances as the consumer pulls
+/// from it, so the caller decides whether the results are ever materialized.
+/// Walk failures are yielded as `Err` items rather than panicking, which lets
+/// a `collect::<miette::Result<_>>()` short-circuit on the first one.
+fn entrypoints(root: &Path) -> impl Iterator<Item = miette::Result<(PathBuf, Type)>> {
+    WalkDir::new(root).into_iter().filter_map(|item| {
+        let entry = match item.into_diagnostic() {
+            Ok(entry) => entry,
+            Err(error) => return Some(Err(error)),
+        };
+        // `file_type` reuses what readdir already reported; `metadata` would
+        // cost an extra stat per entry.
+        if !entry.file_type().is_file() {
+            return None;
+        }
+        let path = entry.into_path();
+        let r#type = match path.extension().and_then(OsStr::to_str) {
+            Some("so") => Type::Library(Dynamic),
+            Some("a") => Type::Library(Static),
+            _ => Type::Binary,
+        };
+        Some(Ok((path, r#type)))
+    })
+}
 
 #[derive(Serialize, Deserialize, Default)]
 pub struct ConfigFile {
@@ -98,30 +126,11 @@ impl ConfigFile {
                 .iter()
                 .try_for_each(|step| -> miette::Result<()> { step.execute(&self.name) })?;
         }
-        // collect files
-        let files_type = WalkDir::new(&path)
-            .into_iter()
-            .map(|item| -> (PathBuf, Type) {
-                let path1 = item.unwrap().into_path();
-                let mut r#type = Type::Binary;
-                if path1.metadata().unwrap().is_file() {
-                    let fext = path1.extension().unwrap();
-                    if fext.eq("so") {
-                        r#type = Type::Library(Dynamic);
-                    } else if fext.eq("a") {
-                        r#type = Type::Library(Static);
-                    }
-                }
-                (path1, r#type)
-            })
-            .collect();
         info!("Finishing up.");
+        let metadata = Metadata::create(&path, self.version.clone(), entrypoints(&path))?;
         write(
             path.join("metadata"),
-            to_string::<Metadata>(
-                &Metadata::create(path, self.version.clone(), files_type).unwrap(),
-            )
-            .into_diagnostic()?,
+            to_string::<Metadata>(&metadata).into_diagnostic()?,
         )
         .into_diagnostic()?;
         if !self
@@ -139,8 +148,9 @@ impl ConfigFile {
         &self.name
     }
 
+    /// The declared dependency paths, borrowed in place.
     #[must_use]
-    pub fn dependencies(&self) -> &[PathBuf] {
-        &self.dependencies
+    pub fn dependencies(&self) -> impl ExactSizeIterator<Item = &Path> {
+        self.dependencies.iter().map(PathBuf::as_path)
     }
 }

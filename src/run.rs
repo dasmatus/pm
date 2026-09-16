@@ -1,10 +1,9 @@
 use std::{fs::read_to_string, path::PathBuf, process::Command};
 
-use crate::metadata::{Metadata, Type};
+use crate::metadata::Metadata;
 use dialoguer::Select;
 use hakoniwa::Container;
-use miette::IntoDiagnostic;
-use rayon::prelude::*;
+use miette::{IntoDiagnostic, miette};
 use serde_yaml::from_str;
 use tempfile::TempDir;
 use tracing::info;
@@ -21,7 +20,6 @@ impl PackageRunner {
         info!("Running {}", self.path.display());
         let tmpdir = TempDir::new().into_diagnostic()?;
         let tmpdir = tmpdir.path();
-        let mut to_run = String::new();
         Command::new("tar")
             .arg("-xpvf")
             .arg(&self.path)
@@ -30,20 +28,26 @@ impl PackageRunner {
         let cfg_file: Metadata =
             from_str(&read_to_string(tmpdir.join("metadata")).into_diagnostic()?)
                 .into_diagnostic()?;
-        if bin.is_none() {
-            let available_bins: Vec<_> = cfg_file
-                .entrypoints()
-                .par_iter()
-                .filter(|(_, ty)| **ty == Type::Binary)
-                .map(|(it, _)| it.display().to_string())
-                .collect();
-            let run = Select::new()
-                .items(available_bins.clone())
+        let to_run = if let Some(bin) = bin {
+            bin
+        } else {
+            // One of the few collects that has to stay: `Select` needs the
+            // whole list up front and answers with a *position*, which an
+            // iterator cannot be indexed by. Holding `&Path` keeps it to one
+            // pointer-sized push per entrypoint, and the strings are built
+            // exactly once, inside dialoguer.
+            let available_bins: Vec<_> = cfg_file.binaries().collect();
+            let selected = Select::new()
+                .items(available_bins.iter().map(|path| path.display()))
                 .with_prompt("Select which binary to run:")
                 .interact()
-                .unwrap();
-            to_run = available_bins[run].clone();
-        }
+                .into_diagnostic()?;
+            let chosen = available_bins[selected];
+            chosen
+                .to_str()
+                .ok_or_else(|| miette!("{} is not valid UTF-8", chosen.display()))?
+                .to_owned()
+        };
         Container::new()
             .command(&to_run)
             .spawn()

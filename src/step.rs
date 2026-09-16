@@ -39,12 +39,16 @@ impl Step {
             self.run
                 .par_iter()
                 .try_for_each(|cmd| -> miette::Result<()> {
-                    let split: Vec<String> = cmd
-                        .split_whitespace()
-                        .map(std::convert::Into::into)
-                        .collect();
-                    Command::new(split[0].clone())
-                        .args(split[1..split.len()].to_vec())
+                    // `args` takes any `IntoIterator<Item: AsRef<OsStr>>`, so
+                    // the tail of the split feeds it directly. Collecting here
+                    // would allocate a `String` per word plus the `Vec`, only
+                    // to hand the same borrows on.
+                    let mut words = cmd.split_whitespace();
+                    let program = words.next().ok_or_else(|| {
+                        miette!("Step {} has an empty command in `run`.", self.name)
+                    })?;
+                    Command::new(program)
+                        .args(words)
                         .env("DESTDIR", tmpdir.join(name).join("pkg"))
                         .status()
                         .into_diagnostic()?;
