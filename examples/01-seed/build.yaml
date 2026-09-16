@@ -1,0 +1,70 @@
+# examples/01-seed -- the bottom of the chain.
+#
+# This one depends on nothing, so `pm build ../pm.yaml` starts here. It shows
+# the smallest build file that does real work, and it asserts the shape of the
+# jail its own steps run in.
+#
+# Every command below is matched against the built-in fingerprint table in
+# src/policy.rs BEFORE anything runs. `test` and `install` both land in the
+# `coreutils` fingerprint, which grants Capability::Coreutils and nothing else
+# -- so this package builds in its own empty network namespace.
+name: seed
+version:
+- '0'
+- '1'
+- '0'
+dependencies: []
+steps:
+
+# The confinement probes. These are ASSERTIONS, not setup: each one exits 0
+# only because the jail is shaped the way src/sandbox.rs:7-25 says it is. Run
+# the identical argv on the host and the /home, /root, /var, /build, /dest and
+# decoy probes all flip -- examples/demo.sh runs both columns side by side.
+#
+# There is no shell here. `test ! -e /root` reaches execve as the four words
+# ["test", "!", "-e", "/root"], which is a valid test(1) invocation. A command
+# string is split on whitespace and exec'd directly (src/step.rs:56-69).
+- stage: Prepare
+  dl_urls: null
+  name: confine
+  run:
+  # The two writable mounts, at their stable in-container paths.
+  - test -d /build
+  - test -w /build
+  - test -d /dest
+  - test -w /dest
+  # /root and /var are not mounted at all. On the host both exist, so these two
+  # lines are the clearest host-vs-jail flip in the file.
+  - test ! -e /root
+  - test ! -e /var
+  # Note what is NOT asserted here: `test ! -e /home`. That is false whenever
+  # the build file itself lives under a home directory, because the read-only
+  # mount of this file's own directory has to be created at its own absolute
+  # path, and the path components leading to it come with it. The spine is
+  # hollow -- $HOME's actual contents are not mounted -- but the directory
+  # entries exist. pm.yaml asserts the sharp version of this with the real
+  # $HOME substituted in; see the README.
+
+  # /usr is mirrored read-only so the loader and the toolchain are reachable,
+  # but it cannot be written.
+  - test -d /usr
+  - test ! -w /usr
+  # /tmp is a FRESH tmpfs, not the host's. That matters more than it looks:
+  # every pm workspace lives under the host TMPDIR, so this is what stops one
+  # build from reading another build's tree. examples/demo.sh plants
+  # /tmp/pm-confinement-decoy/secret.txt on the host before building.
+  - test -d /tmp
+  - test ! -e /tmp/pm-confinement-decoy/secret.txt
+
+# Stage the payload. DESTDIR reaches the command through the environment as
+# /dest, but nothing expands it -- there is no shell -- so the path is written
+# out in full. `install -D` creates the parent directories itself.
+#
+# The payload is a copy of /usr/bin/echo: a real ELF, so the package gets a
+# real entrypoint and elf::analyse has something to infer a run-time
+# permission profile from.
+- stage: Install
+  dl_urls: null
+  name: stage
+  run:
+  - install -Dm755 /usr/bin/echo /dest/usr/bin/seed

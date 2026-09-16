@@ -1,0 +1,54 @@
+# examples/03-app -- the third link, and the one the run-time demo uses.
+#
+# Depends on 02-lib, which depends on 01-seed. Dependencies are built
+# depth-first and sequentially, with a visiting stack that rejects cycles and a
+# memo map so a diamond builds once (src/bf.rs:349-389).
+#
+# This package stages TWO entrypoints on purpose, because the interesting half
+# of pm happens after the build: a run-time permission profile is inferred from
+# the staged ELFs and recorded in the archive, and `pm run --enforce` turns it
+# into a landlock ruleset. One entrypoint stays inside that profile; the other
+# does not. Same package, same ruleset -- the only variable is which binary you
+# ask for.
+name: app
+version:
+- '0'
+- '1'
+- '0'
+dependencies:
+- ../examples/02-lib/build.yaml
+steps:
+
+- stage: Prepare
+  dl_urls: null
+  name: confine
+  run:
+  - test -w /build
+  - test -w /dest
+  - test ! -e /root
+  - test ! -e /var
+  - test ! -w /usr
+  - test ! -e /tmp/pm-confinement-decoy/secret.txt
+  # Only the DIRECT dependency is staged into deps/. 01-seed is in the graph,
+  # but its archive lives nested inside lib-0.1.0.cpkg, not beside it -- the
+  # dependency tree is carried, not flattened.
+  - test -f /dest/deps/lib-0.1.0.cpkg
+  - test ! -e /dest/deps/seed-0.1.0.cpkg
+
+- stage: Install
+  dl_urls: null
+  name: stage
+  run:
+  # Inside the inferred profile. /usr/bin/echo needs its loader and its
+  # libraries, which elf::analyse records from PT_INTERP and DT_NEEDED, and
+  # nothing else -- it prints its arguments and exits.
+  - install -Dm755 /usr/bin/echo /dest/usr/bin/hello
+  # Outside the inferred profile. /usr/bin/whoami reads /etc/passwd to turn a
+  # uid into a name. No signal pm has can know that: elf::analyse sees only the
+  # dynamic section, and source::scan has no source to read, because this
+  # package compiled nothing. So /etc/passwd is absent from the recorded
+  # profile, `pm run --audit` reports the access, and `pm run --enforce` denies
+  # it. That gap is the point -- a profile derived by observation is incomplete
+  # by construction, which is why a fresh one is recorded in audit mode and
+  # promoting it is a human decision (src/bf.rs:441-453).
+  - install -Dm755 /usr/bin/whoami /dest/usr/bin/leak

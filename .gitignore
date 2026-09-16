@@ -1,2 +1,9 @@
 /target
 .env
+
+# Demo artifacts. `examples/demo.sh` regenerates all of these.
+/out
+/pm.yaml
+*.cpkg
+*.sig
+examples/.demo-config

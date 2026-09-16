@@ -1,7 +1,7 @@
 use clap::{Parser, Subcommand};
 use miette::{IntoDiagnostic, WrapErr, miette};
 use pm::{
-    bf::BuildFile,
+    bf::{BuildFile, BuildOptions},
     metadata::Metadata,
     perms::Enforcement,
     policy::{BuildPolicy, UNMATCHED},
@@ -379,27 +379,36 @@ fn build(file: &Path, permissive: bool, unsandboxed: bool) -> miette::Result<()>
         );
     }
 
-    let archive = run_build(&build_file, &policy, unsandboxed)?;
+    let archive = run_build(
+        &build_file,
+        BuildOptions {
+            permissive,
+            unsandboxed,
+        },
+    )?;
     info!(archive = %archive.display(), "packaged");
     Ok(())
 }
 
 /// The single seam between the CLI and the builder.
 ///
-/// `BuildFile::run` does not take the policy or the escape hatch yet, so they
-/// are resolved here and handed over as soon as it does; this function is the
-/// only place that has to change when it grows the parameters.
+/// Both flags reach [`BuildFile::run_with`] rather than [`BuildFile::run`],
+/// which hard-codes [`BuildOptions::default`] - the safe answer to both - and
+/// would therefore ignore whatever the caller asked for. They deliberately
+/// carry no policy: the recursive dependency walk derives one per package from
+/// that package's own build file, so the policy the caller already has in hand
+/// describes the top-level package and nothing below it.
+///
+/// `options` applies to every package built out of this one, which is
+/// [`BuildFile::run_with`]'s contract: a permissive top-level build does not get
+/// to impose strict classification on its dependencies, and an unsandboxed one
+/// has already given up the jail.
 ///
 /// # Errors
 ///
 /// Propagates whatever the build fails with.
-fn run_build(
-    build_file: &BuildFile,
-    policy: &BuildPolicy,
-    unsandboxed: bool,
-) -> miette::Result<PathBuf> {
-    let _ = (policy, unsandboxed);
-    build_file.run()
+fn run_build(build_file: &BuildFile, options: BuildOptions) -> miette::Result<PathBuf> {
+    build_file.run_with(options)
 }
 
 /// Prints the policy derived from `file` without building it.

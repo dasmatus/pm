@@ -1,0 +1,52 @@
+# examples/02-lib -- the second link.
+#
+# Depends on 01-seed. A dependency is a PATH TO ANOTHER BUILD FILE: there is no
+# registry, no name lookup and no version constraint (src/bf.rs:82). The path
+# is resolved against the process working directory, NOT against this file's
+# directory (src/bf.rs:357-364), which is why it reads `../examples/...` --
+# every pm invocation in examples/demo.sh runs from the repo's out/ directory.
+#
+# Running from out/ is deliberate. The directory holding each dependency
+# archive gets bind-mounted read-only into the dependent's jail
+# (src/bf.rs:605-627), so keeping the archives in out/ means this build sees a
+# directory of .cpkg files rather than the whole repository.
+name: lib
+version:
+- '0'
+- '1'
+- '0'
+dependencies:
+- ../examples/01-seed/build.yaml
+steps:
+
+# Same probes as 01-seed, plus what a dependency actually looks like from
+# inside the build that consumes it.
+- stage: Prepare
+  dl_urls: null
+  name: confine
+  run:
+  - test -w /build
+  - test -w /dest
+  - test ! -e /root
+  - test ! -e /var
+  - test ! -w /usr
+  - test ! -e /tmp/pm-confinement-decoy/secret.txt
+  # 01-seed's archive was copied into this package's DESTDIR before the first
+  # step ran, so it is here and it will ship inside lib-0.1.0.cpkg
+  # (src/bf.rs:411-422).
+  - test -f /dest/deps/seed-0.1.0.cpkg
+  # It is delivered into DESTDIR, not into the working directory, and NOTHING
+  # unpacks it. A build file that wants a dependency's contents has to extract
+  # the archive itself; there is no store, no prefix and no -I/-L wiring.
+  - test ! -e /build/deps
+
+# Stage a real shared library so the package carries a Library: Dynamic
+# entrypoint -- metadata.rs classifies by file name, and a `.so.N` suffix is
+# what makes it dynamic rather than a plain binary (src/metadata.rs:233-256).
+# /usr/lib64/libz.so.1 is a symlink; install follows it, so the staged file is
+# the library itself.
+- stage: Install
+  dl_urls: null
+  name: stage
+  run:
+  - install -Dm755 /usr/lib64/libz.so.1 /dest/usr/lib/libexample.so.1
