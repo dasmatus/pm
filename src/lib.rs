@@ -2,6 +2,9 @@
 pub mod bf;
 /// Package metadata written into each archive.
 pub mod metadata;
+/// Inferring the permissions a package actually needs, from its source, its
+/// built objects and a traced execution.
+pub mod perms;
 /// Deriving a sandbox policy from the contents of a build file.
 pub mod policy;
 /// Extracting and running a built package inside a sandbox.

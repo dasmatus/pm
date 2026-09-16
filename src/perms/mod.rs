@@ -423,8 +423,11 @@ impl fmt::Display for Enforcement {
     }
 }
 
+/// The test a [`Permission`] has to pass to belong to one of the report's groups.
+type Belongs = fn(&Permission) -> bool;
+
 /// The report's groups, in print order, each with the test for membership.
-const GROUPS: [(&str, fn(&Permission) -> bool); 5] = [
+const GROUPS: [(&str, Belongs); 5] = [
     ("read", |p| matches!(p, Permission::ReadPath(_))),
     ("write", |p| matches!(p, Permission::WritePath(_))),
     ("exec", |p| matches!(p, Permission::ExecPath(_))),
@@ -593,7 +596,7 @@ fn collapse(merged: &mut BTreeMap<Permission, Entry>) {
 fn rebuild(
     _merged: &BTreeMap<Permission, Entry>,
     path: &Path,
-    belongs: fn(&Permission) -> bool,
+    belongs: Belongs,
 ) -> Option<Permission> {
     [
         Permission::ReadPath(path.to_path_buf()),
@@ -601,7 +604,7 @@ fn rebuild(
         Permission::ExecPath(path.to_path_buf()),
     ]
     .into_iter()
-    .find(|permission| belongs(permission))
+    .find(belongs)
 }
 
 /// Display width of a report cell, in characters.
