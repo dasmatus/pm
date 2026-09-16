@@ -78,6 +78,13 @@ struct Screen {
     /// How many lines the last draw left on screen, and therefore how many the
     /// next one has to erase.
     drawn: usize,
+    /// Whether this region is the one currently hiding the cursor.
+    ///
+    /// Tracked rather than assumed: every `pm` subcommand builds a region but
+    /// only a build ever opens a line on one, and a region that hid the cursor
+    /// merely by existing would leave `pm run`'s prompt - and the package's own
+    /// binary - running without one.
+    cursor_hidden: bool,
 }
 
 /// Where the region is drawn, and how wide it is.
@@ -122,7 +129,6 @@ impl Progress {
     pub fn to_terminal() -> Self {
         let term = Term::stderr();
         if term.is_term() {
-            term.hide_cursor().ok();
             Self::live(Canvas::Terminal(term))
         } else {
             Self::passthrough(Box::new(term))
@@ -298,9 +304,7 @@ impl Drop for Inner {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
 
         screen.erase();
-        if let Canvas::Terminal(term) = &screen.canvas {
-            term.show_cursor().ok();
-        }
+        screen.set_cursor_hidden(false);
     }
 }
 
@@ -324,6 +328,7 @@ impl Screen {
             next_id: 0,
             frame: 0,
             drawn: 0,
+            cursor_hidden: false,
         }
     }
 
@@ -458,10 +463,38 @@ impl Screen {
     fn draw(&mut self) {
         self.erase();
         let lines = self.render();
+
+        // The cursor is hidden only while there is a region to hide it for: it
+        // would otherwise chase the redraw across the screen, but an empty
+        // region has nothing to chase and no business owning it.
+        self.set_cursor_hidden(!lines.is_empty());
+
         for line in &lines {
             self.write_line(line);
         }
         self.drawn = lines.len();
+    }
+
+    /// Hide or show the cursor, if that is not already its state.
+    fn set_cursor_hidden(&mut self, hidden: bool) {
+        if hidden == self.cursor_hidden {
+            return;
+        }
+        match (&mut self.canvas, hidden) {
+            (Canvas::Terminal(term), true) => {
+                term.hide_cursor().ok();
+            }
+            (Canvas::Terminal(term), false) => {
+                term.show_cursor().ok();
+            }
+            (Canvas::Writer { sink, .. }, true) => {
+                write!(sink, "\x1b[?25l").ok();
+            }
+            (Canvas::Writer { sink, .. }, false) => {
+                write!(sink, "\x1b[?25h").ok();
+            }
+        }
+        self.cursor_hidden = hidden;
     }
 
     /// Write one line and a newline, wherever the canvas points.

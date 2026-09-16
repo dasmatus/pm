@@ -364,3 +364,40 @@ fn a_child_of_a_handle_nests_under_the_handles_own_line() {
         lines[1]
     );
 }
+
+#[test]
+fn an_empty_region_does_not_touch_the_cursor() {
+    let sink = Sink::default();
+    let progress = region(&sink);
+
+    // Every `pm` subcommand builds a region, but only a build ever opens a
+    // line on it. `pm run` hands the terminal to the package's own binary and
+    // prompts with dialoguer; a region that hid the cursor just by existing
+    // would leave that prompt invisible.
+    progress.tick();
+    progress.println("INFO nothing is building");
+
+    assert!(
+        !sink.written().contains("\x1b[?25l"),
+        "a region with no work on it must leave the cursor alone"
+    );
+}
+
+#[test]
+fn the_cursor_is_hidden_only_while_there_are_lines() {
+    let sink = Sink::default();
+    let progress = region(&sink);
+
+    {
+        let _task = progress.task("zlib-1.3.1");
+        assert!(
+            sink.written().contains("\x1b[?25l"),
+            "a drawing region must hide the cursor so it does not chase the redraw"
+        );
+    }
+
+    assert!(
+        sink.written().contains("\x1b[?25h"),
+        "the cursor must come back as soon as the region has nothing left to draw"
+    );
+}
