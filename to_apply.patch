@@ -1,0 +1,608 @@
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -249,6 +249,7 @@ dependencies = [
+  "anstyle",
+  "clap_lex",
+  "strsim",
++ "terminal_size",
+ ]
+ 
+ [[package]]
+@@ -294,6 +295,12 @@ version = "1.0.5"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "1d07550c9036bf2ae0c684c4297d503f838287c83c53686d05370d0e139ae570"
+ 
++[[package]]
++name = "condtype"
++version = "1.3.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "baf0a07a401f374238ab8e2f11a104d2851bf9ce711ec69804834de8af45c7af"
++
+ [[package]]
+ name = "console"
+ version = "0.16.6"
+@@ -435,6 +442,31 @@ dependencies = [
+  "syn 3.0.5",
+ ]
+ 
++[[package]]
++name = "divan"
++version = "0.1.21"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "a405457ec78b8fe08b0e32b4a3570ab5dff6dd16eb9e76a5ee0a9d9cbd898933"
++dependencies = [
++ "cfg-if",
++ "clap",
++ "condtype",
++ "divan-macros",
++ "libc",
++ "regex-lite",
++]
++
++[[package]]
++name = "divan-macros"
++version = "0.1.21"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "9556bc800956545d6420a640173e5ba7dfa82f38d3ea5a167eb555bc69ac3323"
++dependencies = [
++ "proc-macro2",
++ "quote",
++ "syn 2.0.119",
++]
++
+ [[package]]
+ name = "either"
+ version = "1.18.0"
+@@ -1089,6 +1121,7 @@ version = "0.1.0"
+ dependencies = [
+  "clap",
+  "dialoguer",
++ "divan",
+  "either",
+  "fetch-data",
+  "hakoniwa",
+@@ -1230,6 +1263,12 @@ dependencies = [
+  "thiserror 1.0.69",
+ ]
+ 
++[[package]]
++name = "regex-lite"
++version = "0.1.9"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "cab834c73d247e67f4fae452806d17d3c7501756d98c8808d7c9c7aa7d18f973"
++
+ [[package]]
+ name = "ring"
+ version = "0.17.14"
+diff --git a/Cargo.toml b/Cargo.toml
+index 7cf4d40..78331fd 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -3,6 +3,14 @@ name = "pm"
+ version = "0.1.0"
+ edition = "2024"
+ 
++[[bench]]
++name = "argv"
++harness = false
++
++[[bench]]
++name = "entrypoints"
++harness = false
++
+ [dependencies]
+ clap = { version = "4.6.6", features = ["derive"] }
+ dialoguer = "0.12.0"
+@@ -18,3 +26,6 @@ tracing = "0.1.44"
+ tracing-subscriber = "0.3.23"
+ url = { version = "2.5.8", features = ["serde"] }
+ walkdir = "2.5.0"
++
++[dev-dependencies]
++divan = "0.1.21"
+diff --git a/benches/argv.rs b/benches/argv.rs
+new file mode 100644
+index 0000000..1e239cd
+--- /dev/null
++++ b/benches/argv.rs
+@@ -0,0 +1,48 @@
++//! Measures the argv construction in `Step::execute`, before and after the
++//! `collect()` was dropped.
++//!
++//! Both variants end up building the same [`Command`], so the only difference
++//! the timer sees is the intermediate allocations the old shape needed.
++
++use std::process::Command;
++
++use divan::{Bencher, black_box};
++
++fn main() {
++    divan::main();
++}
++
++/// Representative `run:` lines from a build file: a bare invocation, a typical
++/// autotools configure and a long cargo command.
++const COMMANDS: &[&str] = &[
++    "make install",
++    "./configure --prefix=/usr --sysconfdir=/etc --localstatedir=/var --disable-static",
++    "cargo build --release --locked --offline --target x86_64-unknown-linux-gnu --features a,b,c",
++];
++
++/// The old shape: every word becomes an owned `String` inside a `Vec`, the
++/// program name is cloned back out, and `to_vec` copies the tail a second time.
++#[divan::bench(args = COMMANDS)]
++fn collect_into_vec(bencher: Bencher, cmd: &str) {
++    bencher.bench(|| {
++        let split: Vec<String> = black_box(cmd)
++            .split_whitespace()
++            .map(std::convert::Into::into)
++            .collect();
++        let mut command = Command::new(split[0].clone());
++        command.args(split[1..split.len()].to_vec());
++        black_box(command)
++    });
++}
++
++/// The new shape: `args` consumes the `SplitWhitespace` borrows directly, so
++/// nothing is allocated on the way in.
++#[divan::bench(args = COMMANDS)]
++fn lazy_split(bencher: Bencher, cmd: &str) {
++    bencher.bench(|| {
++        let mut words = black_box(cmd).split_whitespace();
++        let mut command = Command::new(words.next().unwrap_or_default());
++        command.args(words);
++        black_box(command)
++    });
++}
+diff --git a/benches/entrypoints.rs b/benches/entrypoints.rs
+new file mode 100644
+index 0000000..b9d6cb4
+--- /dev/null
++++ b/benches/entrypoints.rs
+@@ -0,0 +1,108 @@
++//! Measures the entrypoint classification in `ConfigFile::run`, before and
++//! after the walk was made lazy.
++//!
++//! This is the O(files-in-the-package-tree) path, so it is the one where the
++//! shape of the iterator can actually move the wall clock. Both variants end
++//! up with the same `HashMap` — that collect is unavoidable, the map is a
++//! serialized field — so what the timer isolates is the per-entry work: the
++//! old shape paid an extra `stat` through `Path::metadata` for every entry,
++//! and inserted directories into the map as if they were binaries.
++//!
++//! Harness scaffolding: `classify_old` reproduces deleted code verbatim,
++//! unwraps included, and the fixture helper panics on setup failure. Neither
++//! is a shipped path.
++
++use std::{
++    collections::HashMap,
++    ffi::OsStr,
++    fs::{File, create_dir_all},
++    path::PathBuf,
++};
++
++use divan::{Bencher, black_box};
++use tempfile::TempDir;
++use walkdir::WalkDir;
++
++fn main() {
++    divan::main();
++}
++
++/// Stand-in for `metadata::Type`, which is crate-private.
++#[derive(PartialEq, Eq)]
++enum Type {
++    Binary,
++    Library(bool),
++}
++
++/// A package tree shaped like a real `make install` output: nested directories
++/// with a mix of extensionless binaries, shared objects and static archives.
++fn fixture(files: usize) -> TempDir {
++    let dir = TempDir::new().unwrap();
++    for index in 0..files {
++        let sub = dir.path().join(format!("usr/lib/pkg{}", index % 16));
++        create_dir_all(&sub).unwrap();
++        let name = match index % 4 {
++            0 => format!("bin{index}"),
++            1 => format!("lib{index}.so"),
++            2 => format!("lib{index}.a"),
++            _ => format!("share{index}.txt"),
++        };
++        File::create(sub.join(name)).unwrap();
++    }
++    dir
++}
++
++/// The old shape: eager `map` into a `collect`, an extra `stat` per entry via
++/// `Path::metadata`, and a panic waiting on any extensionless file.
++#[divan::bench(args = [256, 2048])]
++fn classify_old(bencher: Bencher, files: usize) {
++    let tree = fixture(files);
++    bencher.bench_local(|| {
++        let map: HashMap<PathBuf, Type> = WalkDir::new(black_box(tree.path()))
++            .into_iter()
++            .map(|item| {
++                let path = item.unwrap().into_path();
++                let mut r#type = Type::Binary;
++                // The original also unwrapped `extension()` here, which panics
++                // on any extensionless file; relaxed so the bench can run.
++                if path.metadata().unwrap().is_file()
++                    && let Some(fext) = path.extension()
++                {
++                    if fext.eq("so") {
++                        r#type = Type::Library(true);
++                    } else if fext.eq("a") {
++                        r#type = Type::Library(false);
++                    }
++                }
++                (path, r#type)
++            })
++            .collect();
++        black_box(map)
++    });
++}
++
++/// The new shape: a lazy `filter_map` that reuses the file type readdir
++/// already reported and skips directories entirely.
++#[divan::bench(args = [256, 2048])]
++fn classify_lazy(bencher: Bencher, files: usize) {
++    let tree = fixture(files);
++    bencher.bench_local(|| {
++        let map: HashMap<PathBuf, Type> = WalkDir::new(black_box(tree.path()))
++            .into_iter()
++            .filter_map(|item| {
++                let entry = item.ok()?;
++                if !entry.file_type().is_file() {
++                    return None;
++                }
++                let path = entry.into_path();
++                let r#type = match path.extension().and_then(OsStr::to_str) {
++                    Some("so") => Type::Library(true),
++                    Some("a") => Type::Library(false),
++                    _ => Type::Binary,
++                };
++                Some((path, r#type))
++            })
++            .collect();
++        black_box(map)
++    });
++}
+diff --git a/src/bf.rs b/src/bf.rs
+index ed07bca..562d170 100644
+--- a/src/bf.rs
++++ b/src/bf.rs
+@@ -1,5 +1,6 @@
+ use std::{
+     collections::HashMap,
++    ffi::OsStr,
+     fs::{copy, create_dir_all, read_to_string, rename},
+     path::{Path, PathBuf},
+     process::Command,
+@@ -21,6 +22,33 @@ use tempfile::{TempDir, env::temp_dir};
+ use tracing::info;
+ use walkdir::WalkDir;
+ 
++/// Classifies every file under `root` as an entrypoint, lazily.
++///
++/// Nothing is allocated up front: the walk only advances as the consumer pulls
++/// from it, so the caller decides whether the results are ever materialized.
++/// Walk failures are yielded as `Err` items rather than panicking, which lets
++/// a `collect::<miette::Result<_>>()` short-circuit on the first one.
++fn entrypoints(root: &Path) -> impl Iterator<Item = miette::Result<(PathBuf, Type)>> {
++    WalkDir::new(root).into_iter().filter_map(|item| {
++        let entry = match item.into_diagnostic() {
++            Ok(entry) => entry,
++            Err(error) => return Some(Err(error)),
++        };
++        // `file_type` reuses what readdir already reported; `metadata` would
++        // cost an extra stat per entry.
++        if !entry.file_type().is_file() {
++            return None;
++        }
++        let path = entry.into_path();
++        let r#type = match path.extension().and_then(OsStr::to_str) {
++            Some("so") => Type::Library(Dynamic),
++            Some("a") => Type::Library(Static),
++            _ => Type::Binary,
++        };
++        Some(Ok((path, r#type)))
++    })
++}
++
+ #[derive(Serialize, Deserialize, Default)]
+ pub struct ConfigFile {
+     name: String,
+@@ -98,30 +126,11 @@ impl ConfigFile {
+                 .iter()
+                 .try_for_each(|step| -> miette::Result<()> { step.execute(&self.name) })?;
+         }
+-        // collect files
+-        let files_type = WalkDir::new(&path)
+-            .into_iter()
+-            .map(|item| -> (PathBuf, Type) {
+-                let path1 = item.unwrap().into_path();
+-                let mut r#type = Type::Binary;
+-                if path1.metadata().unwrap().is_file() {
+-                    let fext = path1.extension().unwrap();
+-                    if fext.eq("so") {
+-                        r#type = Type::Library(Dynamic);
+-                    } else if fext.eq("a") {
+-                        r#type = Type::Library(Static);
+-                    }
+-                }
+-                (path1, r#type)
+-            })
+-            .collect();
+         info!("Finishing up.");
++        let metadata = Metadata::create(&path, self.version.clone(), entrypoints(&path))?;
+         write(
+             path.join("metadata"),
+-            to_string::<Metadata>(
+-                &Metadata::create(path, self.version.clone(), files_type).unwrap(),
+-            )
+-            .into_diagnostic()?,
++            to_string::<Metadata>(&metadata).into_diagnostic()?,
+         )
+         .into_diagnostic()?;
+         if !self
+@@ -139,8 +148,9 @@ impl ConfigFile {
+         &self.name
+     }
+ 
++    /// The declared dependency paths, borrowed in place.
+     #[must_use]
+-    pub fn dependencies(&self) -> &[PathBuf] {
+-        &self.dependencies
++    pub fn dependencies(&self) -> impl ExactSizeIterator<Item = &Path> {
++        self.dependencies.iter().map(PathBuf::as_path)
+     }
+ }
+diff --git a/src/metadata.rs b/src/metadata.rs
+index 51b1eed..0a32425 100644
+--- a/src/metadata.rs
++++ b/src/metadata.rs
+@@ -1,5 +1,9 @@
+-use std::{collections::HashMap, path::PathBuf};
++use std::{
++    collections::HashMap,
++    path::{Path, PathBuf},
++};
+ 
++use miette::{IntoDiagnostic, miette};
+ use serde::{Deserialize, Serialize};
+ use walkdir::WalkDir;
+ 
+@@ -21,23 +25,48 @@ pub enum LibraryType {
+     Dynamic,
+ }
+ impl Metadata {
++    /// Builds the metadata written alongside a packaged tree.
++    ///
++    /// `entrypoints` is consumed lazily and only walked here, at the single
++    /// point where the map has to exist because it is a serialized field. An
++    /// `Err` item aborts the walk on the first failure.
+     pub fn create(
+-        dir: PathBuf,
++        dir: &Path,
+         version: Vec<String>,
+-        entrypoints: HashMap<PathBuf, Type>,
++        entrypoints: impl IntoIterator<Item = miette::Result<(PathBuf, Type)>>,
+     ) -> miette::Result<Self> {
++        let name = dir
++            .file_name()
++            .ok_or_else(|| {
++                miette!(
++                    "{} has no final component to name the package after",
++                    dir.display()
++                )
++            })?
++            .display()
++            .to_string();
+         Ok(Self {
+-            name: dir.file_name().unwrap().display().to_string(),
++            name,
+             version,
+             dependencies: WalkDir::new(dir.join("deps"))
+                 .into_iter()
+-                .map(|item| item.unwrap().into_path())
+-                .collect(),
+-            entrypoints,
++                .map(|item| item.map(walkdir::DirEntry::into_path).into_diagnostic())
++                .collect::<miette::Result<_>>()?,
++            entrypoints: entrypoints.into_iter().collect::<miette::Result<_>>()?,
+         })
+     }
+ 
+-    pub fn entrypoints(&self) -> &HashMap<PathBuf, Type> {
+-        &self.entrypoints
++    /// Every declared entrypoint, borrowed in place.
++    pub fn entrypoints(&self) -> impl ExactSizeIterator<Item = (&Path, &Type)> {
++        self.entrypoints
++            .iter()
++            .map(|(path, r#type)| (path.as_path(), r#type))
++    }
++
++    /// The runnable subset of [`Self::entrypoints`].
++    pub fn binaries(&self) -> impl Iterator<Item = &Path> {
++        self.entrypoints()
++            .filter(|&(_, r#type)| *r#type == Type::Binary)
++            .map(|(path, _)| path)
+     }
+ }
+diff --git a/src/run.rs b/src/run.rs
+index b6596f7..26b4695 100644
+--- a/src/run.rs
++++ b/src/run.rs
+@@ -1,10 +1,9 @@
+ use std::{fs::read_to_string, path::PathBuf, process::Command};
+ 
+-use crate::metadata::{Metadata, Type};
++use crate::metadata::Metadata;
+ use dialoguer::Select;
+ use hakoniwa::Container;
+-use miette::IntoDiagnostic;
+-use rayon::prelude::*;
++use miette::{IntoDiagnostic, miette};
+ use serde_yaml::from_str;
+ use tempfile::TempDir;
+ use tracing::info;
+@@ -21,7 +20,6 @@ impl PackageRunner {
+         info!("Running {}", self.path.display());
+         let tmpdir = TempDir::new().into_diagnostic()?;
+         let tmpdir = tmpdir.path();
+-        let mut to_run = String::new();
+         Command::new("tar")
+             .arg("-xpvf")
+             .arg(&self.path)
+@@ -30,20 +28,26 @@ impl PackageRunner {
+         let cfg_file: Metadata =
+             from_str(&read_to_string(tmpdir.join("metadata")).into_diagnostic()?)
+                 .into_diagnostic()?;
+-        if bin.is_none() {
+-            let available_bins: Vec<_> = cfg_file
+-                .entrypoints()
+-                .par_iter()
+-                .filter(|(_, ty)| **ty == Type::Binary)
+-                .map(|(it, _)| it.display().to_string())
+-                .collect();
+-            let run = Select::new()
+-                .items(available_bins.clone())
++        let to_run = if let Some(bin) = bin {
++            bin
++        } else {
++            // One of the few collects that has to stay: `Select` needs the
++            // whole list up front and answers with a *position*, which an
++            // iterator cannot be indexed by. Holding `&Path` keeps it to one
++            // pointer-sized push per entrypoint, and the strings are built
++            // exactly once, inside dialoguer.
++            let available_bins: Vec<_> = cfg_file.binaries().collect();
++            let selected = Select::new()
++                .items(available_bins.iter().map(|path| path.display()))
+                 .with_prompt("Select which binary to run:")
+                 .interact()
+-                .unwrap();
+-            to_run = available_bins[run].clone();
+-        }
++                .into_diagnostic()?;
++            let chosen = available_bins[selected];
++            chosen
++                .to_str()
++                .ok_or_else(|| miette!("{} is not valid UTF-8", chosen.display()))?
++                .to_owned()
++        };
+         Container::new()
+             .command(&to_run)
+             .spawn()
+diff --git a/src/step.rs b/src/step.rs
+index 9a02a97..937434a 100644
+--- a/src/step.rs
++++ b/src/step.rs
+@@ -39,12 +39,16 @@ impl Step {
+             self.run
+                 .par_iter()
+                 .try_for_each(|cmd| -> miette::Result<()> {
+-                    let split: Vec<String> = cmd
+-                        .split_whitespace()
+-                        .map(std::convert::Into::into)
+-                        .collect();
+-                    Command::new(split[0].clone())
+-                        .args(split[1..split.len()].to_vec())
++                    // `args` takes any `IntoIterator<Item: AsRef<OsStr>>`, so
++                    // the tail of the split feeds it directly. Collecting here
++                    // would allocate a `String` per word plus the `Vec`, only
++                    // to hand the same borrows on.
++                    let mut words = cmd.split_whitespace();
++                    let program = words.next().ok_or_else(|| {
++                        miette!("Step {} has an empty command in `run`.", self.name)
++                    })?;
++                    Command::new(program)
++                        .args(words)
+                         .env("DESTDIR", tmpdir.join(name).join("pkg"))
+                         .status()
+                         .into_diagnostic()?;
+diff --git a/tests/config_file.rs b/tests/config_file.rs
+new file mode 100644
+index 0000000..0d36acd
+--- /dev/null
++++ b/tests/config_file.rs
+@@ -0,0 +1,79 @@
++//! Behavioural tests for the iterator accessors on [`ConfigFile`].
++
++use std::path::Path;
++
++use pm::bf::ConfigFile;
++use serde_yaml::{from_str, to_string};
++
++#[test]
++fn generate_declares_a_single_dependency() {
++    let config = ConfigFile::generate();
++
++    assert_eq!(
++        config.dependencies().collect::<Vec<_>>(),
++        [Path::new("/tmp")]
++    );
++}
++
++#[test]
++fn dependencies_reports_its_length_up_front() {
++    let config = ConfigFile::generate();
++
++    // `ExactSizeIterator` is what lets a caller size a buffer before iterating,
++    // which is the capability a `&[PathBuf]` return used to provide.
++    assert_eq!(config.dependencies().len(), 1);
++    assert_eq!(config.dependencies().count(), 1);
++}
++
++#[test]
++fn dependencies_preserve_declaration_order() {
++    let yaml = "
++name: ordered
++version: ['1', '0', '0']
++dependencies:
++  - /pkg/zlib
++  - /pkg/atk
++  - /pkg/brotli
++steps: []
++";
++    let config: ConfigFile = from_str(yaml).expect("the fixture is valid yaml");
++
++    assert_eq!(
++        config.dependencies().collect::<Vec<_>>(),
++        [
++            Path::new("/pkg/zlib"),
++            Path::new("/pkg/atk"),
++            Path::new("/pkg/brotli"),
++        ],
++        "the accessor must not reorder what the build file declared"
++    );
++    assert_eq!(config.dependencies().len(), 3);
++}
++
++#[test]
++fn an_empty_dependency_list_yields_nothing() {
++    let yaml = "
++name: leaf
++version: ['0', '1', '0']
++dependencies: []
++steps: []
++";
++    let config: ConfigFile = from_str(yaml).expect("the fixture is valid yaml");
++
++    assert_eq!(config.name(), "leaf");
++    assert_eq!(config.dependencies().len(), 0);
++    assert!(config.dependencies().next().is_none());
++}
++
++#[test]
++fn dependencies_survive_a_yaml_round_trip() {
++    let original = ConfigFile::generate();
++    let yaml = to_string(&original).expect("a generated config is serializable");
++    let reloaded: ConfigFile = from_str(&yaml).expect("what we just wrote must parse back");
++
++    assert_eq!(reloaded.name(), original.name());
++    assert_eq!(
++        reloaded.dependencies().collect::<Vec<_>>(),
++        original.dependencies().collect::<Vec<_>>()
++    );
++}

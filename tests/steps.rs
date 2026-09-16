@@ -1,0 +1,447 @@
+//! Integration tests for [`pm::step::Step`]: command execution semantics,
+//! stage ordering, and the environment the child process sees.
+
+use std::collections::HashMap;
+use std::fs::{create_dir_all, read_dir, read_to_string, write};
+use std::path::Path;
+use std::process::Command;
+
+use pm::step::{Stage, Step};
+use tempfile::{TempDir, tempdir};
+use url::Url;
+
+/// A step with no downloads attached.
+fn step(stage: Stage, name: &str, run: Vec<String>) -> Step {
+    Step {
+        stage,
+        dl_urls: None,
+        name: name.into(),
+        run,
+    }
+}
+
+/// A step that runs `commands` through the shell in the `Install` stage.
+fn install_step(name: &str, commands: &[&str]) -> Step {
+    step(
+        Stage::Install,
+        name,
+        commands.iter().map(|c| (*c).to_string()).collect(),
+    )
+}
+
+/// A step whose single command runs `script` through `/bin/sh <path>`.
+///
+/// `Step` execs directly with no shell, so anything needing `$DESTDIR`,
+/// redirection or quoting has to live in a script file. `make install` is the
+/// intended real-world form; this is the shape a build file takes without make.
+fn script_step(name: &str, dir: &Path, script: &str) -> Step {
+    let path = dir.join(format!("{name}.sh"));
+    std::fs::write(&path, script).expect("write the script");
+    install_step(name, &[&format!("/bin/sh {}", path.display())])
+}
+
+/// A step that fetches exactly `url`, with an expected hash that cannot match.
+fn download_step(name: &str, url: &str) -> Step {
+    let mut dl_urls = HashMap::new();
+    dl_urls.insert(Url::parse(url).expect("a parseable URL"), "0".repeat(64));
+    Step {
+        stage: Stage::Prepare,
+        dl_urls: Some(dl_urls),
+        name: name.into(),
+        run: Vec::new(),
+    }
+}
+
+/// The names of the entries directly under `dir`, sorted.
+fn entries_of(dir: &Path) -> Vec<String> {
+    let mut names: Vec<String> = read_dir(dir)
+        .expect("read the directory")
+        .map(|entry| {
+            entry
+                .expect("a readable directory entry")
+                .file_name()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect();
+    names.sort();
+    names
+}
+
+/// A working directory and a `DESTDIR`, each in its own temporary directory so
+/// a test can tell the two apart.
+fn workdirs() -> (TempDir, TempDir) {
+    (
+        tempdir().expect("work directory"),
+        tempdir().expect("destination directory"),
+    )
+}
+
+#[test]
+fn a_failing_command_is_an_error_carrying_the_child_stderr() {
+    let (work, dest) = workdirs();
+    // `cat` on a missing file exits non-zero and explains itself on stderr,
+    // prefixing the message with its own name.
+    let missing = "/pm-integration-test-missing-file";
+    let failing = step(Stage::Build, "doomed", vec![format!("/bin/cat {missing}")]);
+
+    let error = failing
+        .execute(work.path(), dest.path())
+        .expect_err("a command that exits non-zero must fail the step");
+
+    let rendered = format!("{error}\n{error:?}");
+    assert!(
+        rendered.contains(missing),
+        "the diagnostic must name what failed, got: {rendered}"
+    );
+    assert!(
+        rendered.contains("cat:"),
+        "the child's captured stderr must be surfaced, got: {rendered}"
+    );
+}
+
+#[test]
+fn a_missing_program_is_an_error_not_a_panic() {
+    let (work, dest) = workdirs();
+    let bogus = step(
+        Stage::Build,
+        "bogus",
+        vec!["/pm-integration-test/no-such-program".into()],
+    );
+
+    assert!(
+        bogus.execute(work.path(), dest.path()).is_err(),
+        "a command naming a program that does not exist must return a diagnostic"
+    );
+}
+
+#[test]
+fn blank_and_whitespace_only_commands_do_not_panic() {
+    let (work, dest) = workdirs();
+    let blank = step(
+        Stage::Build,
+        "blank",
+        vec![String::new(), "   ".into(), "\t\n ".into()],
+    );
+
+    // Skipping them or rejecting them are both defensible; indexing argv[0] of
+    // an empty split is not. Reaching the assertion at all is the test.
+    let outcome = blank.execute(work.path(), dest.path());
+    if let Err(error) = outcome {
+        assert!(
+            !format!("{error}").trim().is_empty(),
+            "a rejection must still say something"
+        );
+    }
+}
+
+#[test]
+fn commands_run_sequentially_in_the_authored_order() {
+    let (work, dest) = workdirs();
+    let one = work.path().join("one");
+    let two = work.path().join("two");
+    let three = work.path().join("three");
+
+    // Each command consumes what the previous one produced, so any reordering
+    // or parallel dispatch turns into a hard failure rather than a flake.
+    let chain = step(
+        Stage::Build,
+        "chain",
+        vec![
+            format!("/bin/mkdir {}", one.display()),
+            format!("/bin/mv {} {}", one.display(), two.display()),
+            format!("/bin/mv {} {}", two.display(), three.display()),
+        ],
+    );
+
+    chain
+        .execute(work.path(), dest.path())
+        .expect("a chain of dependent commands must succeed when run in order");
+
+    assert!(!one.exists());
+    assert!(!two.exists());
+    assert!(three.is_dir(), "the final rename must have happened last");
+}
+
+#[test]
+fn a_failing_command_stops_the_ones_after_it() {
+    let (work, dest) = workdirs();
+    let never = work.path().join("never-created");
+
+    let aborting = step(
+        Stage::Build,
+        "aborting",
+        vec![
+            "/bin/cat /pm-integration-test-missing-file".into(),
+            format!("/bin/mkdir {}", never.display()),
+        ],
+    );
+
+    assert!(aborting.execute(work.path(), dest.path()).is_err());
+    assert!(
+        !never.exists(),
+        "execution must stop at the first failing command"
+    );
+}
+
+#[test]
+fn destdir_and_the_working_directory_reach_the_child_process() {
+    let (work, dest) = workdirs();
+    // `DESTDIR` reaches the child through its ENVIRONMENT, which is the whole
+    // point: `make install` reads it from there and expands `$(DESTDIR)` in its
+    // own install rules. The probe is a script so a shell can report what the
+    // child actually received.
+    let probe = script_step(
+        "probe",
+        work.path(),
+        "pwd > \"$DESTDIR/cwd.txt\"\nprintf '%s' \"$DESTDIR\" > \"$DESTDIR/destdir.txt\"\n",
+    );
+    probe
+        .execute(work.path(), dest.path())
+        .expect("the probe commands must run");
+
+    let reported_cwd = read_to_string(dest.path().join("cwd.txt")).expect("cwd.txt");
+    assert_eq!(
+        Path::new(reported_cwd.trim())
+            .canonicalize()
+            .expect("canonicalise the reported cwd"),
+        work.path()
+            .canonicalize()
+            .expect("canonicalise the workdir"),
+        "commands must run with the working directory as their cwd"
+    );
+
+    let reported_destdir = read_to_string(dest.path().join("destdir.txt")).expect("destdir.txt");
+    assert_eq!(
+        Path::new(reported_destdir.trim())
+            .canonicalize()
+            .expect("canonicalise the reported DESTDIR"),
+        dest.path().canonicalize().expect("canonicalise DESTDIR"),
+        "DESTDIR must point at the staging directory, not the work directory"
+    );
+}
+
+#[test]
+fn commands_still_run_when_a_download_map_is_present_but_empty() {
+    let (work, dest) = workdirs();
+    let made = work.path().join("made");
+    let with_downloads = Step {
+        stage: Stage::Prepare,
+        dl_urls: Some(HashMap::new()),
+        name: "downloads-then-commands".into(),
+        run: vec![format!("/bin/mkdir {}", made.display())],
+    };
+
+    with_downloads
+        .execute(work.path(), dest.path())
+        .expect("an empty download map must not short-circuit the commands");
+
+    assert!(
+        made.is_dir(),
+        "downloads and commands are sequential phases of one step, not alternatives"
+    );
+}
+
+#[test]
+fn a_step_with_nothing_to_do_succeeds() {
+    let (work, dest) = workdirs();
+    let idle = step(Stage::Test, "idle", Vec::new());
+
+    idle.execute(work.path(), dest.path())
+        .expect("a step with no commands must succeed");
+}
+
+#[test]
+fn stages_are_ordered_prepare_build_install_test() {
+    assert!(Stage::Prepare < Stage::Build);
+    assert!(Stage::Build < Stage::Install);
+    assert!(Stage::Install < Stage::Test);
+    assert!(Stage::Prepare < Stage::Test);
+}
+
+#[test]
+fn sorting_steps_by_stage_preserves_the_authored_order_within_a_stage() {
+    let mut steps = [
+        step(Stage::Test, "t1", Vec::new()),
+        step(Stage::Install, "i1", Vec::new()),
+        step(Stage::Prepare, "p1", Vec::new()),
+        step(Stage::Install, "i2", Vec::new()),
+        step(Stage::Build, "b1", Vec::new()),
+        step(Stage::Prepare, "p2", Vec::new()),
+        step(Stage::Build, "b2", Vec::new()),
+    ];
+
+    // `sort_by_key` is stable, which is what keeps two steps of the same stage
+    // in the order the build file listed them. This mirrors what `bf.rs` does.
+    steps.sort_by_key(|left| left.stage);
+
+    let order: Vec<&str> = steps.iter().map(|s| s.name.as_str()).collect();
+    assert_eq!(order, ["p1", "p2", "b1", "b2", "i1", "i2", "t1"]);
+}
+
+#[test]
+#[ignore = "needs a fetcher that understands file:// URLs; run with `cargo test -- --ignored`"]
+fn a_download_whose_hash_does_not_match_is_rejected() {
+    let (work, dest) = workdirs();
+    let payload = work.path().join("payload.tar");
+    write(&payload, b"contents that hash to something else").expect("write the payload");
+
+    let mut urls = HashMap::new();
+    urls.insert(
+        Url::from_file_path(&payload).expect("a file:// URL"),
+        "0".repeat(64),
+    );
+    let download = Step {
+        stage: Stage::Prepare,
+        dl_urls: Some(urls),
+        name: "download".into(),
+        run: Vec::new(),
+    };
+
+    let error = download
+        .execute(work.path(), dest.path())
+        .expect_err("a hash mismatch must fail the step");
+    assert!(
+        format!("{error}\n{error:?}")
+            .to_lowercase()
+            .contains("hash"),
+        "the diagnostic must explain that the hash did not match"
+    );
+}
+
+#[test]
+fn downloads_sharing_a_basename_do_not_share_a_destination() {
+    let (work, dest) = workdirs();
+    // Offline by construction: `file://` URLs are not something the downloader
+    // can fetch, so each of these steps fails. The destination directory is
+    // derived and created BEFORE the fetch is attempted, though, so what the
+    // work directory holds afterwards is exactly the destination mapping this
+    // test is about. See the `#[ignore]`d test below for the end-to-end path,
+    // which needs a fetcher this crate does not have.
+    let first = download_step("first", "file:///pm-integration-test/one/source.tar.gz");
+    let second = download_step("second", "file:///pm-integration-test/two/source.tar.gz");
+
+    assert!(
+        first.execute(work.path(), dest.path()).is_err(),
+        "an unfetchable URL must fail the step"
+    );
+    assert!(second.execute(work.path(), dest.path()).is_err());
+
+    let after_two = entries_of(work.path());
+    assert_eq!(
+        after_two.len(),
+        2,
+        "two URLs sharing the basename `source.tar.gz` must get two destinations, got {after_two:?}"
+    );
+
+    // The same URL must map to the same destination every time, or a resumed
+    // build would re-download everything.
+    let again = download_step(
+        "first-again",
+        "file:///pm-integration-test/one/source.tar.gz",
+    );
+    assert!(again.execute(work.path(), dest.path()).is_err());
+    assert_eq!(
+        entries_of(work.path()),
+        after_two,
+        "the destination for a URL must be stable across runs"
+    );
+}
+
+#[test]
+#[ignore = "needs a fetcher that understands file:// URLs; run with `cargo test -- --ignored`"]
+fn two_downloads_sharing_a_basename_both_land() {
+    let (work, dest) = workdirs();
+    let sources = tempdir().expect("source directory");
+
+    let mut dl_urls = HashMap::new();
+    for (directory, payload) in [("one", "first payload"), ("two", "second payload")] {
+        // Two different files, deliberately sharing the basename that ends up
+        // naming the download on disk.
+        let directory = sources.path().join(directory);
+        create_dir_all(&directory).expect("create the source directory");
+        let source = directory.join("source.tar.gz");
+        write(&source, payload).expect("write the payload");
+
+        let url = Url::from_file_path(&source).expect("a file:// URL");
+        let hash = fetch_data::hash_file(&source).expect("hash the payload");
+        dl_urls.insert(url, hash);
+    }
+
+    let fetching = Step {
+        stage: Stage::Prepare,
+        dl_urls: Some(dl_urls),
+        name: "fetch-two".into(),
+        run: Vec::new(),
+    };
+    fetching
+        .execute(work.path(), dest.path())
+        .expect("both downloads must succeed");
+
+    let landed: Vec<String> = read_dir(work.path())
+        .expect("read the work directory")
+        .filter_map(|entry| {
+            let path = entry.expect("a readable entry").path();
+            path.is_dir()
+                .then(|| read_to_string(path.join("source.tar.gz")).ok())
+                .flatten()
+        })
+        .collect();
+    assert_eq!(
+        landed.len(),
+        2,
+        "both downloads must survive; one overwrote the other"
+    );
+}
+
+#[test]
+fn a_command_string_is_not_interpreted_by_a_shell() {
+    let (work, dest) = workdirs();
+    // Commands are split on whitespace and exec'd directly. `$DESTDIR` in a
+    // command string is therefore literal text, NOT the staging directory.
+    // `DESTDIR` is passed through the environment instead, because that is the
+    // Makefile convention: `make install` reads it from there and expands
+    // `$(DESTDIR)` in its own rules. Pinning this stops anyone reintroducing a
+    // shell and silently changing what every existing build file means.
+    let literal = install_step("literal", &["/bin/mkdir -p $DESTDIR/oops"]);
+
+    literal
+        .execute(work.path(), dest.path())
+        .expect("mkdir must succeed; the argument is just an odd directory name");
+
+    assert!(
+        work.path().join("$DESTDIR/oops").is_dir(),
+        "`$DESTDIR` must reach the program as literal text, not be expanded"
+    );
+    assert!(
+        !dest.path().join("oops").exists(),
+        "nothing may be expanded into the staging directory"
+    );
+}
+
+#[test]
+fn make_install_redirects_into_destdir_through_the_environment() {
+    // The intended real-world shape of a build step, and the reason `DESTDIR`
+    // is an environment variable rather than a substitution.
+    if Command::new("make").arg("-v").output().is_err() {
+        eprintln!("skipping make_install_redirects_into_destdir: `make` is not installed");
+        return;
+    }
+
+    let (work, dest) = workdirs();
+    std::fs::write(
+        work.path().join("Makefile"),
+        "PREFIX ?= /usr\n\ninstall:\n\tinstall -d $(DESTDIR)$(PREFIX)/bin\n\tinstall -m755 payload $(DESTDIR)$(PREFIX)/bin/payload\n",
+    )
+    .expect("write the Makefile");
+    std::fs::write(work.path().join("payload"), "#!/bin/sh\nexit 0\n").expect("write the payload");
+
+    install_step("make", &["make install"])
+        .execute(work.path(), dest.path())
+        .expect("`make install` must succeed");
+
+    assert!(
+        dest.path().join("usr/bin/payload").is_file(),
+        "make must expand $(DESTDIR) itself and install into the staging tree"
+    );
+}
