@@ -2,6 +2,8 @@
 pub mod bf;
 /// Fetching a build file's sources over HTTP, hashing them as they land.
 pub mod download;
+/// Resolving a build file's dependency graph, and building it.
+pub mod graph;
 /// Package metadata written into each archive.
 pub mod metadata;
 /// Inferring the permissions a package actually needs, from its source, its

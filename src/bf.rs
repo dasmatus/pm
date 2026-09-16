@@ -17,6 +17,7 @@ use std::{
     env::current_dir,
     fs::{copy, create_dir_all, read_to_string, write},
     iter::once,
+    num::NonZeroUsize,
     path::{Path, PathBuf},
     process::Command,
 };
@@ -28,6 +29,7 @@ use tracing::{debug, info, warn};
 use walkdir::WalkDir;
 
 use crate::{
+    graph::Graph,
     metadata::{Metadata, Type},
     perms::{Enforcement, Permissions, elf, source},
     policy::BuildPolicy,
@@ -49,7 +51,7 @@ const POLICY_FINGERPRINT_KEY: &str = "policy_fingerprint";
 /// unverified escape hatch must not silently start demanding signatures of its
 /// dependencies, and one loaded properly must never stop.
 #[derive(Serialize, Deserialize, Default, Debug, Clone, Copy, PartialEq, Eq)]
-enum Verification {
+pub(crate) enum Verification {
     /// No signature was checked. Only reachable through
     /// [`BuildFile::load_unverified`] or by deserialising a value directly.
     #[default]
@@ -73,10 +75,17 @@ pub struct BuildOptions {
     /// build file the calling user's full access to `$HOME`, the network and
     /// every file they can reach, and says so loudly in the log.
     pub unsandboxed: bool,
+    /// How many packages may build at once.
+    ///
+    /// `None`, the default, means [`std::thread::available_parallelism`]. One
+    /// job is the sequential build this crate did before there was a
+    /// scheduler, and is the honest way to take concurrency out of the picture
+    /// when a build misbehaves.
+    pub jobs: Option<NonZeroUsize>,
 }
 
 /// A parsed build file: everything needed to build and package one package.
-#[derive(Serialize, Deserialize, Default)]
+#[derive(Serialize, Deserialize, Default, Clone)]
 pub struct BuildFile {
     name: String,
     version: Vec<String>,
@@ -208,12 +217,7 @@ impl BuildFile {
         options: BuildOptions,
         progress: &Progress,
     ) -> miette::Result<PathBuf> {
-        let mut visiting = Vec::new();
-        let mut built = HashMap::new();
-        if let Some(source) = &self.source {
-            visiting.push(source.clone());
-        }
-        self.run_tracked(options, progress, &mut visiting, &mut built)
+        Graph::resolve(self, options)?.build(options, progress)
     }
 
     /// The package name.
@@ -232,6 +236,23 @@ impl BuildFile {
     #[must_use]
     pub fn version_string(&self) -> String {
         self.version.join(".")
+    }
+
+    /// Where this build file was read from, if it came off disk.
+    ///
+    /// The canonical form of this path is a package's identity to
+    /// [`crate::graph::Graph`]: two build files at one path are one package.
+    pub(crate) fn source(&self) -> Option<&Path> {
+        self.source.as_deref()
+    }
+
+    /// How far this build file was trusted when it was loaded.
+    ///
+    /// The resolver loads the whole graph at the root's strictness, so a
+    /// signed build file cannot pull in unsigned dependencies and an
+    /// unverified one does not suddenly start demanding signatures.
+    pub(crate) fn verification(&self) -> Verification {
+        self.verification
     }
 
     /// Paths of the build files this package depends on.
@@ -266,48 +287,40 @@ impl BuildFile {
         Ok(build_file)
     }
 
-    /// Recursive worker behind [`BuildFile::run`].
+    /// Build this one package, its dependencies already built.
     ///
-    /// `visiting` is the stack of canonical build-file paths currently being
-    /// built; a dependency that is already on it closes a cycle. `built` caches
-    /// archives already produced in this invocation so a diamond dependency is
-    /// built once rather than once per path to it.
-    fn run_tracked(
+    /// Which packages get built, and in what order, is [`Graph`]'s job; this is
+    /// what was left when that moved out. `policy` is the one the graph derived
+    /// for this package during resolution, and `dependency_archives` are the
+    /// archives its dependencies produced.
+    ///
+    /// # Errors
+    ///
+    /// Returns a diagnostic when the workspace cannot be created, when staging
+    /// or packaging fails, or when the finished archive cannot be moved out of
+    /// the workspace. A staging failure leaks the workspace rather than
+    /// deleting it, so the half-finished tree can still be inspected.
+    pub(crate) fn build_alone(
         &self,
         options: BuildOptions,
+        policy: &BuildPolicy,
         progress: &Progress,
-        visiting: &mut Vec<PathBuf>,
-        built: &mut HashMap<PathBuf, PathBuf>,
+        dependency_archives: &[PathBuf],
     ) -> miette::Result<PathBuf> {
-        // Read the build file first. Deriving the policy before the dependency
-        // walk means a build file whose commands cannot be classified is
-        // rejected before anything at all is built for it.
-        let policy = self.derive_policy(options.permissive)?;
-
-        // The line opens BEFORE the dependency walk, so a package waiting on
-        // its dependencies is visibly waiting rather than absent.
         let task = progress.task(format!("{}-{}", self.name, self.version_string()));
-        if !self.dependencies.is_empty() {
-            task.set_message(format!(
-                "waiting on {} dependencies",
-                self.dependencies.len()
-            ));
-        }
-
-        let dependency_archives = self.build_dependencies(options, progress, visiting, built)?;
         task.set_message("building");
-
         info!("building {} version {}", self.name, self.version_string());
+
         let mut workspace = Workspace::new(format!("{}-{}", self.name, self.version_string()))?;
         let archive_name = format!("{}-{}.cpkg", self.name, self.version_string());
         let staged_archive = workspace.path().join(&archive_name);
 
         if let Err(report) = self.stage(
-            &policy,
+            policy,
             options,
             &task,
             workspace.path(),
-            &dependency_archives,
+            dependency_archives,
             &staged_archive,
         ) {
             // Leak the workspace so the half-finished tree can be inspected.
@@ -321,105 +334,6 @@ impl BuildFile {
             .join(&archive_name);
         let archive = workspace.persist(&staged_archive, &destination)?;
         info!("packaged {} at {}", self.name, archive.display());
-        Ok(archive)
-    }
-
-    /// Match every step command against the built-in fingerprint table and log
-    /// what came out.
-    fn derive_policy(&self, permissive: bool) -> miette::Result<BuildPolicy> {
-        let policy = BuildPolicy::derive(self, permissive).wrap_err_with(|| {
-            format!(
-                "cannot derive a sandbox policy for {}; run `pm explain` on it to see the \
-                 whole build file, or build with --permissive to allow the commands anyway",
-                self.name
-            )
-        })?;
-
-        for (command, fingerprint) in policy.matches() {
-            info!(
-                package = %self.name,
-                command = %command,
-                fingerprint = %fingerprint,
-                "step command classified"
-            );
-        }
-        info!(
-            package = %self.name,
-            fingerprint = policy.fingerprint(),
-            capabilities = ?policy.capabilities(),
-            "derived the sandbox policy from the build file"
-        );
-
-        Ok(policy)
-    }
-
-    /// Build every dependency in turn, returning the archive produced for each.
-    ///
-    /// Deliberately sequential: this recurses, and recursing inside a Rayon
-    /// `par_iter` runs the nested build on a worker of the same global pool
-    /// while the outer task blocks on it, which starves the pool on deep or
-    /// wide dependency graphs. Dependency builds are I/O- and subprocess-bound
-    /// anyway, so there is little to win here.
-    fn build_dependencies(
-        &self,
-        options: BuildOptions,
-        progress: &Progress,
-        visiting: &mut Vec<PathBuf>,
-        built: &mut HashMap<PathBuf, PathBuf>,
-    ) -> miette::Result<Vec<PathBuf>> {
-        if self.dependencies.is_empty() {
-            return Ok(Vec::new());
-        }
-        info!("resolving {} dependencies", self.dependencies.len());
-
-        self.dependencies
-            .iter()
-            .map(|dependency| self.build_dependency(dependency, options, progress, visiting, built))
-            .collect()
-    }
-
-    /// Build one dependency, reusing an archive already built in this run.
-    fn build_dependency(
-        &self,
-        dependency: &Path,
-        options: BuildOptions,
-        progress: &Progress,
-        visiting: &mut Vec<PathBuf>,
-        built: &mut HashMap<PathBuf, PathBuf>,
-    ) -> miette::Result<PathBuf> {
-        if !dependency.is_file() {
-            return Err(miette!(
-                "dependency of {} is not a build file: {}",
-                self.name,
-                dependency.display()
-            ));
-        }
-        let key = dependency
-            .canonicalize()
-            .into_diagnostic()
-            .wrap_err_with(|| format!("cannot resolve dependency {}", dependency.display()))?;
-
-        if visiting.contains(&key) {
-            return Err(miette!("dependency cycle: {}", cycle_chain(visiting, &key)));
-        }
-        if let Some(archive) = built.get(&key) {
-            debug!("reusing already built dependency {}", key.display());
-            return Ok(archive.clone());
-        }
-
-        visiting.push(key.clone());
-        // A dependency is loaded exactly as strictly as the build file naming
-        // it was: signatures are checked all the way down, or not at all.
-        let load = match self.verification {
-            Verification::Signed => Self::load,
-            Verification::Unverified => Self::load_unverified,
-        };
-        let result =
-            load(&key).and_then(|loaded| loaded.run_tracked(options, progress, visiting, built));
-        visiting.pop();
-
-        let archive = result.wrap_err_with(|| format!("dependency {} failed", key.display()))?;
-        built.insert(key, archive.clone());
         Ok(archive)
     }
 
@@ -750,17 +664,6 @@ fn summarise(permissions: &Permissions) -> String {
     .map(|(label, _)| label.to_owned());
 
     counted.chain(flagged).collect::<Vec<_>>().join(", ")
-}
-
-/// Render the cycle `visiting` closes when `key` is entered again.
-fn cycle_chain(visiting: &[PathBuf], key: &Path) -> String {
-    let start = visiting.iter().position(|seen| seen == key).unwrap_or(0);
-    visiting[start..]
-        .iter()
-        .map(|path| path.display().to_string())
-        .chain(std::iter::once(key.display().to_string()))
-        .collect::<Vec<_>>()
-        .join(" -> ")
 }
 
 /// Classify every regular file under `staging`, keyed by its path RELATIVE to

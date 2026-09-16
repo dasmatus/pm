@@ -18,6 +18,7 @@ use std::{
     ffi::OsString,
     fs::{OpenOptions, read_to_string, remove_file, rename, write},
     io::{ErrorKind, Write as _},
+    num::NonZeroUsize,
     path::{Path, PathBuf},
     process::Command,
 };
@@ -89,6 +90,13 @@ enum Commands {
         /// use it on a build file you wrote yourself.
         #[arg(long)]
         unsandboxed: bool,
+        /// How many packages to build at once. Defaults to the core count.
+        ///
+        /// A dependency graph is built with several packages in flight at a
+        /// time. `-j1` builds them one after another, which is the first thing
+        /// to reach for when a build fails only under concurrency.
+        #[arg(short, long, value_name = "N")]
+        jobs: Option<NonZeroUsize>,
     },
     /// Print the sandbox policy derived from a build file, without building.
     ///
@@ -278,7 +286,8 @@ fn main() -> miette::Result<()> {
             file,
             permissive,
             unsandboxed,
-        } => build(&file, permissive, unsandboxed, &progress)?,
+            jobs,
+        } => build(&file, permissive, unsandboxed, jobs, &progress)?,
         Commands::Explain { file, permissive } => explain(&file, permissive)?,
         Commands::Generate { file, force } => generate(&file, force)?,
         Commands::Run {
@@ -371,6 +380,7 @@ fn build(
     file: &Path,
     permissive: bool,
     unsandboxed: bool,
+    jobs: Option<NonZeroUsize>,
     progress: &Progress,
 ) -> miette::Result<()> {
     if !file.exists() {
@@ -406,6 +416,7 @@ fn build(
         BuildOptions {
             permissive,
             unsandboxed,
+            jobs,
         },
         progress,
     )?;

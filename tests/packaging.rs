@@ -5,52 +5,22 @@
 //! directory, and Rust runs tests as threads inside a single process, so every
 //! test here moves the current directory under a lock and puts it back again.
 
-use std::env::{current_dir, set_current_dir};
+use std::env::current_dir;
 use std::fs::{read, read_to_string, write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::mpsc::channel;
-use std::sync::{Mutex, MutexGuard};
 use std::thread::spawn;
 use std::time::Duration;
 
 use pm::bf::{BuildFile, BuildOptions};
 use pm::metadata::{LibraryType, Metadata, Type};
 use pm::progress::Progress;
-use serde::Serialize;
-use serde_yaml::{from_str, to_string};
+use serde_yaml::from_str;
 use tempfile::{TempDir, tempdir};
 
-/// Serialises every current-directory change in this test binary.
-static CWD_LOCK: Mutex<()> = Mutex::new(());
-
-/// Holds the current directory at `to` until it is dropped, then restores it
-/// and releases the lock. Fields drop in declaration order, so the directory is
-/// restored before the next test is allowed to take the lock.
-struct CwdGuard {
-    previous: PathBuf,
-    _lock: MutexGuard<'static, ()>,
-}
-
-impl CwdGuard {
-    fn enter(to: &Path) -> Self {
-        let lock = CWD_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let previous = current_dir().expect("a current directory");
-        set_current_dir(to).expect("move into the test directory");
-        Self {
-            previous,
-            _lock: lock,
-        }
-    }
-}
-
-impl Drop for CwdGuard {
-    fn drop(&mut self) {
-        let _ = set_current_dir(&self.previous);
-    }
-}
+mod common;
+use common::{CwdGuard, build_file_yaml, write_build_file};
 
 /// Stages a binary and two libraries into `DESTDIR`.
 ///
@@ -67,59 +37,6 @@ printf '#!/bin/sh\\nexit 0\\n' > \"$DESTDIR/usr/bin/mytool\"\n\
 chmod 755 \"$DESTDIR/usr/bin/mytool\"\n\
 printf 'stand-in for a shared object\\n' > \"$DESTDIR/usr/lib/libfoo.so\"\n\
 printf 'stand-in for an archive\\n' > \"$DESTDIR/usr/lib/libbar.a\"\n";
-
-/// One step of a build file, shaped for serialisation into YAML.
-///
-/// `dl_urls` is always `null` here: these tests never download anything.
-#[derive(Serialize)]
-struct StepSpec {
-    stage: &'static str,
-    dl_urls: Option<()>,
-    name: String,
-    run: Vec<String>,
-}
-
-/// A whole build file, shaped for serialisation into YAML.
-///
-/// Going through `serde_yaml` rather than `format!` keeps the shell quoting in
-/// the commands from having to survive a second round of YAML quoting by hand.
-#[derive(Serialize)]
-struct BuildSpec {
-    name: String,
-    version: Vec<String>,
-    dependencies: Vec<String>,
-    steps: Vec<StepSpec>,
-}
-
-/// Renders a build file whose single `Install` step runs `commands`.
-fn build_file_yaml(
-    name: &str,
-    version: &[&str],
-    dependencies: &[&Path],
-    commands: &[&str],
-) -> String {
-    let spec = BuildSpec {
-        name: name.into(),
-        version: version.iter().map(|v| (*v).to_string()).collect(),
-        dependencies: dependencies
-            .iter()
-            .map(|d| d.display().to_string())
-            .collect(),
-        steps: vec![StepSpec {
-            stage: "Install",
-            dl_urls: None,
-            name: format!("stage-{name}"),
-            run: commands.iter().map(|c| (*c).to_string()).collect(),
-        }],
-    };
-    to_string(&spec).expect("a build file must serialise")
-}
-
-/// Writes a build file at `path` and hands the path back.
-fn write_build_file(path: PathBuf, yaml: &str) -> PathBuf {
-    write(&path, yaml).expect("write the build file");
-    path
-}
 
 /// Runs `build` with the current directory moved to `at`, returning an absolute
 /// path to whatever archive it produced.
