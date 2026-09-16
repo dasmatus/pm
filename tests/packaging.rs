@@ -14,8 +14,9 @@ use std::sync::{Mutex, MutexGuard};
 use std::thread::spawn;
 use std::time::Duration;
 
-use pm::bf::BuildFile;
+use pm::bf::{BuildFile, BuildOptions};
 use pm::metadata::{LibraryType, Metadata, Type};
+use pm::progress::Progress;
 use serde::Serialize;
 use serde_yaml::{from_str, to_string};
 use tempfile::{TempDir, tempdir};
@@ -628,5 +629,46 @@ fn destdir_reaches_a_real_makefile() {
         Some(&Type::Binary),
         "the make-installed binary must be recorded as an entrypoint, got {:?}",
         metadata.entrypoints().collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn a_build_reporting_into_a_region_still_produces_its_archive() {
+    let work = tempdir().expect("work directory");
+    let script = work.path().join("stage.sh");
+    write(&script, STAGE_SCRIPT).expect("write the staging script");
+    let stage = format!("/bin/sh {}", script.display());
+    let build_file = write_build_file(
+        work.path().join("build.yaml"),
+        &build_file_yaml("reported", &["0", "1", "0"], &[], &[stage.as_str()]),
+    );
+    let build = BuildFile::load_unverified(&build_file).expect("the build file must load");
+
+    // A region that renders for real, into nothing. This is the whole stack:
+    // a package line, a jailed command under it whose stdout is captured and
+    // streamed into that line, and the archive at the end of it.
+    let progress = Progress::to_writer(Box::new(std::io::sink()), 100);
+
+    let archive = {
+        let _cwd = CwdGuard::enter(work.path());
+        let produced = build
+            .run_with_progress(BuildOptions::default(), &progress)
+            .expect("the build must succeed with a region attached");
+        if produced.is_absolute() {
+            produced
+        } else {
+            current_dir().expect("a current directory").join(produced)
+        }
+    };
+
+    assert!(
+        archive.is_file(),
+        "capturing a command's stdout must not cost us the archive: {}",
+        archive.display()
+    );
+    assert!(
+        progress.snapshot().is_empty(),
+        "every line must be closed once the build is over, got {:?}",
+        progress.snapshot()
     );
 }

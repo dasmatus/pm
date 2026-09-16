@@ -1,5 +1,6 @@
 /target
 .env
+.claude/worktrees/
 
 # Demo artifacts. `examples/demo.sh` regenerates all of these.
 /out

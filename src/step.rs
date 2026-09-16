@@ -2,18 +2,17 @@
 
 use std::{
     collections::HashMap,
-    fs::{create_dir_all, remove_file},
+    fs::create_dir_all,
     path::{Path, PathBuf},
 };
 
-use fetch_data::hash_download;
 use miette::miette;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 use url::Url;
 
-use crate::sandbox::BuildSandbox;
+use crate::{download::Downloader, progress::Task, sandbox::BuildSandbox};
 
 /// A single step of a build: an optional set of downloads followed by a list of
 /// commands to run.
@@ -43,7 +42,7 @@ impl Step {
     /// its own subdirectory of `workdir` so that two URLs sharing a basename cannot
     /// overwrite one another, and each one's SHA-256 is checked case-insensitively against
     /// the expected hash from the build file. They do not go through the sandbox because
-    /// they are not child processes: [`fetch_data`] fetches them from this process, so
+    /// they are not child processes: [`Downloader`] fetches them from this process, so
     /// confining them would mean confining `pm` itself. Their *output* is nonetheless
     /// written where the confined commands will read it, which is the part that matters.
     ///
@@ -87,43 +86,35 @@ impl Step {
             ));
         }
 
-        self.download(workdir)?;
+        self.download(sandbox.progress(), workdir)?;
         self.run_commands(sandbox)
     }
 
     /// Fetch every download of this step into `workdir` and verify its hash.
     ///
     /// Downloads are independent of one another, so unlike the commands they are safe to
-    /// run in parallel.
-    fn download(&self, workdir: &Path) -> miette::Result<()> {
+    /// run in parallel. Each opens its own line under `progress`, which is what makes a
+    /// step fetching four tarballs legible rather than four interleaved log streams.
+    fn download(&self, progress: &Task, workdir: &Path) -> miette::Result<()> {
         let Some(dl_urls) = self.dl_urls.as_ref() else {
             return Ok(());
         };
+
+        let downloader = Downloader::new();
 
         dl_urls
             .par_iter()
             .try_for_each(|(url, expected)| -> miette::Result<()> {
                 let dest = Self::download_dest(workdir, url)?;
+                let task = progress.child(Self::download_file_name(url)?);
 
-                // `hash_download` downloads the file and returns the hash it COMPUTED, so
-                // its return value is the actual hash and the build file holds the expected one.
-                let actual = hash_download(url.as_str(), &dest).map_err(|e| {
-                    miette!("Failed to download `{url}` to `{}`: {e}", dest.display())
-                })?;
-
-                let (actual, expected) = (actual.trim(), expected.trim());
-                if !actual.eq_ignore_ascii_case(expected) {
-                    // Do not leave a corrupt file behind for a later step to pick up.
-                    if let Err(e) = remove_file(&dest) {
-                        warn!(
-                            "Could not remove mismatched download `{}`: {e}",
-                            dest.display()
-                        );
-                    }
-                    return Err(miette!(
-                        "Hash mismatch for `{url}`: expected {expected}, got {actual}"
-                    ));
-                }
+                downloader
+                    .fetch_verified(url, &dest, expected, |done, total| {
+                        task.set_bytes(done, total);
+                    })
+                    .map_err(|report| {
+                        report.wrap_err(format!("cannot fetch `{url}` for step `{}`", self.name))
+                    })?;
 
                 info!("{url} downloaded and verified.");
                 Ok(())
@@ -173,8 +164,8 @@ impl Step {
     ///
     /// This is FNV-1a, written out inline: it only has to turn a URL into a deterministic
     /// directory name, so a non-cryptographic hash is enough and pulling in a dependency
-    /// for it is not warranted. `fetch_data::hash_file` is no use here - it hashes file
-    /// contents, and the file does not exist yet.
+    /// for it is not warranted. The SHA-256 [`Downloader`] computes is no use here - it
+    /// covers the file's contents, and the file does not exist yet.
     fn url_digest(url: &Url) -> String {
         const OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
         const PRIME: u64 = 0x0000_0100_0000_01b3;

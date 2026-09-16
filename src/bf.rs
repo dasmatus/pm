@@ -31,6 +31,7 @@ use crate::{
     metadata::{Metadata, Type},
     perms::{Enforcement, Permissions, elf, source},
     policy::BuildPolicy,
+    progress::{Progress, Task},
     sandbox::BuildSandbox,
     signing::{TrustStore, default_trust_dir, verify_file},
     step::{Stage, Step},
@@ -189,12 +190,30 @@ impl BuildFile {
     ///
     /// As [`BuildFile::run`].
     pub fn run_with(&self, options: BuildOptions) -> miette::Result<PathBuf> {
+        self.run_with_progress(options, &Progress::disabled())
+    }
+
+    /// As [`BuildFile::run_with`], reporting what it is doing into `progress`.
+    ///
+    /// Each package built - this one and every dependency - opens its own line,
+    /// with the commands and downloads running under it nested beneath. A
+    /// [`Progress::disabled`] region reports nothing and costs nothing, which
+    /// is what the other two entry points pass.
+    ///
+    /// # Errors
+    ///
+    /// Everything [`BuildFile::run_with`] returns.
+    pub fn run_with_progress(
+        &self,
+        options: BuildOptions,
+        progress: &Progress,
+    ) -> miette::Result<PathBuf> {
         let mut visiting = Vec::new();
         let mut built = HashMap::new();
         if let Some(source) = &self.source {
             visiting.push(source.clone());
         }
-        self.run_tracked(options, &mut visiting, &mut built)
+        self.run_tracked(options, progress, &mut visiting, &mut built)
     }
 
     /// The package name.
@@ -256,6 +275,7 @@ impl BuildFile {
     fn run_tracked(
         &self,
         options: BuildOptions,
+        progress: &Progress,
         visiting: &mut Vec<PathBuf>,
         built: &mut HashMap<PathBuf, PathBuf>,
     ) -> miette::Result<PathBuf> {
@@ -264,7 +284,18 @@ impl BuildFile {
         // rejected before anything at all is built for it.
         let policy = self.derive_policy(options.permissive)?;
 
-        let dependency_archives = self.build_dependencies(options, visiting, built)?;
+        // The line opens BEFORE the dependency walk, so a package waiting on
+        // its dependencies is visibly waiting rather than absent.
+        let task = progress.task(format!("{}-{}", self.name, self.version_string()));
+        if !self.dependencies.is_empty() {
+            task.set_message(format!(
+                "waiting on {} dependencies",
+                self.dependencies.len()
+            ));
+        }
+
+        let dependency_archives = self.build_dependencies(options, progress, visiting, built)?;
+        task.set_message("building");
 
         info!("building {} version {}", self.name, self.version_string());
         let mut workspace = Workspace::new(format!("{}-{}", self.name, self.version_string()))?;
@@ -274,6 +305,7 @@ impl BuildFile {
         if let Err(report) = self.stage(
             &policy,
             options,
+            &task,
             workspace.path(),
             &dependency_archives,
             &staged_archive,
@@ -331,6 +363,7 @@ impl BuildFile {
     fn build_dependencies(
         &self,
         options: BuildOptions,
+        progress: &Progress,
         visiting: &mut Vec<PathBuf>,
         built: &mut HashMap<PathBuf, PathBuf>,
     ) -> miette::Result<Vec<PathBuf>> {
@@ -341,7 +374,7 @@ impl BuildFile {
 
         self.dependencies
             .iter()
-            .map(|dependency| self.build_dependency(dependency, options, visiting, built))
+            .map(|dependency| self.build_dependency(dependency, options, progress, visiting, built))
             .collect()
     }
 
@@ -350,6 +383,7 @@ impl BuildFile {
         &self,
         dependency: &Path,
         options: BuildOptions,
+        progress: &Progress,
         visiting: &mut Vec<PathBuf>,
         built: &mut HashMap<PathBuf, PathBuf>,
     ) -> miette::Result<PathBuf> {
@@ -380,7 +414,8 @@ impl BuildFile {
             Verification::Signed => Self::load,
             Verification::Unverified => Self::load_unverified,
         };
-        let result = load(&key).and_then(|loaded| loaded.run_tracked(options, visiting, built));
+        let result =
+            load(&key).and_then(|loaded| loaded.run_tracked(options, progress, visiting, built));
         visiting.pop();
 
         let archive = result.wrap_err_with(|| format!("dependency {} failed", key.display()))?;
@@ -398,6 +433,7 @@ impl BuildFile {
         &self,
         policy: &BuildPolicy,
         options: BuildOptions,
+        task: &Task,
         root: &Path,
         dependency_archives: &[PathBuf],
         archive: &Path,
@@ -421,8 +457,11 @@ impl BuildFile {
             })
             .collect::<miette::Result<Vec<PathBuf>>>()?;
 
-        let sandbox = self.sandbox(policy, options, &workdir, &staging, dependency_archives)?;
+        let sandbox = self
+            .sandbox(policy, options, &workdir, &staging, dependency_archives)?
+            .with_progress(task.handle());
         self.execute_steps(&sandbox, &workdir)?;
+        task.set_message("packaging");
 
         // Collect entrypoints BEFORE writing `metadata`, so the metadata file
         // does not end up listing itself as a runnable entrypoint.

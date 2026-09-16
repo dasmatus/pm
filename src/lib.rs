@@ -1,5 +1,7 @@
 /// Build-file parsing, building and packaging.
 pub mod bf;
+/// Fetching a build file's sources over HTTP, hashing them as they land.
+pub mod download;
 /// Package metadata written into each archive.
 pub mod metadata;
 /// Inferring the permissions a package actually needs, from its source, its
@@ -7,6 +9,8 @@ pub mod metadata;
 pub mod perms;
 /// Deriving a sandbox policy from the contents of a build file.
 pub mod policy;
+/// A live, redrawable region that reports what a build is doing right now.
+pub mod progress;
 /// Extracting and running a built package inside a sandbox.
 pub mod run;
 /// The hakoniwa jail that build steps run inside.

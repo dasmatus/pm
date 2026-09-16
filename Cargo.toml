@@ -16,9 +16,9 @@ arbitrary = { version = "1.4.2", features = ["derive"] }
 clap = { version = "4.6.6", features = ["derive"] }
 dialoguer = "0.12.0"
 either = { version = "1.18.0", features = ["serde"] }
-fetch-data = "0.2.0"
 hakoniwa = { version = "1.7.2", features = ["landlock"] }
 miette = { version = "7.6.0", features = ["fancy"] }
+minreq = { version = "3.0.0", features = ["https-rustls"] }
 nix = { version = "0.31.3", features = ["ptrace", "process", "signal"] }
 nom = "8.0.0"
 rayon = "1.12.0"

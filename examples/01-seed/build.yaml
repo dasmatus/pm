@@ -17,13 +17,14 @@ dependencies: []
 steps:
 
 # The confinement probes. These are ASSERTIONS, not setup: each one exits 0
-# only because the jail is shaped the way src/sandbox.rs:7-25 says it is. Run
-# the identical argv on the host and the /home, /root, /var, /build, /dest and
-# decoy probes all flip -- examples/demo.sh runs both columns side by side.
+# only because the jail is shaped the way the module doc of src/sandbox.rs
+# says it is. Run this same file under `pm build --unsandboxed` and it aborts
+# on the first of them, which is step 6 of examples/demo.sh and the whole
+# reason these lines are worth anything.
 #
 # There is no shell here. `test ! -e /root` reaches execve as the four words
 # ["test", "!", "-e", "/root"], which is a valid test(1) invocation. A command
-# string is split on whitespace and exec'd directly (src/step.rs:56-69).
+# string is split on whitespace and exec'd directly (Step::execute).
 - stage: Prepare
   dl_urls: null
   name: confine
@@ -49,10 +50,12 @@ steps:
   # but it cannot be written.
   - test -d /usr
   - test ! -w /usr
-  # /tmp is a FRESH tmpfs, not the host's. That matters more than it looks:
-  # every pm workspace lives under the host TMPDIR, so this is what stops one
-  # build from reading another build's tree. examples/demo.sh plants
-  # /tmp/pm-confinement-decoy/secret.txt on the host before building.
+  # /tmp is a FRESH tmpfs, not the host's, so nothing the host left there is
+  # reachable. examples/demo.sh plants /tmp/pm-confinement-decoy/secret.txt
+  # before building, and this is the line that says it stayed unreachable.
+  # Build workspaces are bind-mounted one at a time at /build, never by way of
+  # the directory holding them, so a sibling build's tree is out of reach for
+  # the same reason.
   - test -d /tmp
   - test ! -e /tmp/pm-confinement-decoy/secret.txt
 

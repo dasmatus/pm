@@ -2,7 +2,7 @@
 #
 # Depends on 02-lib, which depends on 01-seed. Dependencies are built
 # depth-first and sequentially, with a visiting stack that rejects cycles and a
-# memo map so a diamond builds once (src/bf.rs:349-389).
+# memo map so a diamond builds once (BuildFile::build_dependency).
 #
 # This package stages TWO entrypoints on purpose, because the interesting half
 # of pm happens after the build: a run-time permission profile is inferred from
@@ -50,5 +50,5 @@ steps:
   # profile, `pm run --audit` reports the access, and `pm run --enforce` denies
   # it. That gap is the point -- a profile derived by observation is incomplete
   # by construction, which is why a fresh one is recorded in audit mode and
-  # promoting it is a human decision (src/bf.rs:441-453).
+  # promoting it is a human decision (BuildFile::stage).
   - install -Dm755 /usr/bin/whoami /dest/usr/bin/leak

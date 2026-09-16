@@ -2,7 +2,7 @@
 //! stage ordering, and the environment the child process sees.
 
 use std::collections::HashMap;
-use std::fs::{create_dir_all, read_dir, read_to_string, write};
+use std::fs::{read_dir, read_to_string};
 use std::path::Path;
 use std::process::Command;
 
@@ -10,6 +10,9 @@ use pm::sandbox::BuildSandbox;
 use pm::step::{Stage, Step};
 use tempfile::{TempDir, tempdir};
 use url::Url;
+
+mod common;
+use common::{Body, TestServer};
 
 /// A step with no downloads attached.
 fn step(stage: Stage, name: &str, run: Vec<String>) -> Step {
@@ -51,6 +54,16 @@ fn download_step(name: &str, url: &str) -> Step {
         name: name.into(),
         run: Vec::new(),
     }
+}
+
+/// The SHA-256 of a fixture payload, as the build file would declare it.
+fn expected_hash(payload: &str) -> String {
+    match payload {
+        "first payload" => "bdaddc7127911b7a4d96de6f704ac24eea1357ec52d7249750e88d2baddd14d9",
+        "second payload" => "969e6ff862080fc76166b4f8eb362588b21d8e946c93a649ce8da91d1ab5e1ad",
+        other => panic!("no recorded digest for the payload {other:?}"),
+    }
+    .to_string()
 }
 
 /// The names of the entries directly under `dir`, sorted.
@@ -299,17 +312,12 @@ fn sorting_steps_by_stage_preserves_the_authored_order_within_a_stage() {
 }
 
 #[test]
-#[ignore = "needs a fetcher that understands file:// URLs; run with `cargo test -- --ignored`"]
 fn a_download_whose_hash_does_not_match_is_rejected() {
     let (work, dest) = workdirs();
-    let payload = work.path().join("payload.tar");
-    write(&payload, b"contents that hash to something else").expect("write the payload");
+    let server = TestServer::serving_one(b"contents that hash to something else");
 
     let mut urls = HashMap::new();
-    urls.insert(
-        Url::from_file_path(&payload).expect("a file:// URL"),
-        "0".repeat(64),
-    );
+    urls.insert(server.url("/source.tar.gz"), "0".repeat(64));
     let download = Step {
         stage: Stage::Prepare,
         dl_urls: Some(urls),
@@ -331,14 +339,13 @@ fn a_download_whose_hash_does_not_match_is_rejected() {
 #[test]
 fn downloads_sharing_a_basename_do_not_share_a_destination() {
     let (work, dest) = workdirs();
-    // Offline by construction: `file://` URLs are not something the downloader
-    // can fetch, so each of these steps fails. The destination directory is
-    // derived and created BEFORE the fetch is attempted, though, so what the
-    // work directory holds afterwards is exactly the destination mapping this
-    // test is about. See the `#[ignore]`d test below for the end-to-end path,
-    // which needs a fetcher this crate does not have.
-    let first = download_step("first", "file:///pm-integration-test/one/source.tar.gz");
-    let second = download_step("second", "file:///pm-integration-test/two/source.tar.gz");
+    // Offline by construction: port 1 has nothing listening, so each of these
+    // steps fails to connect. The destination directory is derived and created
+    // BEFORE the fetch is attempted, though, so what the work directory holds
+    // afterwards is exactly the destination mapping this test is about. The
+    // end-to-end path is covered by the test below, which serves real bodies.
+    let first = download_step("first", "http://127.0.0.1:1/one/source.tar.gz");
+    let second = download_step("second", "http://127.0.0.1:1/two/source.tar.gz");
 
     assert!(
         first
@@ -361,10 +368,7 @@ fn downloads_sharing_a_basename_do_not_share_a_destination() {
 
     // The same URL must map to the same destination every time, or a resumed
     // build would re-download everything.
-    let again = download_step(
-        "first-again",
-        "file:///pm-integration-test/one/source.tar.gz",
-    );
+    let again = download_step("first-again", "http://127.0.0.1:1/one/source.tar.gz");
     assert!(
         again
             .execute(&host_sandbox(work.path(), dest.path()), work.path())
@@ -378,23 +382,27 @@ fn downloads_sharing_a_basename_do_not_share_a_destination() {
 }
 
 #[test]
-#[ignore = "needs a fetcher that understands file:// URLs; run with `cargo test -- --ignored`"]
 fn two_downloads_sharing_a_basename_both_land() {
     let (work, dest) = workdirs();
-    let sources = tempdir().expect("source directory");
+    // Two different bodies served under different paths but the SAME basename,
+    // which is the collision `Step::download_dest` exists to prevent.
+    let server = TestServer::serving(HashMap::from([
+        (
+            "/one/source.tar.gz".to_string(),
+            Body::Measured(b"first payload".to_vec()),
+        ),
+        (
+            "/two/source.tar.gz".to_string(),
+            Body::Measured(b"second payload".to_vec()),
+        ),
+    ]));
 
     let mut dl_urls = HashMap::new();
-    for (directory, payload) in [("one", "first payload"), ("two", "second payload")] {
-        // Two different files, deliberately sharing the basename that ends up
-        // naming the download on disk.
-        let directory = sources.path().join(directory);
-        create_dir_all(&directory).expect("create the source directory");
-        let source = directory.join("source.tar.gz");
-        write(&source, payload).expect("write the payload");
-
-        let url = Url::from_file_path(&source).expect("a file:// URL");
-        let hash = fetch_data::hash_file(&source).expect("hash the payload");
-        dl_urls.insert(url, hash);
+    for (path, payload) in [
+        ("/one/source.tar.gz", "first payload"),
+        ("/two/source.tar.gz", "second payload"),
+    ] {
+        dl_urls.insert(server.url(path), expected_hash(payload));
     }
 
     let fetching = Step {

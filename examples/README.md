@@ -27,12 +27,19 @@ That builds the chain end to end and then demonstrates both of pm's confinement
 layers. It uses a throwaway signing key under `examples/.demo-config` and never
 touches your real `~/.config/pm`.
 
+It also points `TMPDIR` at `out/tmp` first, and that is not tidiness. Every
+build workspace lives under `TMPDIR` (`Workspace::new`), and compiling pm's own
+dependency graph in release mode needs several GB there. Where `/tmp` is a
+tmpfs, which is the Fedora default, the build dies partway through `aws-lc-sys`
+with `Disk quota exceeded (os error 122)`. Anything building more than a toy
+package through `pm` wants `TMPDIR` on real disk.
+
 ---
 
 ## The format
 
 A build file is plain YAML with exactly four fields, all required
-(`src/bf.rs:78-95`):
+(`BuildFile` in `src/bf.rs`):
 
 | field | type | notes |
 |---|---|---|
@@ -41,7 +48,7 @@ A build file is plain YAML with exactly four fields, all required
 | `dependencies` | list of **paths to other build files** | no registry, no names, no version constraints |
 | `steps` | list of steps | may be empty |
 
-A step (`src/step.rs:20-30`):
+A step (`Step` in `src/step.rs`):
 
 | field | type | notes |
 |---|---|---|
@@ -51,12 +58,12 @@ A step (`src/step.rs:20-30`):
 | `dl_urls` | map URL → SHA-256, or `null` | the only optional field |
 
 Steps are sorted by stage and keep their authored order within a stage
-(`src/bf.rs:641-649`). `pm generate <file>` writes a minimal skeleton.
+(`BuildFile::execute_steps`). `pm generate <file>` writes a minimal skeleton.
 
 ### There is no shell
 
 This is the single most surprising thing about the format. A command string is
-split on whitespace and `execve`d directly (`src/step.rs:56-69`). No quoting, no
+split on whitespace and `execve`d directly (`Step::execute`). No quoting, no
 globbing, no pipes, no redirection, **no variable expansion**.
 
 ```yaml
@@ -72,7 +79,7 @@ convention: `make install` reads it and the Makefile's own rules expand
 a hand-written `cp`. Anything that genuinely needs a shell goes in a script
 file, invoked as two plain words: `/bin/sh /abs/path/to/script.sh`.
 
-The jailed environment is exactly five variables (`src/sandbox.rs:296-315`):
+The jailed environment is exactly five variables (`BuildSandbox::run_jailed`):
 
 ```
 DESTDIR=/dest   PATH=/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bin:/sbin
@@ -83,7 +90,7 @@ with the working directory at `/build`. Nothing else is inherited.
 
 ### Every command must be recognised
 
-The sandbox policy is **derived, never declared** (`src/policy.rs:1-9`):
+The sandbox policy is **derived, never declared** (the module doc of `src/policy.rs`):
 
 > A build file is data supplied by whoever wrote the package, so the sandbox it
 > runs in must not be configured by that same file: a hostile build file would
@@ -107,7 +114,7 @@ An optional leading path is allowed, so `/bin/sh` and `./configure` match, while
 a build file and exits non-zero on anything unmatched, which makes it usable as
 a lint.
 
-Only `Network` actually changes the jail today (`src/sandbox.rs:204-216`). The
+Only `Network` actually changes the jail today (`BuildSandbox::new`). The
 other five capabilities — `Toolchain`, `Coreutils`, `Shell`, `Archive`,
 `VersionControl` — are derived and reported but alter no mount. Calling this
 "capability-scoped build confinement" would be overclaiming; it is a
@@ -116,24 +123,24 @@ classification gate plus a network switch.
 ### Signing is not optional
 
 `pm build` and `pm explain` verify a detached `<FILE>.sig` **before** parsing
-the file, against `$XDG_CONFIG_HOME/pm/trusted/` (`src/bf.rs:137-140`). How the
+the file, against `$XDG_CONFIG_HOME/pm/trusted/` (`BuildFile::load`). How the
 top-level file was loaded rides on the value, so dependencies are held to the
 same standard all the way down — signed all the way, or not at all
-(`src/bf.rs:376-383`). `pm run` and `pm profile` verify the `.cpkg` too.
+(`BuildFile::build_dependency`). `pm run` and `pm profile` verify the `.cpkg` too.
 
 Editing a build file invalidates its signature, including a comment. `demo.sh`
 re-signs everything on each run.
 
 ### Dependencies resolve against the *process* working directory
 
-Not against the build file's directory (`src/bf.rs:357-364`). That is why every
-`dependencies:` entry here is spelled `../examples/...`: `demo.sh` runs `pm`
+Not against the build file's directory (`BuildFile::build_dependency`). That is
+why every `dependencies:` entry here is spelled `../examples/...`: `demo.sh` runs `pm`
 from the repo's `out/` directory throughout.
 
 Running from `out/` is deliberate. Archives land in the process working
 directory, and the directory holding each dependency archive is bind-mounted
-read-only into the dependent package's jail (`src/bf.rs:605-627`). Building from
-`out/` means a dependent package sees a directory of `.cpkg` files; building
+read-only into the dependent package's jail (`BuildFile::read_only_mounts`).
+Building from `out/` means a dependent package sees a directory of `.cpkg` files; building
 from the repo root would have handed it the whole repository.
 
 A dependency's archive is copied into the dependent's `DESTDIR` as
@@ -158,7 +165,7 @@ placeholders `@SRCDIR@`, `@HOME@`, `@TRIPLE@`, `@CC@`, `@AR@`.
 
 ## What a build step can actually touch
 
-The jail (`src/sandbox.rs:7-25`, `src/bf.rs:588-627`):
+The jail (the module doc of `src/sandbox.rs`, and `BuildFile::read_only_mounts`):
 
 | path | access | why |
 |---|---|---|
@@ -177,7 +184,8 @@ The jail (`src/sandbox.rs:7-25`, `src/bf.rs:588-627`):
 
 ### The `/home` nuance, stated precisely
 
-`src/sandbox.rs:490` says the jail "never has a `/home` at all". On a
+The doc on `toolchain_roots` in `src/sandbox.rs` says the jail "never has a
+`/home` at all". On a
 checkout that lives under a home directory — like this one — that is not quite
 right, and the examples are written to assert the accurate version instead.
 
@@ -212,8 +220,8 @@ cannot make that assertion without hard-coding a username, so they assert
 
 ## The two confinement layers
 
-They are separate mechanisms with separate vocabularies, and `src/bf.rs:1-13` is
-careful never to conflate them.
+They are separate mechanisms with separate vocabularies, and the module doc of
+`src/bf.rs` is careful never to conflate them.
 
 **The build jail** (hakoniwa namespaces, no landlock) confines the *build*.
 Its policy comes from the fingerprint table. This is what the `confine` step in
@@ -226,7 +234,8 @@ tree-sitter analysis of the sources in the working directory, and ELF analysis
 is extracted read-only at `/pkg` and the entrypoint runs with that as its
 working directory.
 
-The build is deliberately **not** traced (`src/bf.rs:483-492`): tracing a build
+The build is deliberately **not** traced, and `BuildFile::derive_permissions`
+says why. Tracing a build
 traces the compiler, and would hand the package every header under
 `/usr/include`, the linker's temp files and the tarball fetch. The ptrace
 monitor belongs to `pm run --audit`, where it traces the actual entrypoint.
@@ -421,7 +430,8 @@ Not demonstrated, and not claimed:
 `derive_permissions` runs `source::scan` over the **working directory**, on the
 stated assumption that "the steps unpacked and patched the package's sources
 there, so that tree is what the shipped program was compiled from"
-(`src/bf.rs:473-475`). For a cargo build that assumption does not hold. The jail
+(`BuildFile::derive_permissions`). For a cargo build that assumption does not
+hold. The jail
 sets `HOME=/build`, so `CARGO_HOME` is `/build/.cargo`, so the working directory
 ends up holding the unpacked source of **every downloaded dependency**. The scan
 reads all of it.
@@ -442,7 +452,7 @@ appears in libc's **GNU Hurd** module. `/etc/default/init` comes from an
 **illumos** timezone backend. `/dev/zero` comes from a dependency's **test
 file**. None of that code is even compiled into the binary.
 
-This is the same failure `src/bf.rs:484-492` argues against for tracing —
+This is the same failure `BuildFile::derive_permissions` argues against for tracing —
 
 > Tracing a build traces the **compiler**: the profile would come back holding
 > every header under `/usr/include` […] A profile that wide means nothing
@@ -463,7 +473,7 @@ says.
 ## Notes on the toolchain
 
 `pm` resolves the **first word** of a step against the *host* `PATH` and hands
-`execve` the canonicalised result (`src/sandbox.rs:392-435`). That is what makes
+`execve` the canonicalised result (`BuildSandbox::resolve`). That is what makes
 a toolchain installed outside `/usr` usable at all — `cargo` in a Nix profile
 resolves to `/nix/store/…/bin/cargo`, and `/nix/store` is mounted.
 

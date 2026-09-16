@@ -7,8 +7,8 @@
 # here: cargo runs inside the same jail every other package got.
 #
 # ---------------------------------------------------------------------------
-# THIS IS A TEMPLATE. examples/demo.sh substitutes two placeholders and writes
-# the result to <repo>/pm.yaml:
+# THIS IS A TEMPLATE. examples/demo.sh substitutes five placeholders and
+# writes the result to <repo>/pm.yaml:
 #
 #   @SRCDIR@   the absolute path of the repository root
 #   @HOME@     the absolute path of $HOME
@@ -16,11 +16,12 @@
 #   @CC@       the C compiler, canonicalised: `readlink -f $(command -v cc)`
 #   @AR@       the archiver, canonicalised: `readlink -f $(command -v ar)`
 #
-# Both have to be absolute because a build file has no $srcdir: commands run
-# with the working directory at /build, and the only thing mounted from the
-# host is this file's own directory, at its own absolute path. That is also
-# why this file must sit at the repository root -- the mount pm gets is the
-# directory the build file lives in, and cargo needs the whole source tree.
+# Every one of them is an absolute path, because a build file has no $srcdir.
+# Commands run with the working directory at /build, and the only thing
+# mounted from the host is this file's own directory, at its own absolute
+# path. That is also why this file must sit at the repository root -- the
+# mount pm gets is the directory the build file lives in, and cargo needs the
+# whole source tree.
 # ---------------------------------------------------------------------------
 name: pm
 version:
@@ -63,7 +64,7 @@ steps:
 
 # Compile. `cargo` is spelled bare: pm resolves a step's first word against the
 # HOST PATH and hands execve the canonicalised result, which is how a toolchain
-# installed outside /usr is reachable at all (src/sandbox.rs:392-435).
+# installed outside /usr is reachable at all (BuildSandbox::resolve).
 #
 # The cargo fingerprint grants Toolchain, Coreutils and Network, so this is the
 # one package in the chain whose jail shares the host network namespace --
@@ -73,17 +74,17 @@ steps:
 # --target-dir keeps every write inside /build, the working directory, because
 # the source tree is mounted read-only. --locked stops cargo from trying to
 # rewrite Cargo.lock, which is on that read-only mount. CARGO_HOME lands at
-# /build/.cargo because the jail sets HOME=/build (src/sandbox.rs:305-307), so
-# the registry cache is per-build and thrown away with the workspace.
+# /build/.cargo because the jail sets HOME=/build in BuildSandbox::run_jailed,
+# so the registry cache is per-build and thrown away with the workspace.
 #
 # The three --config flags are what this jail costs, and they are worth
 # understanding. pm resolves the FIRST WORD of a step against the host PATH,
 # but nothing else: once cargo is running, its own lookups of `rustc` and `cc`
 # go through the container's PATH, which is a fixed
 # /usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bin:/sbin
-# (src/sandbox.rs:66). On a host whose toolchain lives under $HOME -- a Nix
-# profile, rustup, homebrew -- that PATH finds nothing, because $HOME is not
-# mounted. The binaries themselves ARE reachable, at their canonical store
+# (CONTAINER_PATH in src/sandbox.rs). On a host whose toolchain lives under
+# $HOME -- a Nix profile, rustup, homebrew -- it finds nothing, because $HOME
+# is not mounted. The binaries themselves ARE reachable, at their canonical store
 # paths, so naming them explicitly is the fix. Without this, cargo gets as far
 # as compiling build scripts and then dies with `linker \`cc\` not found`.
 #

@@ -5,6 +5,7 @@ use pm::{
     metadata::Metadata,
     perms::Enforcement,
     policy::{BuildPolicy, UNMATCHED},
+    progress::Progress,
     run::PackageRunner,
     signing::{
         Signature, SigningKey, TrustStore, default_key_path, default_trust_dir, sign_file,
@@ -57,6 +58,14 @@ const PROMOTED_SUFFIX: &str = ".promoting";
 struct Arge {
     #[command(subcommand)]
     command: Commands,
+
+    /// Log every step, and let build commands write to the terminal directly.
+    ///
+    /// Turns off the live progress display. A build command's output is then
+    /// inherited rather than captured, which is what you want when you are
+    /// reading a build rather than watching it.
+    #[arg(short, long, global = true)]
+    verbose: bool,
 }
 
 #[derive(Subcommand)]
@@ -252,8 +261,16 @@ enum Commands {
 }
 
 fn main() -> miette::Result<()> {
-    // Initialised before parsing so that argument-parsing failures are logged too.
-    fmt().without_time().init();
+    // Logging is initialised before parsing so that argument-parsing failures
+    // are logged too, which means `--verbose` has to be read off the raw
+    // arguments: clap has not run yet and cannot be asked.
+    let progress = if raw_args_ask_for_verbose() {
+        Progress::disabled()
+    } else {
+        Progress::to_terminal()
+    };
+    fmt().without_time().with_writer(progress.log_sink()).init();
+
     let args = Arge::parse();
 
     match args.command {
@@ -261,7 +278,7 @@ fn main() -> miette::Result<()> {
             file,
             permissive,
             unsandboxed,
-        } => build(&file, permissive, unsandboxed)?,
+        } => build(&file, permissive, unsandboxed, &progress)?,
         Commands::Explain { file, permissive } => explain(&file, permissive)?,
         Commands::Generate { file, force } => generate(&file, force)?,
         Commands::Run {
@@ -350,7 +367,12 @@ fn main() -> miette::Result<()> {
 ///
 /// Fails if the build file is missing or unparseable, if a command matches no
 /// fingerprint and `permissive` is false, or if the build itself fails.
-fn build(file: &Path, permissive: bool, unsandboxed: bool) -> miette::Result<()> {
+fn build(
+    file: &Path,
+    permissive: bool,
+    unsandboxed: bool,
+    progress: &Progress,
+) -> miette::Result<()> {
     if !file.exists() {
         return Err(miette!("The path {} does not exist.", file.display()));
     }
@@ -385,19 +407,31 @@ fn build(file: &Path, permissive: bool, unsandboxed: bool) -> miette::Result<()>
             permissive,
             unsandboxed,
         },
+        progress,
     )?;
     info!(archive = %archive.display(), "packaged");
     Ok(())
 }
 
+/// Whether the raw command line asks for verbose output.
+///
+/// Scanned rather than parsed because logging is set up before clap runs; the
+/// flag is also declared on [`Arge`] so `--help` documents it and clap accepts
+/// it wherever it appears.
+fn raw_args_ask_for_verbose() -> bool {
+    std::env::args().any(|arg| arg == "-v" || arg == "--verbose")
+}
+
 /// The single seam between the CLI and the builder.
 ///
-/// Both flags reach [`BuildFile::run_with`] rather than [`BuildFile::run`],
-/// which hard-codes [`BuildOptions::default`] - the safe answer to both - and
-/// would therefore ignore whatever the caller asked for. They deliberately
-/// carry no policy: the recursive dependency walk derives one per package from
-/// that package's own build file, so the policy the caller already has in hand
-/// describes the top-level package and nothing below it.
+/// The caller's flags reach [`BuildFile::run_with_progress`] as a
+/// [`BuildOptions`], rather than the [`BuildOptions::default`] that
+/// [`BuildFile::run`] and [`BuildFile::run_with`] would supply - the safe answer
+/// to both, and therefore not the one the caller asked for.
+///
+/// No policy is handed over. The recursive dependency walk derives one per
+/// package from that package's own build file, so the policy the caller already
+/// has in hand describes the top-level package and nothing below it.
 ///
 /// `options` applies to every package built out of this one, which is
 /// [`BuildFile::run_with`]'s contract: a permissive top-level build does not get
@@ -407,8 +441,12 @@ fn build(file: &Path, permissive: bool, unsandboxed: bool) -> miette::Result<()>
 /// # Errors
 ///
 /// Propagates whatever the build fails with.
-fn run_build(build_file: &BuildFile, options: BuildOptions) -> miette::Result<PathBuf> {
-    build_file.run_with(options)
+fn run_build(
+    build_file: &BuildFile,
+    options: BuildOptions,
+    progress: &Progress,
+) -> miette::Result<PathBuf> {
+    build_file.run_with_progress(options, progress)
 }
 
 /// Prints the policy derived from `file` without building it.

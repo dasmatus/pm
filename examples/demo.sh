@@ -35,8 +35,8 @@ fail() { printf '%sFAILED: %s%s\n' "$red" "$*" "$off"; exit 1; }
 
 # pm runs from out/ throughout. Dependency paths inside a build file are
 # resolved against the PROCESS working directory, not the build file's own
-# directory (src/bf.rs:357-364), which is why every dependency in examples/ is
-# spelled ../examples/... -- it is relative to here.
+# directory, which is why every dependency in examples/ is spelled
+# ../examples/... -- it is relative to here. See BuildFile::build_dependency.
 pm() { ( cd "$OUT" && "$PM" "$@" ); }
 
 # ---------------------------------------------------------------------------
@@ -50,12 +50,24 @@ note "using $PM"
 mkdir -p "$OUT"
 rm -f "$OUT"/*.cpkg "$OUT"/*.sig
 
+# pm puts every build workspace under TMPDIR (Workspace::new), and compiling
+# pm's own dependency graph in release mode needs several GB of it. On a distro
+# where /tmp is a tmpfs -- the Fedora default, and 7.5G here, shared with
+# everything else on the machine -- that is not a safe place for it: the build
+# dies partway through aws-lc-sys with "Disk quota exceeded (os error 122)".
+# Point it at real disk instead. out/ is gitignored, so this cleans up with the
+# rest of the demo.
+export TMPDIR="$OUT/tmp"
+mkdir -p "$TMPDIR"
+note "build workspaces go in $TMPDIR"
+
 # ---------------------------------------------------------------------------
 step "1. Plant a decoy on the host, where the build jail must not find it"
 # ---------------------------------------------------------------------------
-# Every pm workspace lives under the host TMPDIR. Inside the jail /tmp is a
-# fresh tmpfs, so this file is what proves one build cannot read another
-# build's tree.
+# Inside the jail /tmp is a fresh tmpfs, not the host's, so this file proves
+# the host /tmp is not reachable from a build step. Build workspaces are each
+# bind-mounted individually at /build, never by way of their parent, so a
+# sibling build's tree is not reachable either.
 mkdir -p "$DECOY"
 printf 'If a pm build step can read this, the build jail is not confining it.\n' > "$DECOY/secret.txt"
 note "planted $DECOY/secret.txt"
@@ -65,9 +77,9 @@ step "2. Generate a throwaway signing key"
 # ---------------------------------------------------------------------------
 # pm build verifies a detached <FILE>.sig BEFORE it parses the build file, and
 # every dependency is held to the same standard all the way down
-# (src/bf.rs:137-140, src/bf.rs:376-383). A build file names the commands that
-# will run, so reading an unsigned one is already the interesting half of
-# running it.
+# (BuildFile::load, then BuildFile::build_dependency for each one below it). A
+# build file names the commands that will run, so reading an unsigned one is
+# already the interesting half of running it.
 rm -rf "$XDG_CONFIG_HOME"
 pm keygen || fail "keygen"
 
@@ -111,9 +123,9 @@ step "5. What each build file is allowed to do, before anything runs"
 # ---------------------------------------------------------------------------
 # The sandbox policy is DERIVED, never declared: each step command is matched
 # against a built-in fingerprint table, and a command matching nothing aborts
-# the build before a single step runs (src/policy.rs:1-9). Note that only pm
-# gets Network, and it gets it because `cargo` is in the table as a program
-# that resolves and downloads its own dependency graph.
+# the build before a single step runs. See the module doc of src/policy.rs.
+# Note that only pm gets Network, and it gets it because `cargo` is in the
+# table as a program that resolves and downloads its own dependency graph.
 for f in ../examples/01-seed/build.yaml \
          ../examples/02-lib/build.yaml \
          ../examples/03-app/build.yaml \
@@ -151,8 +163,8 @@ step "7. Build the chain: 01-seed -> 02-lib -> 03-app -> pm"
 # ---------------------------------------------------------------------------
 # One command builds all four. Dependencies are built depth-first and
 # sequentially, with a visiting stack that rejects cycles and a memo map so a
-# diamond builds once (src/bf.rs:349-389). pm itself is compiled from source
-# by cargo, inside the same jail every other package got.
+# diamond builds once, all of it in BuildFile::build_dependency. pm itself is
+# compiled from source by cargo, inside the same jail every other package got.
 #
 # This downloads and compiles pm's entire dependency graph, so it takes a few
 # minutes. CARGO_HOME is /build/.cargo -- inside the workspace -- so the cache
@@ -167,7 +179,7 @@ step "8. A build step cannot write to the tree it was described by"
 # ---------------------------------------------------------------------------
 # The build file's own directory is mounted READ-ONLY, because a build writes
 # into its working directory and into DESTDIR, not back into its source
-# (src/bf.rs:592-604). This build file is deliberately kept out of examples/ so
+# (BuildFile::read_only_mounts). This build file is deliberately kept out of examples/ so
 # the committed chain stays green; it is expected to FAIL, and the failure is
 # the demonstration.
 ESC="$OUT/escape"
@@ -243,6 +255,8 @@ note "archives, signatures and the generated pm.yaml are gitignored"
 note "remove the demo key with: rm -rf $XDG_CONFIG_HOME"
 note "remove the decoy with:    rm -rf $DECOY"
 # Steps 6 and 8 are meant to fail, and pm deliberately retains the workspace of
-# a failed build so the half-finished tree can be inspected (src/bf.rs:274-284).
-note "two builds here fail on purpose; pm kept their workspaces:"
-note "  rm -rf /tmp/pm-seed-0.1.0-* /tmp/pm-escape-0-*"
+# a failed build so the half-finished tree can be inspected. See
+# BuildFile::run_tracked. Those land under TMPDIR, which is out/tmp here, so
+# removing out/ takes them with it.
+note "two builds here fail on purpose; pm kept their workspaces under $TMPDIR"
+note "remove everything with: rm -rf $OUT"
