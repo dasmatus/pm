@@ -101,7 +101,6 @@ impl Rng {
     fn below(&mut self, n: u64) -> u64 {
         if n == 0 { 0 } else { self.next_u64() % n }
     }
-
 }
 
 /// The signature state a generated package ships with.
@@ -661,7 +660,13 @@ fn run_case(shape: &Shape, pm: &Path, archive: &Path, cfg: &Path) -> (Outcome, S
 
     let mut child = match command.spawn() {
         Ok(child) => child,
-        Err(error) => return (Outcome::Skipped, Stage::Unknown, format!("could not spawn pm: {error}")),
+        Err(error) => {
+            return (
+                Outcome::Skipped,
+                Stage::Unknown,
+                format!("could not spawn pm: {error}"),
+            );
+        }
     };
 
     let started = Instant::now();
@@ -699,7 +704,13 @@ fn run_case(shape: &Shape, pm: &Path, archive: &Path, cfg: &Path) -> (Outcome, S
                 }
                 std::thread::sleep(Duration::from_millis(20));
             }
-            Err(error) => return (Outcome::Skipped, Stage::Unknown, format!("wait failed: {error}")),
+            Err(error) => {
+                return (
+                    Outcome::Skipped,
+                    Stage::Unknown,
+                    format!("wait failed: {error}"),
+                );
+            }
         }
     }
 }
@@ -774,15 +785,7 @@ fn fuzz_one(args: &Args, seed: u64, iteration: u64, root: &Path, pm: &Path) -> (
         }
     };
 
-    if apply_signature(
-        &shape,
-        pm,
-        &archive,
-        &cfg,
-        &root.join("untrusted-cfg"),
-    )
-    .is_err()
-    {
+    if apply_signature(&shape, pm, &archive, &cfg, &root.join("untrusted-cfg")).is_err() {
         debug!(iteration, "could not apply the signature state");
     }
 
@@ -807,7 +810,14 @@ fn fuzz_one(args: &Args, seed: u64, iteration: u64, root: &Path, pm: &Path) -> (
             signature = shape.signature.label(),
             "ESCAPE: {detail}"
         );
-        record_finding(&root.join("findings"), &shape, stage, seed, &detail, &archive);
+        record_finding(
+            &root.join("findings"),
+            &shape,
+            stage,
+            seed,
+            &detail,
+            &archive,
+        );
     } else {
         debug!(
             iteration,
@@ -989,7 +999,9 @@ fn main() -> miette::Result<()> {
         ));
     }
     if timeouts > 0 {
-        warn!("{timeouts} run(s) had to be killed; that is worth a look even though nothing escaped");
+        warn!(
+            "{timeouts} run(s) had to be killed; that is worth a look even though nothing escaped"
+        );
     }
     if reached_sandbox == 0 {
         // The escape oracle only means something for packages that ran. Saying

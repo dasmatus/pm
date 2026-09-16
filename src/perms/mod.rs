@@ -343,7 +343,11 @@ impl Permissions {
                 continue;
             }
 
-            let subject_width = rows.iter().map(|row| width(&row.subject)).max().unwrap_or(0);
+            let subject_width = rows
+                .iter()
+                .map(|row| width(&row.subject))
+                .max()
+                .unwrap_or(0);
             let provenance_width = rows
                 .iter()
                 .map(|row| width(&row.provenance))

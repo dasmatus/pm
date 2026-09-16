@@ -252,6 +252,7 @@ mod x86_64 {
         ffi::{CString, OsString},
         os::unix::ffi::OsStringExt as _,
         path::{Path, PathBuf},
+        sync::{Mutex, PoisonError},
         time::{Duration, Instant},
     };
 
@@ -576,6 +577,11 @@ mod x86_64 {
     /// this one execution took and no others - which is why a profile derived from it
     /// stays in [`Enforcement::Audit`] until a human promotes it.
     ///
+    /// Only one trace runs at a time per process; a concurrent caller blocks until the
+    /// first finishes. `ptrace` reports stops through the process-wide wait queue, so
+    /// two tracers would steal each other's syscall stops and both write a wrong
+    /// profile. See `TRACER`.
+    ///
     /// # Errors
     ///
     /// A diagnostic if `program` or an argument contains an interior NUL, if `fork`
@@ -584,6 +590,12 @@ mod x86_64 {
     ///
     /// [`Enforcement::Audit`]: crate::perms::Enforcement::Audit
     pub fn trace(program: &Path, args: &[String], options: &TraceOptions) -> Result<TraceReport> {
+        // See `TRACER`: one tracer per process, or two of them quietly rob each other.
+        // A poisoned lock still guards the right to call `waitpid` correctly - the mutex
+        // protects no data that a panic could have left half-written - so the poison is
+        // stepped over rather than turned into a failure.
+        let _tracer = TRACER.lock().unwrap_or_else(PoisonError::into_inner);
+
         let program_c = cstring(program.as_os_str().as_encoded_bytes())
             .wrap_err_with(|| format!("program path {}", program.display()))?;
         let mut argv = Vec::with_capacity(args.len() + 1);
@@ -625,6 +637,21 @@ mod x86_64 {
             ForkResult::Parent { child } => supervise(child, program, options),
         }
     }
+
+    /// Serialises [`trace`] calls within one process.
+    ///
+    /// `ptrace`'s wait interface is process-wide: the tracer loop calls `waitpid(-1)`,
+    /// which reaps *any* child of this process, because a tracee's forked children are
+    /// not known by pid until their first stop arrives. Two tracers running side by side
+    /// therefore consume each other's syscall stops and each writes a profile built from
+    /// half of the other program's behaviour - silently, and with no error anywhere. A
+    /// second caller waits here instead.
+    ///
+    /// This guards only *other tracers*. Any other code in the process that spawns and
+    /// reaps its own children concurrently - a `std::process::Command`, a build step -
+    /// is still racing the tracer for the same wait queue, so a trace should be the only
+    /// child-reaping work in flight.
+    static TRACER: Mutex<()> = Mutex::new(());
 
     /// The child half of [`trace`]: become a process group leader, ask to be traced and
     /// exec. Never returns - every failure path is an `_exit`, because returning would
