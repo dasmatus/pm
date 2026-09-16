@@ -2,15 +2,23 @@ use clap::{Parser, Subcommand};
 use miette::{IntoDiagnostic, WrapErr, miette};
 use pm::{
     bf::BuildFile,
+    metadata::Metadata,
+    perms::Enforcement,
     policy::{BuildPolicy, UNMATCHED},
     run::PackageRunner,
-    signing::{Signature, SigningKey, TrustStore, default_key_path, default_trust_dir, sign_file},
+    signing::{
+        Signature, SigningKey, TrustStore, default_key_path, default_trust_dir, sign_file,
+        verify_file,
+    },
+    workspace::Workspace,
 };
-use serde_yaml::to_string;
+use serde_yaml::{Value, from_str, to_string, to_value};
 use std::{
-    fs::{OpenOptions, read_to_string, remove_file, write},
+    ffi::OsString,
+    fs::{OpenOptions, read_to_string, remove_file, rename, write},
     io::{ErrorKind, Write as _},
     path::{Path, PathBuf},
+    process::Command,
 };
 use tracing::{info, warn};
 use tracing_subscriber::fmt;
@@ -26,6 +34,22 @@ const COMMAND_HEADER: &str = "COMMAND";
 /// the row simply runs past the column - because a build file is something the
 /// user has to be able to read back verbatim.
 const COMMAND_WIDTH_CAP: usize = 72;
+
+/// Name of the metadata member at the root of every `.cpkg` archive.
+const METADATA_MEMBER: &str = "metadata";
+
+/// Suffix of the detached signature that travels beside a package.
+const SIGNATURE_SUFFIX: &str = ".sig";
+
+/// Suffix `pm promote` renames a signature to once it has rewritten the archive
+/// out from under it. The file is kept rather than deleted so the old signer is
+/// still on record, but the name says plainly that it can never verify again.
+const STALE_SIGNATURE_SUFFIX: &str = ".sig.stale";
+
+/// Suffix of the archive `pm promote` builds beside the package before renaming
+/// it over the original. Written next to the package rather than in the
+/// workspace so the rename is within one filesystem and cannot fail half-way.
+const PROMOTED_SUFFIX: &str = ".promoting";
 
 #[derive(Parser)]
 #[clap(name = "pm", version, about = "A package manager")]
@@ -81,6 +105,12 @@ enum Commands {
         force: bool,
     },
     /// Run a binary contained in a built package.
+    ///
+    /// The package carries a permission profile that was inferred at build time
+    /// from its source, its ELF headers and a traced run, and the package itself
+    /// says whether that profile is enforced. `--enforce` turns denial on for a
+    /// profile nobody has promoted; `--audit` replaces the jailed run with a
+    /// traced one that reports what enforcing it would have broken.
     Run {
         /// Path to the .cpkg archive.
         package: PathBuf,
@@ -93,6 +123,88 @@ enum Commands {
         /// and cannot talk to the host, the LAN or the internet.
         #[arg(short, long)]
         network: bool,
+        /// Report what the program does outside its profile, and deny nothing.
+        ///
+        /// Answers "what would enforcing this profile break?", which landlock
+        /// cannot: it has no log-only mode and reports no violations, so the only
+        /// honest audit is to watch a real execution. The entrypoint runs under
+        /// the ptrace monitor and every access outside the profile is reported,
+        /// with a summary of the grants a promotion would need.
+        ///
+        /// THE AUDITED RUN IS NOT JAILED. ptrace observes, it does not deny, and
+        /// the monitor execs the entrypoint directly rather than in the
+        /// container - so the program runs with your own privileges. Audit only
+        /// a package you were already willing to run.
+        #[arg(long, conflicts_with = "enforce")]
+        audit: bool,
+        /// Deny everything outside the profile, even while it is still in audit.
+        ///
+        /// Attaches the landlock ruleset for a profile that has not been
+        /// promoted. A derived profile only describes what was OBSERVED, so this
+        /// is how you find out whether promoting it would break the package -
+        /// without rewriting the archive or invalidating its signature. If the
+        /// program dies on a path nobody watched, run it under `--audit` and
+        /// read what it asked for.
+        #[arg(long)]
+        enforce: bool,
+    },
+    /// Print the permission profile recorded in a package.
+    ///
+    /// Lists every grant, where it was inferred from, the evidence behind it,
+    /// and whether the profile is enforced or merely audited. A profile is
+    /// derived by observation and is therefore incomplete by construction, which
+    /// is why a fresh one is only ever in audit mode: reading this report is how
+    /// you decide whether `pm promote` would be safe.
+    Profile {
+        /// Path to the .cpkg archive.
+        package: PathBuf,
+        /// Read the profile without checking who the package came from.
+        ///
+        /// The profile is data from inside the archive, so an unverified one
+        /// says only what its author wants it to say.
+        #[arg(long)]
+        unsigned: bool,
+        /// Trust store to verify the signature against.
+        #[arg(long, value_name = "DIR")]
+        trust_dir: Option<PathBuf>,
+    },
+    /// Promote a package's profile from audit to enforcing.
+    ///
+    /// Nothing else in `pm` ever does this. A profile is inferred from one
+    /// traced run plus static analysis, so it describes what the package was
+    /// SEEN to need, never what it can need - enforcing it is a human decision,
+    /// made after reading `pm profile` and, ideally, a few runs of
+    /// `pm run --audit`. Once promoted, landlock denies every path outside the
+    /// profile and the package stops working the first time it takes one.
+    ///
+    /// This rewrites the `metadata` member inside the archive, so every byte the
+    /// old signature covered has changed and that signature is void. It is
+    /// replaced with a fresh one by default; `--no-sign` keeps your key out of
+    /// it and moves the dead signature aside instead.
+    Promote {
+        /// Path to the .cpkg archive.
+        package: PathBuf,
+        /// Rewrite the archive without signing it again.
+        ///
+        /// The old `<PACKAGE>.sig` is renamed to `<PACKAGE>.sig.stale`, because
+        /// it cannot verify the rewritten archive and leaving it in place would
+        /// only make `pm run` fail with a signature error. Run `pm sign` next.
+        #[arg(long)]
+        no_sign: bool,
+        /// Promote a package that carries no valid signature.
+        ///
+        /// Without this, a package that has a signature must pass verification
+        /// and a package with none is refused. Re-signing an archive you never
+        /// verified means vouching, with your own key, for bytes you did not
+        /// check.
+        #[arg(long)]
+        unsigned: bool,
+        /// Signing key to use instead of the one under your config directory.
+        #[arg(long, value_name = "PATH")]
+        key: Option<PathBuf>,
+        /// Trust store used to verify the old signature and trust a new key.
+        #[arg(long, value_name = "DIR")]
+        trust_dir: Option<PathBuf>,
     },
     /// Sign a build file or a package with your key.
     ///
@@ -156,6 +268,8 @@ fn main() -> miette::Result<()> {
             package,
             bin,
             network,
+            audit,
+            enforce,
         } => {
             if !package.exists() {
                 return Err(miette!("The path {} does not exist.", package.display()));
@@ -166,6 +280,19 @@ fn main() -> miette::Result<()> {
                      and can reach the internet, the LAN and host-local services"
                 );
             }
+            if audit {
+                warn!(
+                    "--audit was given: the entrypoint is TRACED, not jailed. ptrace observes \
+                     and denies nothing, so the program runs with your privileges for the \
+                     length of the audit. Only audit a package you were already willing to run."
+                );
+            }
+            if enforce {
+                info!(
+                    "--enforce was given: the recorded profile is applied even though nobody \
+                     promoted it, so this run denies what a promoted package would deny"
+                );
+            }
             // `PackageRunner::run` owns the `Workspace` and `SandboxedChild` guards for
             // the whole lifetime of the sandboxed process, and both are dropped before it
             // hands back an `ExitStatus`. This frame therefore holds nothing that
@@ -173,9 +300,13 @@ fn main() -> miette::Result<()> {
             // that call terminates immediately and runs no destructors, so were a guard
             // still live here it would leak the staging directory and leave the child
             // unreaped. Do not move the exit into a scope that still holds one.
-            let status = PackageRunner::new(package)
-                .allow_network(network)
-                .run(bin)?;
+            // Scoped so the runner - and the `PathBuf` it owns - is gone before
+            // the `exit` below, keeping the claim above literally true.
+            let status = {
+                let mut runner = PackageRunner::new(package);
+                runner.allow_network(network).audit(audit).enforce(enforce);
+                runner.run(bin)?
+            };
             if !status.success() {
                 warn!(
                     code = status.code,
@@ -195,6 +326,18 @@ fn main() -> miette::Result<()> {
             key,
             trust_dir,
         } => keygen(force, key, trust_dir)?,
+        Commands::Profile {
+            package,
+            unsigned,
+            trust_dir,
+        } => profile(&package, unsigned, trust_dir)?,
+        Commands::Promote {
+            package,
+            no_sign,
+            unsigned,
+            key,
+            trust_dir,
+        } => promote(&package, no_sign, unsigned, key, trust_dir)?,
         Commands::Trust { key, trust_dir } => trust(&key, trust_dir)?,
     }
 
@@ -349,6 +492,447 @@ fn explain(file: &Path, permissive: bool) -> miette::Result<()> {
     }
 
     Ok(())
+}
+
+/// Prints the permission profile recorded in `package`.
+///
+/// The report goes to stdout because it is this subcommand's entire output and is
+/// meant to be read, piped and diffed; everything else stays on `tracing`. The
+/// archive is unpacked into a throwaway workspace to get at it, exactly as
+/// `pm run` does, because the profile lives in the `metadata` member.
+///
+/// # Errors
+///
+/// Fails if the package does not exist, if its signature is missing, wrong or
+/// untrusted and `unsigned` is false, if the staging workspace cannot be
+/// created, if `tar` cannot extract the archive, or if the `metadata` member is
+/// missing or is not valid YAML.
+fn profile(package: &Path, unsigned: bool, trust_dir: Option<PathBuf>) -> miette::Result<()> {
+    if !package.exists() {
+        return Err(miette!("The path {} does not exist.", package.display()));
+    }
+    verify_package(package, unsigned, trust_dir.as_deref())?;
+
+    let workspace = Workspace::new("profile")?;
+    extract(package, workspace.path())?;
+    let (_, metadata) = package_metadata(package, workspace.path())?;
+
+    let recorded = metadata.recorded_permissions();
+    let permissions = metadata.permissions();
+    let enforcement = metadata.enforcement();
+
+    println!("{:<LABEL_WIDTH$}{}", "archive:", package.display());
+    println!(
+        "{:<LABEL_WIDTH$}{} {}",
+        "package:",
+        metadata.name(),
+        metadata.version().join(".")
+    );
+    println!(
+        "{:<LABEL_WIDTH$}{enforcement} - {}",
+        "mode:",
+        describe_mode(enforcement)
+    );
+    println!();
+    println!("{}", permissions.report().trim_end());
+    println!();
+
+    // "No profile was recorded" and "a profile was derived and wanted nothing" read
+    // identically in the report above - both are an empty grant list - and they call
+    // for opposite reactions, so say which one this is.
+    if recorded.is_none() {
+        println!(
+            "This package records NO profile: it predates the field entirely. Nothing was\n\
+             inferred for it and nothing was promised about it, so enforcing it would leave\n\
+             it only what the runner allows unconditionally - its own files and the dynamic\n\
+             loader. Rebuild it rather than promoting it."
+        );
+        return Ok(());
+    }
+    if permissions.is_empty() {
+        println!(
+            "A profile was derived for this package and it came back empty: nothing in the\n\
+             source, the ELF headers or the traced run asked for anything outside the package\n\
+             itself. Run `pm run --audit {}` over real work before you believe that.",
+            package.display()
+        );
+        return Ok(());
+    }
+
+    match enforcement {
+        Enforcement::Audit => println!(
+            "Nothing here is denied yet, and that is deliberate: this profile was derived by\n\
+             watching ONE execution and reading the source, so it knows what the package was\n\
+             seen to need, not what it can need. Run `pm run --audit {}` over the work you\n\
+             actually expect of it, and promote it with `pm promote {}` once the audit stops\n\
+             turning up anything new. `pm run --enforce {}` tries the strict ruleset for a\n\
+             single run without rewriting the archive.",
+            package.display(),
+            package.display(),
+            package.display()
+        ),
+        Enforcement::Enforce => println!(
+            "Every access outside this list is denied. If the package dies on a path that\n\
+             belongs here, rebuild it so the grant is inferred with evidence behind it; a\n\
+             profile is not meant to be edited by hand."
+        ),
+    }
+    Ok(())
+}
+
+/// What an enforcement mode actually does to a running package, in one line.
+fn describe_mode(enforcement: Enforcement) -> &'static str {
+    match enforcement {
+        Enforcement::Audit => "accesses outside the profile are reported, none are denied",
+        Enforcement::Enforce => "landlock denies every access outside the profile",
+    }
+}
+
+/// Rewrites `package` so its profile is enforced, and deals with the signature
+/// that the rewrite invalidates.
+///
+/// Promotion changes the `metadata` member, so every byte the detached signature
+/// covered has moved and that signature can never verify again. The package is
+/// therefore re-signed with your key by default and the substitution is logged;
+/// `no_sign` skips that and moves the dead signature aside instead. Neither path
+/// leaves a signature that silently fails to match its archive.
+///
+/// # Errors
+///
+/// Fails if the package does not exist, if its signature is missing, wrong or
+/// untrusted and `unsigned` is false, if the staging workspace cannot be
+/// created, if `tar` cannot extract or repack the archive, if the `metadata`
+/// member is missing, unparseable or not a YAML mapping, if the promoted archive
+/// cannot replace the original, or if the signing key cannot be loaded, created
+/// or trusted.
+fn promote(
+    package: &Path,
+    no_sign: bool,
+    unsigned: bool,
+    key: Option<PathBuf>,
+    trust_dir: Option<PathBuf>,
+) -> miette::Result<()> {
+    if !package.exists() {
+        return Err(miette!("The path {} does not exist.", package.display()));
+    }
+
+    let signature = sibling(package, SIGNATURE_SUFFIX);
+    // Read before anything is rewritten: afterwards the file has been replaced or
+    // renamed, and who signed the package before is the one fact worth carrying
+    // into the log line that says it no longer does.
+    let signer = previous_signer(&signature);
+    verify_package(package, unsigned, trust_dir.as_deref())?;
+
+    let workspace = Workspace::new("promote")?;
+    extract(package, workspace.path())?;
+    let (original, mut metadata) = package_metadata(package, workspace.path())?;
+
+    if metadata.enforcement() == Enforcement::Enforce {
+        info!(
+            package = %package.display(),
+            "the profile is already enforced; leaving the archive and its signature alone"
+        );
+        return Ok(());
+    }
+
+    let grants = metadata.permissions().len();
+    if grants == 0 {
+        warn!(
+            package = %package.display(),
+            "promoting a profile with no grants: the package is left with nothing but the \
+             runner's unconditional allowances, and everything else it touches is denied"
+        );
+    }
+
+    // One-way by construction, and the only thing in the tree that moves a
+    // profile out of audit. It warns by itself when the package recorded no
+    // profile at all.
+    metadata.promote();
+    write(
+        workspace.path().join(METADATA_MEMBER),
+        rewrite_metadata(&original, &metadata)?,
+    )
+    .into_diagnostic()
+    .wrap_err("cannot write the promoted package metadata")?;
+
+    // Built beside the package and renamed over it, so a `tar` that fails
+    // part-way leaves the original archive intact instead of truncated.
+    let staged = sibling(package, PROMOTED_SUFFIX);
+    repack(workspace.path(), &staged)?;
+    if let Err(source) = rename(&staged, package) {
+        let _ = remove_file(&staged);
+        return Err(source).into_diagnostic().wrap_err_with(|| {
+            format!(
+                "cannot replace {} with the promoted archive",
+                package.display()
+            )
+        });
+    }
+    warn!(
+        package = %package.display(),
+        grants,
+        "profile promoted to enforcing; the archive was rewritten, so its old signature is void"
+    );
+
+    if no_sign {
+        return retire_signature(&signature, package, signer.as_deref());
+    }
+    resign(package, key, trust_dir, signer.as_deref())
+}
+
+/// The public key of the detached signature at `path`, if one can be read.
+///
+/// Best effort by design: the answer only names a key in a log line, and a
+/// signature that cannot be read at all is what [`verify_package`] reports on.
+fn previous_signer(path: &Path) -> Option<String> {
+    let text = read_to_string(path).ok()?;
+    Signature::from_yaml(&text)
+        .ok()
+        .map(|signature| signature.public_key_hex().to_owned())
+}
+
+/// Moves the signature that promotion invalidated out of the way.
+///
+/// Renamed rather than deleted: it can never verify the rewritten archive, but it
+/// is still the record of who signed the package before. Leaving it under its own
+/// name would be worse than either - `pm run` would refuse the package with a
+/// signature error that says nothing about the promotion that caused it.
+///
+/// # Errors
+///
+/// Fails if the signature exists but cannot be renamed.
+fn retire_signature(signature: &Path, package: &Path, signer: Option<&str>) -> miette::Result<()> {
+    if !signature.exists() {
+        warn!(
+            package = %package.display(),
+            "the promoted package carries no signature; sign it with `pm sign` before it travels"
+        );
+        return Ok(());
+    }
+
+    let stale = sibling(package, STALE_SIGNATURE_SUFFIX);
+    rename(signature, &stale)
+        .into_diagnostic()
+        .wrap_err_with(|| {
+            format!(
+                "cannot move the invalidated signature {} aside",
+                signature.display()
+            )
+        })?;
+    warn!(
+        stale = %stale.display(),
+        signer = signer.unwrap_or("unknown"),
+        "the old signature cannot verify the promoted archive and was moved aside; run `pm sign {}`",
+        package.display()
+    );
+    Ok(())
+}
+
+/// Signs the promoted archive, generating and trusting the key on first use.
+///
+/// Says loudly when the package used to be signed by somebody else: re-signing is
+/// the point of the default path, but swapping another signer out for yourself is
+/// not something to discover later.
+///
+/// # Errors
+///
+/// Fails if the key path cannot be resolved, if the key cannot be loaded or
+/// created, if a freshly generated key cannot be trusted, or if the signature
+/// cannot be written.
+fn resign(
+    package: &Path,
+    key: Option<PathBuf>,
+    trust_dir: Option<PathBuf>,
+    previous: Option<&str>,
+) -> miette::Result<()> {
+    let key_path = resolve_key_path(key)?;
+    // Asked before loading, because `load_or_create` erases the difference.
+    let generated = !key_path.exists();
+
+    let signing_key = SigningKey::load_or_create(&key_path)?;
+    let public_key = signing_key.public_key_hex();
+
+    if generated {
+        let dir = resolve_trust_dir(trust_dir)?;
+        TrustStore::load(&dir)?.add(&public_key, &dir)?;
+        warn!(
+            path = %key_path.display(),
+            "generated a new signing key and trusted it locally; back it up, it cannot be recovered"
+        );
+    }
+
+    let written = sign_file(package, &signing_key)?;
+    match previous {
+        Some(old) if old != public_key => warn!(
+            signature = %written.display(),
+            previous_signer = old,
+            signer = %public_key,
+            "re-signed the promoted package with YOUR key; it no longer carries the signature it arrived with"
+        ),
+        _ => info!(
+            signature = %written.display(),
+            signer = %public_key,
+            "re-signed the promoted package"
+        ),
+    }
+    Ok(())
+}
+
+/// Verifies `<package>.sig` against the trust store, or says loudly that it was
+/// told not to.
+///
+/// The same rule `PackageRunner` applies before it unpacks anything: `pm profile`
+/// and `pm promote` read metadata that whoever built the package wrote, so an
+/// unverified archive is an archive whose profile says whatever its author wants.
+///
+/// # Errors
+///
+/// Fails if the trust store cannot be located or read, or if the signature is
+/// missing, malformed, wrong, or from an untrusted key.
+fn verify_package(package: &Path, unsigned: bool, trust_dir: Option<&Path>) -> miette::Result<()> {
+    if unsigned {
+        warn!(
+            package = %package.display(),
+            "signature verification DISABLED; this profile is of unverified origin"
+        );
+        return Ok(());
+    }
+
+    let dir = match trust_dir {
+        Some(dir) => dir.to_path_buf(),
+        None => default_trust_dir()?,
+    };
+    let trust = TrustStore::load(&dir)?;
+    verify_file(package, &trust).wrap_err_with(|| {
+        format!(
+            "refusing to open {}: its signature does not check out",
+            package.display()
+        )
+    })
+}
+
+/// Reads and parses the `metadata` member of an already-extracted package.
+///
+/// Hands back the raw YAML alongside the parsed value because `pm promote` writes
+/// the file again: the build splices keys into that mapping which [`Metadata`]
+/// has no field for - the policy fingerprint, today - and re-rendering a parsed
+/// [`Metadata`] would drop every one of them. The text is the only record.
+///
+/// # Errors
+///
+/// Fails if the member is missing or unreadable, or is not valid YAML.
+fn package_metadata(package: &Path, root: &Path) -> miette::Result<(String, Metadata)> {
+    let path = root.join(METADATA_MEMBER);
+    let text = read_to_string(&path).into_diagnostic().wrap_err_with(|| {
+        format!(
+            "{} has no `{METADATA_MEMBER}` member; it is not a pm package",
+            package.display()
+        )
+    })?;
+    let metadata = from_str(&text)
+        .into_diagnostic()
+        .wrap_err_with(|| format!("cannot parse the metadata of {}", package.display()))?;
+    Ok((text, metadata))
+}
+
+/// Renders `metadata` back into `original`, overwriting only the keys it owns.
+///
+/// A blind `to_string(&metadata)` would silently drop whatever the build spliced
+/// in beside the struct's fields, so the original mapping is the base and the
+/// re-serialised struct is layered on top of it.
+///
+/// # Errors
+///
+/// Fails if either side does not serialise to a YAML mapping, or if the result
+/// cannot be rendered.
+fn rewrite_metadata(original: &str, metadata: &Metadata) -> miette::Result<String> {
+    let mut merged: Value = from_str(original)
+        .into_diagnostic()
+        .wrap_err("cannot re-read the package metadata")?;
+    let updated = to_value(metadata)
+        .into_diagnostic()
+        .wrap_err("cannot serialise the promoted metadata")?;
+
+    let (Some(target), Some(source)) = (merged.as_mapping_mut(), updated.as_mapping()) else {
+        return Err(miette!("package metadata is not a YAML mapping"));
+    };
+    for (key, value) in source {
+        target.insert(key.clone(), value.clone());
+    }
+
+    to_string(&merged)
+        .into_diagnostic()
+        .wrap_err("cannot render the promoted metadata")
+}
+
+/// Extracts `package` into `dest`, preserving permissions, as `pm run` does.
+///
+/// # Errors
+///
+/// Fails if `tar` cannot be spawned, or exits unsuccessfully - in which case its
+/// status and stderr are reported.
+fn extract(package: &Path, dest: &Path) -> miette::Result<()> {
+    let output = Command::new("tar")
+        .arg("-xpf")
+        .arg(package)
+        .arg("-C")
+        .arg(dest)
+        .output()
+        .into_diagnostic()
+        .wrap_err("cannot run tar")?;
+
+    if !output.status.success() {
+        return Err(miette!(
+            "tar failed to extract {} into {} ({}): {}",
+            package.display(),
+            dest.display(),
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(())
+}
+
+/// Packs `root` into `archive` the way `pm build` does.
+///
+/// `tar -cJf <archive> -C <root> .`, so a promoted package has the same shape as
+/// a freshly built one and `tar -xpf` still puts `metadata` at the package root.
+/// Getting this wrong would produce an archive that only fails at run time.
+///
+/// # Errors
+///
+/// Fails if `tar` cannot be spawned, or exits unsuccessfully - in which case its
+/// status and stderr are reported.
+fn repack(root: &Path, archive: &Path) -> miette::Result<()> {
+    let output = Command::new("tar")
+        .arg("-cJf")
+        .arg(archive)
+        .arg("-C")
+        .arg(root)
+        .arg(".")
+        .output()
+        .into_diagnostic()
+        .wrap_err("cannot run tar")?;
+
+    if !output.status.success() {
+        return Err(miette!(
+            "tar failed to pack {} from {} ({}): {}",
+            archive.display(),
+            root.display(),
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(())
+}
+
+/// `<path><suffix>`, appending to the full file name rather than replacing the
+/// extension: a package is `foo-1.0.cpkg`, and `Path::with_extension` would eat
+/// the `.cpkg`.
+fn sibling(path: &Path, suffix: &str) -> PathBuf {
+    let mut name = OsString::from(path.as_os_str());
+    name.push(suffix);
+    PathBuf::from(name)
 }
 
 /// Writes the example build file to `file`.

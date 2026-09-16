@@ -14,30 +14,106 @@
 //!    requiring it to still live under the package root.
 //! 3. **The sandbox has no network.** A packaged binary cannot phone home
 //!    unless the caller opts in with [`PackageRunner::allow_network`].
+//! 4. **The recorded permission profile is applied, never invented.** A package
+//!    carries the [`Permissions`] its build derived (see [`crate::perms`]) and
+//!    the [`Enforcement`] a human chose for them. [`Enforcement::Enforce`]
+//!    becomes a landlock ruleset; [`Enforcement::Audit`] stays audit - nothing
+//!    here ever promotes a profile by itself.
+//!
+//! # Why audit is a `ptrace` run and not a permissive ruleset
+//!
+//! Landlock has no log-only mode: a ruleset either denies or it is not there,
+//! and the kernel offers no violation feed to log from. Attaching a permissive
+//! ruleset and calling it "audit" would produce a sandbox that looks configured
+//! and enforces nothing, which is the worst failure mode a security feature has
+//! because it passes inspection. So [`PackageRunner::audit`] runs the entrypoint
+//! under the `ptrace` monitor in [`crate::perms::monitor`] instead, diffs what it
+//! really touched against the recorded profile, and reports every access that
+//! falls outside it. **That traced run is not jailed** - see
+//! [`PackageRunner::audit`].
 
 use std::{
+    collections::BTreeMap,
     fs::read_to_string,
     io::{IsTerminal, stdin},
     path::{Component, Path, PathBuf},
     process::Command,
+    time::Duration,
 };
 
 use crate::{
     metadata::Metadata,
+    perms::{
+        Enforcement, Grant, Permission, Permissions, Provenance,
+        elf::{interpreter, needed_libraries, runpath},
+        monitor::{TraceOptions, trace},
+    },
     signing::{TrustStore, default_trust_dir, verify_file},
     workspace::{SandboxedChild, Workspace},
 };
 use dialoguer::{Select, console::Term};
-use hakoniwa::{Container, ExitStatus, MountOptions, Namespace, Runctl};
+use hakoniwa::{
+    Container, ExitStatus, MountOptions, Namespace, Runctl,
+    landlock::{CompatMode, FsAccess, Resource, Ruleset},
+};
 use miette::{Context, IntoDiagnostic, miette};
+use serde::Deserialize;
 use serde_yaml::from_str;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 /// Path the extracted package tree is bind-mounted on inside the sandbox.
 ///
 /// The host-side staging directory is a throwaway temporary path, so entrypoints
 /// are always invoked through this stable in-container path instead.
 const CONTAINER_PACKAGE_ROOT: &str = "/pkg";
+
+/// Immutable store a Nix-provisioned toolchain resolves into.
+///
+/// Mirrors the constant of the same name in [`crate::sandbox`]: a package built
+/// against a Nix toolchain names its loader and libraries here, and neither is
+/// covered by `rootfs("/")`.
+const NIX_STORE: &str = "/nix/store";
+
+/// Package-root file a profile may be recorded in, when it is not inside the
+/// `metadata` member.
+///
+/// Read as a fallback so that a package built by a `pm` that records the profile
+/// beside the metadata rather than inside it still runs enforced. Its content is
+/// either a `permissions:`/`enforcement:` map or a bare serialised
+/// [`Permissions`].
+const PROFILE_SIDECAR: &str = "permissions";
+
+/// Directories the glibc loader searches when a `DT_NEEDED` soname carries no
+/// path of its own.
+///
+/// Only used to *locate* the libraries an entrypoint names, so that the
+/// directory actually holding each one can be allowed; a directory in this list
+/// that holds none of them is never added to the ruleset. The order mirrors the
+/// loader's own: architecture-specific directories before the generic ones.
+const DEFAULT_LIBRARY_DIRS: [&str; 6] = [
+    "/lib64",
+    "/usr/lib64",
+    "/lib",
+    "/usr/lib",
+    "/lib/x86_64-linux-gnu",
+    "/usr/lib/x86_64-linux-gnu",
+];
+
+/// Wall-clock budget for an audited run before the traced process group is
+/// killed.
+///
+/// An audit exists to produce a report, and a report that never arrives is worse
+/// than a partial one. [`TraceReport::timed_out`] is surfaced in the summary, so
+/// a truncated audit is never mistaken for a clean one.
+///
+/// [`TraceReport::timed_out`]: crate::perms::monitor::TraceReport::timed_out
+const AUDIT_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Exit code reported for an audited run whose entrypoint did not exit on its
+/// own - it timed out or died on a signal.
+///
+/// 124 is `timeout(1)`'s, which is the convention a shell caller already knows.
+const AUDIT_UNFINISHED: i32 = 124;
 
 /// Flags for the read-only bind mount of the extracted package.
 ///
@@ -75,6 +151,11 @@ pub struct PackageRunner {
     unsigned: bool,
     /// Trust store directory; [`default_trust_dir`] when `None`.
     trust_dir: Option<PathBuf>,
+    /// Trace the entrypoint and report what fell outside its profile, instead of
+    /// running it in the jail.
+    audit: bool,
+    /// Apply the recorded profile even when it is only in audit mode.
+    enforce: bool,
 }
 
 impl PackageRunner {
@@ -89,6 +170,8 @@ impl PackageRunner {
             network: false,
             unsigned: false,
             trust_dir: None,
+            audit: false,
+            enforce: false,
         }
     }
 
@@ -122,6 +205,44 @@ impl PackageRunner {
         self
     }
 
+    /// Trace the entrypoint and report accesses outside its profile.
+    ///
+    /// This answers "what would enforcing this profile break?", which landlock
+    /// itself cannot answer: it has no log-only mode and reports no violations,
+    /// so the only honest audit is to watch a real execution. The entrypoint is
+    /// run under the `ptrace` monitor, every access it makes is compared against
+    /// the recorded profile plus the allowances the sandbox always adds, and each
+    /// one that falls outside is logged with its syscall and path, followed by a
+    /// summary of the grants a promotion to [`Enforcement::Enforce`] would need.
+    ///
+    /// **The audited run is not jailed.** `ptrace` observes, it does not deny,
+    /// and the monitor execs the entrypoint directly rather than inside the
+    /// container - so an audited package runs with the caller's own privileges.
+    /// Audit a package you are already willing to run; `run` says so at warn
+    /// level every time. The run is also killed after [`AUDIT_TIMEOUT`].
+    ///
+    /// Auditing never turns denial on: it is a report, not a promotion.
+    pub fn audit(&mut self, audit: bool) -> &mut Self {
+        self.audit = audit;
+        self
+    }
+
+    /// Apply the profile even when it is only in audit mode.
+    ///
+    /// A freshly derived profile is [`Enforcement::Audit`], because it was
+    /// derived by observation and is incomplete by construction; enforcing one
+    /// breaks the package the first time it takes a path nobody watched. This is
+    /// the human promotion, and the only thing in `pm` that turns denial on for a
+    /// profile that did not already carry it.
+    ///
+    /// A package that records no profile at all cannot be enforced - `run`
+    /// refuses rather than enforcing an empty set, which would deny everything
+    /// outside the package root.
+    pub fn enforce(&mut self, enforce: bool) -> &mut Self {
+        self.enforce = enforce;
+        self
+    }
+
     /// Extracts the package, picks a binary and runs it inside a `hakoniwa`
     /// sandbox, waiting for it to terminate.
     ///
@@ -144,8 +265,13 @@ impl PackageRunner {
     /// valid YAML; when the package exposes no usable binary entrypoints; when
     /// `bin` names something that is not one of them; when an entrypoint path is
     /// not valid UTF-8; when a binary has to be picked but there is no terminal
-    /// to prompt on; when the user dismisses the prompt; or when the sandbox
-    /// cannot be configured, spawned or waited on.
+    /// to prompt on; when the user dismisses the prompt; when
+    /// [`PackageRunner::enforce`] was asked for but the package records no
+    /// profile; or when the sandbox cannot be configured, spawned or waited on.
+    ///
+    /// A profile that cannot be parsed is reported and treated as absent rather
+    /// than failing the run - but then `--enforce` has nothing to apply and
+    /// errors, so a broken profile can never quietly become a permissive one.
     pub fn run(&self, bin: Option<String>) -> miette::Result<ExitStatus> {
         info!("Running {}", self.path.display());
 
@@ -189,7 +315,41 @@ impl PackageRunner {
             .into_diagnostic()
             .wrap_err_with(|| format!("cannot parse the metadata of {}", self.path.display()))?;
 
+        let profile = Self::load_profile(&package_root, &metadata_text);
         let entrypoint = Self::pick_entrypoint(&metadata, bin, &package_root)?;
+        // The entrypoint as it exists on the host right now. The ELF reader and
+        // the `ptrace` monitor both work on the host filesystem, so neither can
+        // be handed the in-container path.
+        let host_bin = package_root.join(&entrypoint);
+
+        if self.audit {
+            if self.enforce {
+                warn!(
+                    "--enforce is ignored for this run: an audit traces the entrypoint OUTSIDE \
+                     the landlock ruleset, which is the only way to see what the ruleset would \
+                     have denied"
+                );
+            }
+            match self.audit_run(&host_bin, &package_root, &profile) {
+                Ok(status) => return Ok(status),
+                Err(error) => warn!(
+                    %error,
+                    "cannot audit this entrypoint; running it normally instead. The profile is \
+                     NOT enforced by this fallback"
+                ),
+            }
+        }
+
+        // Enforcement is either what the package recorded or what the caller
+        // promoted it to. It is never inferred from the profile's contents.
+        let enforcing = self.enforce || profile.enforcement.denies();
+        if enforcing && !profile.recorded {
+            return Err(miette!(
+                help = "run without --enforce, or rebuild the package with a recorded profile",
+                "{} records no permission profile, so there is nothing to enforce",
+                self.path.display()
+            ));
+        }
 
         let container_bin = Path::new(CONTAINER_PACKAGE_ROOT).join(&entrypoint);
         let container_bin = container_bin.to_str().ok_or_else(|| {
@@ -224,6 +384,21 @@ impl PackageRunner {
             .mount(host_root, CONTAINER_PACKAGE_ROOT, "", package_mount_flags())
             .runctl(Runctl::MountFallback);
 
+        // `rootfs("/")` mirrors only `/bin /etc /lib* /sbin /usr`. On a
+        // Nix-provisioned host a package's dynamic loader and every library it
+        // needs live under the store instead, and none of those paths are
+        // inside that list - so `execve` fails with ENOENT before the program
+        // runs at all, and any landlock rule naming a store path refuses
+        // because the path does not exist in the container. The build jail in
+        // `crate::sandbox` already exposes the store for exactly this reason;
+        // the run jail needs it just as much. It is world-readable and
+        // immutable by construction, so read-only exposure costs no
+        // confinement, and landlock still decides what the package may open.
+        if Path::new(NIX_STORE).is_dir() {
+            container.mount(NIX_STORE, NIX_STORE, "", package_mount_flags());
+            debug!("exposed {NIX_STORE} read-only for a store-linked entrypoint");
+        }
+
         // `Container::new` unshares Mount, User and PID only - a sandboxed
         // package otherwise keeps the caller's full network access. Unsharing
         // the network namespace without configuring a `Network` leaves the
@@ -238,6 +413,23 @@ impl PackageRunner {
             info!("package runs in its own empty network namespace");
         }
 
+        if enforcing {
+            let ruleset = self.ruleset(&profile.permissions, &package_root, &host_bin)?;
+            container.landlock_ruleset(ruleset);
+            info!(
+                grants = profile.permissions.len(),
+                "ENFORCING the recorded profile with landlock"
+            );
+        } else if profile.recorded {
+            info!(
+                grants = profile.permissions.len(),
+                "profile recorded in audit mode; NOT enforced. Run with --audit to see what \
+                 enforcing it would deny, then --enforce to apply it"
+            );
+        } else {
+            debug!("package records no permission profile; running with the default sandbox only");
+        }
+
         let mut command = container.command(container_bin);
         command.current_dir(CONTAINER_PACKAGE_ROOT);
 
@@ -250,6 +442,305 @@ impl PackageRunner {
             status.code, status.reason
         );
         Ok(status)
+    }
+
+    /// Reads the permission profile the package recorded, from the `metadata`
+    /// member or from the [`PROFILE_SIDECAR`] file beside it.
+    ///
+    /// Never fails: a package with no profile, or with one that does not parse,
+    /// gets [`Profile::none`] and a warning. Failing the run instead would make
+    /// an unreadable profile *more* permissive than a readable one in every mode
+    /// but `--enforce`, which refuses outright - see [`PackageRunner::run`].
+    fn load_profile(package_root: &Path, metadata_text: &str) -> Profile {
+        match from_str::<Recorded>(metadata_text) {
+            Ok(recorded) => {
+                if let Some(profile) = recorded.into_profile() {
+                    debug!(
+                        grants = profile.permissions.len(),
+                        enforcement = %profile.enforcement,
+                        "profile read from the package metadata"
+                    );
+                    return profile;
+                }
+            }
+            Err(error) => warn!(
+                %error,
+                "the package metadata carries a permission profile that does not parse; \
+                 treating the package as having none"
+            ),
+        }
+
+        let sidecar = package_root.join(PROFILE_SIDECAR);
+        let Ok(text) = read_to_string(&sidecar) else {
+            return Profile::none();
+        };
+
+        // The sidecar is either the same `permissions:`/`enforcement:` map the
+        // metadata uses, or a bare serialised `Permissions`. Try the richer shape
+        // first: a bare set parsed as the map would silently come back empty.
+        if let Ok(recorded) = from_str::<Recorded>(&text)
+            && let Some(profile) = recorded.into_profile()
+        {
+            debug!(path = %sidecar.display(), "profile read from the package sidecar");
+            return profile;
+        }
+        match from_str::<Permissions>(&text) {
+            Ok(permissions) => {
+                debug!(path = %sidecar.display(), "bare permission set read from the sidecar");
+                Profile {
+                    permissions,
+                    // A bare set says nothing about enforcement, and the default
+                    // for a set that never went past a human is audit.
+                    enforcement: Enforcement::Audit,
+                    recorded: true,
+                }
+            }
+            Err(error) => {
+                warn!(
+                    path = %sidecar.display(),
+                    %error,
+                    "the recorded profile does not parse; treating the package as having none"
+                );
+                Profile::none()
+            }
+        }
+    }
+
+    /// Builds the landlock ruleset that enforces `profile` on this entrypoint.
+    ///
+    /// # Order is load-bearing
+    ///
+    /// [`Ruleset::restrict`] comes first and [`Ruleset::allow_path`] after.
+    /// hakoniwa's loader returns early when `restrictions` is empty, so a ruleset
+    /// full of allow rules with nothing restricted enforces **nothing at all**
+    /// while looking perfectly configured.
+    ///
+    /// # Path translation
+    ///
+    /// Profile paths are host paths, recorded when the profile was derived, but
+    /// landlock is applied inside the container *after* the mounts are in place,
+    /// so every rule path is resolved there. The container's rootfs is the host's
+    /// `/`, so a system path such as `/usr/lib` means the same thing on both
+    /// sides and is passed through unchanged. Only the package moves: it is
+    /// bind-mounted at [`CONTAINER_PACKAGE_ROOT`], so a path under the staging
+    /// root - and a relative path, which can only be package-relative - is
+    /// rewritten onto `/pkg`. See [`translate`].
+    ///
+    /// # Compatibility mode
+    ///
+    /// `Resource::FS` asks for [`CompatMode::Enforce`]: this is a security
+    /// feature, and a kernel too old for landlock should fail the run rather than
+    /// run the package unrestricted while reporting success. (hakoniwa ignores
+    /// the mode for `FS` and hard-requires landlock ABI v1 regardless, which is
+    /// the same fail-closed behaviour; the argument states the intent.) The TCP
+    /// resources take [`CompatMode::Relax`] instead, because they need ABI v4 -
+    /// kernel 6.7 - and the real guarantee there is the unshared network
+    /// namespace, which is already in place. Failing the whole run on an older
+    /// kernel would buy nothing.
+    ///
+    /// # Errors
+    ///
+    /// Returns a diagnostic when the package root is not valid UTF-8, since a
+    /// landlock rule path must be a `str`.
+    fn ruleset(
+        &self,
+        profile: &Permissions,
+        package_root: &Path,
+        host_bin: &Path,
+    ) -> miette::Result<Ruleset> {
+        // Keyed by the in-container path, because hakoniwa stores fs rules in a
+        // map keyed by path: adding "/usr" twice keeps only the LAST access mode,
+        // so a write grant added after a read grant would drop the read. Merge
+        // the modes here and add each path exactly once.
+        let mut wanted: BTreeMap<String, FsAccess> = BTreeMap::new();
+
+        for (path, access) in Self::always_allowed(host_bin, package_root) {
+            admit(&mut wanted, &path, access, package_root);
+        }
+
+        // Read gets R, write gets RW - a write grant must not lose the read a
+        // separate read grant would have given, and a write-only file descriptor
+        // is not what "may write this path" means in the model. Exec gets R and X
+        // because a binary is read as well as executed.
+        for path in profile.read_paths() {
+            admit(&mut wanted, path, FsAccess::R, package_root);
+        }
+        for path in profile.write_paths() {
+            admit(&mut wanted, path, FsAccess::R | FsAccess::W, package_root);
+        }
+        for path in profile.exec_paths() {
+            admit(&mut wanted, path, FsAccess::R | FsAccess::X, package_root);
+        }
+
+        let mut ruleset = Ruleset::default();
+        // RESTRICT FIRST. See the section above; the reverse is a silent no-op.
+        ruleset.restrict(Resource::FS, CompatMode::Enforce);
+        for (path, access) in &wanted {
+            debug!(path, access = %access, "landlock rule");
+            ruleset.allow_path(path, *access);
+        }
+
+        // The namespace decision already made the network unreachable; this
+        // closes the same door a second time from inside, so that a future
+        // `--allow-network` caller with a profile that does not ask for the
+        // network still cannot open a TCP socket. No `allow_tcp_*` rule follows:
+        // restricting with an empty rule list is what denies every port.
+        if !profile.wants_network() && !self.network {
+            ruleset.restrict(Resource::NET_TCP_BIND, CompatMode::Relax);
+            ruleset.restrict(Resource::NET_TCP_CONNECT, CompatMode::Relax);
+        }
+
+        let _ = package_root
+            .to_str()
+            .ok_or_else(|| miette!("package root {} is not valid UTF-8", package_root.display()))?;
+        Ok(ruleset)
+    }
+
+    /// The allowances every enforced run gets, whatever the profile says, as
+    /// host paths.
+    ///
+    /// Without these, `Enforce` means "nothing runs at all", and the failure
+    /// looks like a broken package rather than a too-tight profile:
+    ///
+    /// - **The package root, `r-x`.** `execve` of the entrypoint needs execute on
+    ///   the file, and a package that cannot read its own data files is useless.
+    ///   The mount is already read-only, so no `w` is needed or wanted.
+    /// - **The ELF interpreter, `r-x`.** The kernel maps `PT_INTERP` before the
+    ///   program ever gets to run; deny it and every dynamically linked package
+    ///   dies before `main`.
+    /// - **The directory holding each `DT_NEEDED` library, `r-x`.** The loader
+    ///   opens them by soname out of its search path, so the directory that
+    ///   actually holds each one is allowed - not the whole search path, and not
+    ///   `/usr` wholesale.
+    ///
+    /// A statically linked entrypoint needs neither of the last two and gets
+    /// neither.
+    fn always_allowed(host_bin: &Path, package_root: &Path) -> Vec<(PathBuf, FsAccess)> {
+        let execute = FsAccess::R | FsAccess::X;
+        let mut allowed = vec![(package_root.to_path_buf(), execute)];
+
+        match interpreter(host_bin) {
+            Ok(Some(interp)) => allowed.push((PathBuf::from(interp), execute)),
+            Ok(None) => debug!("entrypoint names no ELF interpreter; nothing to allow for it"),
+            Err(error) => warn!(
+                %error,
+                "cannot read the entrypoint's ELF interpreter; if it is dynamically linked, \
+                 enforcing may stop it from starting"
+            ),
+        }
+
+        let needed = match needed_libraries(host_bin) {
+            Ok(needed) => needed,
+            Err(error) => {
+                warn!(%error, "cannot read the entrypoint's DT_NEEDED entries");
+                Vec::new()
+            }
+        };
+        for directory in library_directories(host_bin, &needed) {
+            allowed.push((directory, execute));
+        }
+        allowed
+    }
+
+    /// Runs the entrypoint under the `ptrace` monitor and reports every access
+    /// that falls outside the recorded profile.
+    ///
+    /// This is what "audit" means here, because landlock cannot mean it: see the
+    /// module docs. The traced process is **not** in the container - it is
+    /// `execve`d by the monitor with the caller's privileges - so this says so at
+    /// warn level before starting.
+    ///
+    /// Each access outside the profile is logged with its syscall and path, and
+    /// the summary lists the grants a promotion to [`Enforcement::Enforce`] would
+    /// need, in the same shape [`Permissions::report`] prints everywhere else.
+    ///
+    /// # Errors
+    ///
+    /// Returns a diagnostic when the monitor cannot run at all - it is
+    /// x86_64-only, and needs `ptrace` to be permitted. `run` catches that,
+    /// reports it and runs the package normally instead; it never upgrades the
+    /// profile to `Enforce` to compensate.
+    fn audit_run(
+        &self,
+        host_bin: &Path,
+        package_root: &Path,
+        profile: &Profile,
+    ) -> miette::Result<ExitStatus> {
+        warn!(
+            entrypoint = %host_bin.display(),
+            "AUDITING: the entrypoint is traced, NOT jailed. ptrace observes, it does not deny, \
+             and this run happens outside the container with your own privileges"
+        );
+        if !profile.recorded {
+            warn!(
+                "the package records no profile, so every access below is outside it; the \
+                 summary is a starting profile rather than a diff"
+            );
+        }
+
+        let options = TraceOptions {
+            timeout: AUDIT_TIMEOUT,
+            // The jailed run starts the entrypoint in the package root, so the
+            // audit has to as well: a relative path the program opens resolves
+            // differently otherwise, and the audit would describe a run the real
+            // sandbox never performs.
+            working_dir: Some(package_root.to_path_buf()),
+            // Deliberately minimal rather than inherited: an audit that carried
+            // the developer's environment would record their machine. `PATH` is
+            // kept because a package that spawns a helper by name finds nothing
+            // without it, and "it spawned nothing" would be a wrong report.
+            env: vec![("PATH".to_owned(), "/usr/bin:/bin".to_owned())],
+            follow_forks: true,
+        };
+
+        let report = trace(host_bin, &[], &options)?;
+        let always = Self::always_allowed(host_bin, package_root);
+
+        let mut outside: Vec<Grant> = Vec::new();
+        for observation in report.observations() {
+            if !observation.grants()
+                || covered(observation.permission(), &profile.permissions, &always)
+            {
+                continue;
+            }
+            warn!(
+                syscall = observation.syscall(),
+                permission = %observation.permission(),
+                pid = observation.pid(),
+                "access OUTSIDE the recorded profile"
+            );
+            outside.push(Grant::new(
+                observation.permission().clone(),
+                Provenance::RuntimeMonitor,
+                [observation.evidence()],
+            ));
+        }
+
+        if report.timed_out() {
+            warn!(
+                timeout = ?AUDIT_TIMEOUT,
+                "the audited run was killed by the timeout, so this report covers only what it \
+                 managed to do first"
+            );
+        }
+
+        if outside.is_empty() {
+            info!(
+                "audit clean: every access this run made is already inside the recorded profile. \
+                 That is evidence about THIS run only - another input can still take a path \
+                 nobody watched"
+            );
+        } else {
+            let missing = Permissions::from_grants(outside);
+            warn!(
+                "{} access(es) fell outside the profile. Promoting to enforce would need these \
+                 grants:\n{}",
+                missing.len(),
+                missing.report()
+            );
+        }
+
+        Ok(audited_status(&report))
     }
 
     /// Verifies `<package>.sig` against the trust store, or says loudly that it
@@ -561,4 +1052,289 @@ impl PackageRunner {
 struct Entrypoint<'a> {
     declared: &'a Path,
     resolved: PathBuf,
+}
+
+/// The run-time profile a package recorded: what it may do, and whether that is
+/// enforced.
+///
+/// `recorded` distinguishes "the package says it needs nothing" from "the package
+/// says nothing". The first is enforceable; the second is not, and `--enforce`
+/// refuses it rather than denying the package everything outside its own root.
+#[derive(Debug, Clone)]
+struct Profile {
+    permissions: Permissions,
+    enforcement: Enforcement,
+    recorded: bool,
+}
+
+impl Profile {
+    /// The profile of a package that records none: no grants, audit, and known
+    /// to be absent.
+    fn none() -> Self {
+        Self {
+            permissions: Permissions::default(),
+            enforcement: Enforcement::Audit,
+            recorded: false,
+        }
+    }
+}
+
+/// The profile as it is deserialised, wherever it was written.
+///
+/// Spelled as its own type rather than read through [`Metadata`] so that the
+/// shape of the recording and the shape of the metadata can move independently:
+/// unknown fields are ignored by serde, so this parses the `metadata` member
+/// whether or not the profile is in it, and parses a sidecar file that holds
+/// nothing else. The aliases accept the spellings a recorder is likely to use.
+#[derive(Debug, Deserialize)]
+struct Recorded {
+    #[serde(default, alias = "profile", alias = "perms")]
+    permissions: Option<Permissions>,
+    #[serde(default, alias = "mode", alias = "enforcement_mode")]
+    enforcement: Option<Enforcement>,
+}
+
+impl Recorded {
+    /// The profile this recording describes, or `None` when it holds no
+    /// permission set at all.
+    fn into_profile(self) -> Option<Profile> {
+        let permissions = self.permissions?;
+        Some(Profile {
+            permissions,
+            // Absent means audit: the default a derived profile carries, and the
+            // one that does not deny. A recording that forgot to say must not be
+            // read as a promotion.
+            enforcement: self.enforcement.unwrap_or_default(),
+            recorded: true,
+        })
+    }
+}
+
+/// Adds one host path to the rule map under its in-container name, merging the
+/// access mode with whatever is already there.
+///
+/// Paths that cannot be translated, and paths that do not exist at run time, are
+/// dropped with a log line. Dropping the second kind is not optional: hakoniwa
+/// canonicalises every rule path inside the container and fails the *whole*
+/// container when one is missing, so a single stale grant - a build-machine path
+/// that is not on this machine - would stop the package from running at all.
+fn admit(
+    wanted: &mut BTreeMap<String, FsAccess>,
+    host: &Path,
+    access: FsAccess,
+    package_root: &Path,
+) {
+    let Some(rule) = translate(host, package_root) else {
+        warn!(path = %host.display(), "ignoring a grant whose path cannot be mapped into the sandbox");
+        return;
+    };
+    if !rule.host.exists() {
+        debug!(
+            path = %host.display(),
+            "ignoring a grant for a path that does not exist on this machine"
+        );
+        return;
+    }
+    *wanted.entry(rule.container).or_insert(FsAccess::empty()) |= access;
+}
+
+/// One rule path in both the namespaces that matter.
+struct Rule {
+    /// The path landlock is given, resolved inside the container.
+    container: String,
+    /// The same file as this process can see it, used to check that it exists at
+    /// all before the rule is added.
+    host: PathBuf,
+}
+
+/// Maps a recorded path to the path it has inside the container.
+///
+/// Three cases, and the middle one is the one that matters:
+///
+/// - **Relative.** Can only be package-relative - nothing else would have been
+///   recorded without a root - so it hangs off [`CONTAINER_PACKAGE_ROOT`].
+/// - **Under the staging root.** The package is bind-mounted at
+///   [`CONTAINER_PACKAGE_ROOT`], and the staging directory itself does not exist
+///   inside the container. A rule left as the host path would fail to resolve
+///   and take the whole run down with it.
+/// - **Anything else.** The container's rootfs *is* the host's `/`, so `/usr`,
+///   `/etc` and friends name the same files on both sides and are passed through
+///   untouched. Rewriting those onto `/pkg` would allow a path that does not
+///   exist instead of the one the profile asked for.
+///
+/// Returns `None` for a path that is not valid UTF-8 - landlock rule paths are
+/// `str` - or that still contains a `..` component, which cannot be reasoned
+/// about lexically and must not be guessed at in a security decision.
+fn translate(host: &Path, package_root: &Path) -> Option<Rule> {
+    if host
+        .components()
+        .any(|component| matches!(component, Component::ParentDir))
+    {
+        return None;
+    }
+
+    let (container, host) = match host.strip_prefix(package_root) {
+        Ok(relative) => (
+            Path::new(CONTAINER_PACKAGE_ROOT).join(relative),
+            package_root.join(relative),
+        ),
+        Err(_) if host.is_relative() => (
+            Path::new(CONTAINER_PACKAGE_ROOT).join(host),
+            package_root.join(host),
+        ),
+        Err(_) => (host.to_path_buf(), host.to_path_buf()),
+    };
+    Some(Rule {
+        container: container.to_str()?.to_owned(),
+        host,
+    })
+}
+
+/// Whether `parent` is `child` or an ancestor of it.
+///
+/// Component-wise through [`Path::starts_with`], never a string prefix:
+/// `/usrlocal` starts with the text `/usr` without being under it, and a textual
+/// test would call an access covered that the ruleset would deny. A `..`
+/// component on either side makes the answer unknowable without the run-time
+/// filesystem, so it is reported as not covered - the direction that over-reports
+/// in an audit rather than under-reporting.
+fn under(parent: &Path, child: &Path) -> bool {
+    let plain = |path: &Path| {
+        !path
+            .components()
+            .any(|component| matches!(component, Component::ParentDir))
+    };
+    plain(parent) && plain(child) && child.starts_with(parent)
+}
+
+/// Whether an observed access is already inside what an enforced run would allow.
+///
+/// The comparison is against the ruleset that would actually be built, which is
+/// the profile *plus* the unconditional allowances - otherwise an audit would
+/// report the dynamic loader as a violation on every single run and bury the
+/// findings that matter.
+///
+/// The access mapping mirrors [`PackageRunner::ruleset`] exactly: every path
+/// grant carries read, so a read is covered by a read, write or exec grant; a
+/// write needs a write grant; an exec needs an exec grant.
+fn covered(permission: &Permission, profile: &Permissions, always: &[(PathBuf, FsAccess)]) -> bool {
+    let always_covers = |path: &Path, access: FsAccess| {
+        always
+            .iter()
+            .any(|(root, mode)| mode.contains(access) && under(root, path))
+    };
+
+    match permission {
+        Permission::Network => profile.wants_network(),
+        Permission::Spawn => profile.wants_spawn(),
+        Permission::ReadPath(path) => {
+            always_covers(path, FsAccess::R)
+                || profile
+                    .read_paths()
+                    .chain(profile.write_paths())
+                    .chain(profile.exec_paths())
+                    .any(|granted| under(granted, path))
+        }
+        Permission::WritePath(path) => {
+            always_covers(path, FsAccess::W)
+                || profile.write_paths().any(|granted| under(granted, path))
+        }
+        Permission::ExecPath(path) => {
+            always_covers(path, FsAccess::X)
+                || profile.exec_paths().any(|granted| under(granted, path))
+        }
+    }
+}
+
+/// The directories that actually hold the libraries `needed` names.
+///
+/// A `DT_NEEDED` entry is a soname, not a path, so the file behind it is found
+/// the way the loader would: `DT_RUNPATH` first - with `$ORIGIN` expanded to the
+/// entrypoint's own directory, which is how a package refers to the libraries it
+/// ships - then the default search directories.
+///
+/// A soname that is found nowhere makes every *existing* default directory
+/// allowed instead. That is wider than wanted, and it is still the right trade:
+/// the alternative is an enforced package that cannot start, with a failure that
+/// looks nothing like "the profile was too tight".
+fn library_directories(host_bin: &Path, needed: &[String]) -> Vec<PathBuf> {
+    if needed.is_empty() {
+        return Vec::new();
+    }
+
+    let origin = host_bin.parent().unwrap_or(Path::new("."));
+    let mut search: Vec<PathBuf> = match runpath(host_bin) {
+        Ok(entries) => entries
+            .iter()
+            .map(|entry| PathBuf::from(entry.replace("$ORIGIN", &origin.to_string_lossy())))
+            .collect(),
+        Err(error) => {
+            warn!(%error, "cannot read the entrypoint's DT_RUNPATH");
+            Vec::new()
+        }
+    };
+    search.extend(DEFAULT_LIBRARY_DIRS.iter().map(PathBuf::from));
+
+    let mut found: Vec<PathBuf> = Vec::new();
+    let mut unresolved = 0usize;
+    for soname in needed {
+        match search
+            .iter()
+            .find(|directory| directory.join(soname).exists())
+        {
+            Some(directory) => {
+                if !found.contains(directory) {
+                    found.push(directory.clone());
+                }
+            }
+            None => {
+                unresolved += 1;
+                warn!(
+                    soname,
+                    "cannot locate a needed library in any search directory"
+                );
+            }
+        }
+    }
+
+    if unresolved > 0 {
+        warn!(
+            unresolved,
+            "allowing every default library directory, because an entrypoint whose loader \
+             cannot find a library does not start at all"
+        );
+        for directory in DEFAULT_LIBRARY_DIRS.map(PathBuf::from) {
+            if directory.exists() && !found.contains(&directory) {
+                found.push(directory);
+            }
+        }
+    }
+    found
+}
+
+/// Turns a trace report into the exit status `run` returns.
+///
+/// An audited run is still a run, so its exit code is the entrypoint's. A run
+/// that never exited on its own - killed by the timeout or by a signal - reports
+/// [`AUDIT_UNFINISHED`] rather than borrowing a code the program never produced.
+fn audited_status(report: &crate::perms::monitor::TraceReport) -> ExitStatus {
+    let (code, reason) = match report.exit_status() {
+        Some(code) => (code, format!("audited entrypoint exited with code {code}")),
+        None if report.timed_out() => (
+            AUDIT_UNFINISHED,
+            format!("audited entrypoint was killed after {AUDIT_TIMEOUT:?}"),
+        ),
+        None => (
+            AUDIT_UNFINISHED,
+            "audited entrypoint did not exit on its own".to_owned(),
+        ),
+    };
+    ExitStatus {
+        code,
+        reason,
+        exit_code: report.exit_status(),
+        rusage: None,
+        proc_pid_smaps_rollup: None,
+        proc_pid_status: None,
+    }
 }

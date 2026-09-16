@@ -2,26 +2,55 @@
 //!
 //! A [`Metadata`] value is serialised to YAML as the `metadata` file at the root of
 //! every `.cpkg` archive. It records the package identity, the dependencies bundled
-//! under `deps/`, and the entrypoints a consumer can run or link against.
+//! under `deps/`, the entrypoints a consumer can run or link against, and the
+//! permission profile the runner sandboxes those entrypoints with.
 
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
+    sync::LazyLock,
 };
 
 use serde::{Deserialize, Serialize};
+
+use crate::perms::{Enforcement, Permissions};
+
+/// The profile handed out for a package that recorded none.
+///
+/// [`Metadata::permissions`] hands back a borrow, and a package built before profiles
+/// existed has nothing to borrow from, so it borrows this instead. Empty and shared: a
+/// package that recorded no profile wants nothing beyond whatever the runner allows
+/// unconditionally.
+static NO_PROFILE: LazyLock<Permissions> = LazyLock::new(Permissions::default);
 
 /// The package's metadata, stored as YAML at the archive root.
 ///
 /// Construct one with [`Metadata::create`]; the fields are private so the invariant
 /// that entrypoint keys are package-relative stays with the caller that walked the
 /// staging directory.
+///
+/// # Reading a package built before profiles existed
+///
+/// Both permission fields are `#[serde(default)]`, so a `metadata` file written by an
+/// older `pm` - which has neither key - still parses. It parses into *no recorded
+/// profile* and [`Enforcement::Audit`]: defaulting to [`Enforcement::Enforce`] would
+/// hand every such package an empty allow-list and brick it.
 #[derive(Serialize, Deserialize, PartialEq, Eq, Debug, Clone)]
 pub struct Metadata {
     name: String,
     version: Vec<String>,
     dependencies: Vec<PathBuf>,
     entrypoints: HashMap<PathBuf, Type>,
+    /// `None` means no profile was recorded at all - an old package. `Some` of an
+    /// empty set means a profile was derived and came back wanting nothing. The two
+    /// are kept apart because they are different facts about the *build*, and
+    /// [`Metadata::recorded_permissions`] is how a caller asks which one it has.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    permissions: Option<Permissions>,
+    /// Absent and `Audit` mean the same thing, so this needs no `Option`: a package
+    /// with no recorded mode is audited, exactly like a freshly derived profile.
+    #[serde(default)]
+    enforcement: Enforcement,
 }
 
 /// What a single entrypoint inside the package is.
@@ -52,16 +81,27 @@ impl Metadata {
     /// Every key of `entrypoints` and every entry of `dependencies` must be
     /// **relative to the package root**. The archive is extracted somewhere else at
     /// run time, so a build-time absolute path would not resolve there.
+    ///
+    /// `permissions` is the profile inferred for the built package and `enforcement`
+    /// says whether the runner denies against it. Passing a profile here always counts
+    /// as recording one, even when it is empty - see
+    /// [`Metadata::recorded_permissions`]. Nothing in this constructor promotes
+    /// anything: pass [`Enforcement::Audit`] unless a human has already decided
+    /// otherwise.
     pub fn create(
         name: String,
         version: Vec<String>,
         dependencies: Vec<PathBuf>,
         entrypoints: HashMap<PathBuf, Type>,
+        permissions: Permissions,
+        enforcement: Enforcement,
     ) -> Self {
         tracing::debug!(
             %name,
             dependencies = dependencies.len(),
             entrypoints = entrypoints.len(),
+            grants = permissions.len(),
+            %enforcement,
             "assembling package metadata"
         );
         Self {
@@ -69,6 +109,8 @@ impl Metadata {
             version,
             dependencies,
             entrypoints,
+            permissions: Some(permissions),
+            enforcement,
         }
     }
 
@@ -101,6 +143,54 @@ impl Metadata {
         self.entrypoints()
             .filter(|&(_, r#type)| *r#type == Type::Binary)
             .map(|(path, _)| path)
+    }
+
+    /// What the package is allowed to do at run time.
+    ///
+    /// A package that recorded no profile - anything built before this field existed -
+    /// reads back as an empty set, which is the same answer as a profile that was
+    /// derived and wanted nothing. Callers that have to tell those apart want
+    /// [`Metadata::recorded_permissions`]; callers that just need the allow-list want
+    /// this.
+    pub fn permissions(&self) -> &Permissions {
+        self.permissions.as_ref().unwrap_or(&NO_PROFILE)
+    }
+
+    /// The recorded profile, or [`None`] when the package recorded none.
+    ///
+    /// The distinction matters to anything that reports on a package: "this build
+    /// inferred that it needs nothing" and "this package predates permission
+    /// inference" are different claims, and only the first is evidence.
+    pub fn recorded_permissions(&self) -> Option<&Permissions> {
+        self.permissions.as_ref()
+    }
+
+    /// Whether [`Self::permissions`] is denied against or merely audited.
+    ///
+    /// [`Enforcement::Audit`] for a package that recorded nothing.
+    pub fn enforcement(&self) -> Enforcement {
+        self.enforcement
+    }
+
+    /// Promote a profile from audit to enforcing.
+    ///
+    /// Deliberately explicit and one-way: an observation-derived profile is incomplete
+    /// by construction, so turning denial on is a human decision made after reading
+    /// [`Permissions::report`], never something a derivation does to itself.
+    ///
+    /// Promoting a package that recorded no profile is legal but almost certainly a
+    /// mistake - it enforces an empty allow-list - so it is logged as a warning rather
+    /// than silently obeyed.
+    pub fn promote(&mut self) {
+        if self.permissions.is_none() {
+            tracing::warn!(
+                name = %self.name,
+                "promoting a package that recorded no permission profile: it will be \
+                 enforced against an empty allow-list"
+            );
+        }
+        tracing::info!(name = %self.name, "promoting permission profile to enforcing");
+        self.enforcement = Enforcement::Enforce;
     }
 
     /// Classify one file on disk.

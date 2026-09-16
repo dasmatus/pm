@@ -5,11 +5,18 @@
 //! resulting [`BuildPolicy`] decides what the jail the steps run in is allowed
 //! to reach. A build file that is not signed by a trusted key is not read at
 //! all - see [`BuildFile::load`].
+//!
+//! Once the steps have run, a *second* and quite separate profile is derived:
+//! [`BuildFile::derive_permissions`] infers what the **resulting package** needs
+//! at run time and records it in the package metadata. [`BuildPolicy`] governs
+//! the build; [`crate::perms::Permissions`] governs the thing the build
+//! produced. The two are never interchangeable.
 
 use std::{
     collections::HashMap,
     env::current_dir,
     fs::{copy, create_dir_all, read_to_string, write},
+    iter::once,
     path::{Path, PathBuf},
     process::Command,
 };
@@ -22,6 +29,7 @@ use walkdir::WalkDir;
 
 use crate::{
     metadata::{Metadata, Type},
+    perms::{Enforcement, Permissions, elf, source},
     policy::BuildPolicy,
     sandbox::BuildSandbox,
     signing::{TrustStore, default_trust_dir, verify_file},
@@ -430,11 +438,18 @@ impl BuildFile {
                 staging.display()
             );
         }
+        let permissions = self.derive_permissions(&workdir, &staging, &entrypoints)?;
         let metadata = Metadata::create(
             self.name.clone(),
             self.version.clone(),
             dependency_entries,
             entrypoints,
+            permissions,
+            // A profile derived by observation is incomplete by construction, so it is
+            // recorded in audit mode and denies nothing. Promotion to
+            // `Enforcement::Enforce` is a human decision made after reading the report;
+            // nothing on the build path may make it.
+            Enforcement::Audit,
         );
         write(
             staging.join("metadata"),
@@ -449,6 +464,102 @@ impl BuildFile {
         // dependency (goblin/object + a patchelf-equivalent writer); the crate
         // has none and the contract forbids adding one.
         package(&staging, archive)
+    }
+
+    /// Derive the run-time permission profile of the package that was just staged.
+    ///
+    /// Two signals, merged into one set:
+    ///
+    /// * **[`source::scan`] over `workdir`.** The steps unpacked and patched the
+    ///   package's sources there, so that tree is what the shipped program was compiled
+    ///   from. It sees intent a binary no longer records - a `getenv("HOME")`, a config
+    ///   path built up from string literals.
+    /// * **[`elf::analyse`] over each staged entrypoint.** The entrypoints were already
+    ///   classified by [`collect_entrypoints`], so this re-uses that list instead of
+    ///   walking the staging tree a second time. `analyse` answers `Ok(None)` for
+    ///   anything that is not an ELF, which is how a shell or Python entrypoint passes
+    ///   through without being an error.
+    ///
+    /// # The build is deliberately NOT traced
+    ///
+    /// It is tempting to point [`crate::perms::monitor::trace`] at the build steps here,
+    /// and it would be wrong. Tracing a build traces the **compiler**: the profile would
+    /// come back holding every header under `/usr/include`, every object in the
+    /// workspace, `cc1`, `as`, `ld`, the linker's temp files and the network fetch of
+    /// the tarball - none of which the shipped program touches, and all of which the
+    /// package would then be entitled to. A profile that wide means nothing, and the one
+    /// program that was never traced is the one being packaged. The monitor belongs to
+    /// `pm run --audit`, where it traces the actual entrypoint.
+    ///
+    /// # Errors
+    ///
+    /// Fails only if the source scan cannot walk `workdir`. An entrypoint that
+    /// [`elf::analyse`] rejects - a truncated object, or a big-endian or 32-bit one this
+    /// crate's ELF64 reader does not read - is logged at `warn` and skipped rather than
+    /// failing the build: a file the reader cannot parse narrows the profile, and the
+    /// profile is recorded in audit mode where a narrow set denies nothing. Failing a
+    /// whole package over an unreadable staged file would trade a build for no security
+    /// at all.
+    fn derive_permissions(
+        &self,
+        workdir: &Path,
+        staging: &Path,
+        entrypoints: &HashMap<PathBuf, Type>,
+    ) -> miette::Result<Permissions> {
+        let sources = source::scan(workdir).wrap_err_with(|| {
+            format!(
+                "cannot scan the sources of {} in {} for the run-time permission profile",
+                self.name,
+                workdir.display()
+            )
+        })?;
+        debug!(
+            package = %self.name,
+            grants = sources.len(),
+            "source analysis contributed grants"
+        );
+
+        let from_elf = entrypoints.keys().filter_map(|relative| {
+            let staged = staging.join(relative);
+            match elf::analyse(&staged) {
+                Ok(Some(permissions)) => {
+                    debug!(
+                        package = %self.name,
+                        entrypoint = %relative.display(),
+                        grants = permissions.len(),
+                        "ELF analysis contributed grants"
+                    );
+                    Some(permissions)
+                }
+                // Not an ELF at all: a script entrypoint, a data file, a `.a` archive.
+                Ok(None) => None,
+                Err(report) => {
+                    warn!(
+                        package = %self.name,
+                        entrypoint = %relative.display(),
+                        error = %report,
+                        "cannot analyse this entrypoint; its libraries are missing from the \
+                         recorded profile"
+                    );
+                    None
+                }
+            }
+        });
+
+        let permissions = Permissions::merge(once(sources).chain(from_elf));
+        info!(
+            package = %self.name,
+            grants = permissions.len(),
+            summary = %summarise(&permissions),
+            enforcement = ?Enforcement::Audit,
+            "derived the run-time permission profile"
+        );
+        debug!(
+            "permission profile of {}:\n{}",
+            self.name,
+            permissions.report()
+        );
+        Ok(permissions)
     }
 
     /// Build the jail the steps of this package run in.
@@ -522,11 +633,11 @@ impl BuildFile {
     /// host-side path, because a step's downloads are fetched before the jail
     /// is entered - the policy may well deny it the network.
     fn execute_steps(&self, sandbox: &BuildSandbox, workdir: &Path) -> miette::Result<()> {
-        // TODO: trace the steps (and the resulting binaries) under strace to
-        // derive the syscall and filesystem permissions a package actually
-        // needs, and record them in `Metadata` for the sandbox in `run.rs` to
-        // enforce. Blocked on a ptrace/strace-parsing layer the crate does not
-        // have yet.
+        // The steps run untraced on purpose. The run-time permission profile is
+        // derived afterwards by `BuildFile::derive_permissions`, from the sources
+        // and the staged ELF objects; see the "the build is deliberately NOT
+        // traced" section there for why pointing the ptrace monitor at this loop
+        // would profile the toolchain rather than the package.
         let mut ordered: Vec<&Step> = self.steps.iter().collect();
         // Stable sort: steps keep their authored order within one stage.
         ordered.sort_by_key(|step| step.stage);
@@ -575,6 +686,31 @@ fn metadata_yaml(metadata: &Metadata, fingerprint: &str) -> miette::Result<Strin
     to_string(&value)
         .into_diagnostic()
         .wrap_err("cannot render the package metadata")
+}
+
+/// One line naming what a derived profile came to, for the build log.
+///
+/// Path kinds are always counted, zero included, so "0 write" is visible rather than
+/// merely absent; `network` and `spawn` appear only when granted, because those two are
+/// the ones a reader scans for.
+fn summarise(permissions: &Permissions) -> String {
+    let counted = [
+        ("read", permissions.read_paths().count()),
+        ("write", permissions.write_paths().count()),
+        ("exec", permissions.exec_paths().count()),
+    ]
+    .into_iter()
+    .map(|(label, count)| format!("{count} {label}"));
+
+    let flagged = [
+        ("network", permissions.wants_network()),
+        ("spawn", permissions.wants_spawn()),
+    ]
+    .into_iter()
+    .filter(|&(_, wanted)| wanted)
+    .map(|(label, _)| label.to_owned());
+
+    counted.chain(flagged).collect::<Vec<_>>().join(", ")
 }
 
 /// Render the cycle `visiting` closes when `key` is entered again.
