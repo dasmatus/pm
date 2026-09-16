@@ -207,6 +207,17 @@ impl Progress {
         screen.draw();
     }
 
+    /// A `tracing` writer that puts log lines above the region.
+    ///
+    /// Hand this to `tracing_subscriber`'s `with_writer`. It does not keep the
+    /// region alive: see [`LogSink`].
+    #[must_use]
+    pub fn log_sink(&self) -> LogSink {
+        LogSink {
+            region: Arc::downgrade(&self.inner),
+        }
+    }
+
     /// Write `line` as scrollback above the region.
     ///
     /// The region is erased, the line is written where it will scroll away
@@ -225,6 +236,7 @@ impl Progress {
                 progress: self.clone(),
                 id: None,
                 depth,
+                owns_line: true,
             };
         }
 
@@ -237,6 +249,7 @@ impl Progress {
             progress: self.clone(),
             id: Some(id),
             depth,
+            owns_line: true,
         }
     }
 
@@ -474,6 +487,9 @@ pub struct Task {
     /// `None` when the region is disabled, which makes every method a no-op.
     id: Option<u64>,
     depth: usize,
+    /// Whether dropping this removes the line. False for a [`Task::handle`],
+    /// which refers to a line somebody else owns.
+    owns_line: bool,
 }
 
 impl Task {
@@ -486,7 +502,31 @@ impl Task {
             progress: Progress::disabled(),
             id: None,
             depth: 0,
+            owns_line: true,
         }
+    }
+
+    /// A second reference to this same line, which does not close it.
+    ///
+    /// Lets a value that needs to report under an existing line - a
+    /// [`crate::sandbox::BuildSandbox`] reporting under its package - hold a
+    /// `Task` of its own without the line vanishing when that value is dropped
+    /// or opening a redundant level of nesting under it.
+    pub fn handle(&self) -> Self {
+        Self {
+            progress: self.progress.clone(),
+            id: self.id,
+            depth: self.depth,
+            owns_line: false,
+        }
+    }
+
+    /// Whether this task is attached to a region that is actually drawing.
+    ///
+    /// Callers use it to decide whether the terminal is theirs to write to.
+    #[must_use]
+    pub fn is_live(&self) -> bool {
+        self.id.is_some()
     }
 
     /// Open a line nested under this one.
@@ -516,8 +556,31 @@ impl Task {
 
 impl Drop for Task {
     fn drop(&mut self) {
-        if let Some(id) = self.id {
+        if let (true, Some(id)) = (self.owns_line, self.id) {
             self.progress.close(id);
+        }
+    }
+}
+
+/// A `tracing` writer factory that routes log lines above the region.
+///
+/// It holds a **weak** reference on purpose. `tracing`'s global subscriber is
+/// installed for the life of the process and never dropped, so a strong one
+/// here would keep the region alive past the end of `main` - the region would
+/// never be erased, the cursor never restored, and the ticker thread never
+/// stopped. When the region is gone, lines go straight to stderr instead.
+#[derive(Clone)]
+pub struct LogSink {
+    region: Weak<Inner>,
+}
+
+impl<'a> MakeWriter<'a> for LogSink {
+    type Writer = LogWriter;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        LogWriter {
+            region: self.region.clone(),
+            buffer: Vec::new(),
         }
     }
 }
@@ -525,7 +588,7 @@ impl Drop for Task {
 /// Routes `tracing` output through [`Progress::println`] so log lines land
 /// above the region instead of through it.
 pub struct LogWriter {
-    progress: Progress,
+    region: Weak<Inner>,
     buffer: Vec<u8>,
 }
 
@@ -545,9 +608,25 @@ impl LogWriter {
     /// Hand every complete line in the buffer to the region.
     fn emit(&mut self) {
         let text = String::from_utf8_lossy(&self.buffer).into_owned();
-        for line in text.lines().filter(|line| !line.trim().is_empty()) {
-            self.progress.println(line);
+        let lines = text.lines().filter(|line| !line.trim().is_empty());
+
+        match self.region.upgrade() {
+            Some(inner) => {
+                let progress = Progress { inner };
+                for line in lines {
+                    progress.println(line);
+                }
+            }
+            // The region is gone - after `main` returns, or in a `--verbose`
+            // run that never had one. Logging must outlive it either way.
+            None => {
+                let mut stderr = io::stderr();
+                for line in lines {
+                    writeln!(stderr, "{line}").ok();
+                }
+            }
         }
+
         self.buffer.clear();
     }
 }
@@ -557,17 +636,6 @@ impl Drop for LogWriter {
         // `tracing` formats a whole event into the writer and drops it; the
         // trailing line has had no flush, so this is where it gets written.
         self.emit();
-    }
-}
-
-impl<'a> MakeWriter<'a> for Progress {
-    type Writer = LogWriter;
-
-    fn make_writer(&'a self) -> Self::Writer {
-        LogWriter {
-            progress: self.clone(),
-            buffer: Vec::new(),
-        }
     }
 }
 

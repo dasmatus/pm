@@ -37,16 +37,21 @@ use std::{
     env,
     ffi::OsString,
     fs::File,
+    io::{BufRead as _, BufReader, Read},
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     process::{Command as HostCommand, Stdio as HostStdio},
+    thread::scope,
 };
 
 use hakoniwa::{Container, MountOptions, Namespace, Runctl, Stdio};
 use miette::{IntoDiagnostic, WrapErr, miette};
 use tracing::{debug, info, warn};
 
-use crate::policy::{BuildPolicy, Capability};
+use crate::{
+    policy::{BuildPolicy, Capability},
+    progress::Task,
+};
 
 /// Where the step's working directory is mounted inside the jail.
 ///
@@ -125,6 +130,11 @@ pub struct BuildSandbox {
     /// to reject a program the jail could never exec, with a diagnostic that
     /// says what to do about it, instead of a bare `ENOENT` from `execve`.
     visible: Vec<PathBuf>,
+    /// The progress line this sandbox's package owns, if any.
+    ///
+    /// Detached by default, which is what keeps stdout inherited for every
+    /// caller that has no region to draw into.
+    progress: Task,
 }
 
 /// Whether commands are confined or run straight on the host.
@@ -227,6 +237,7 @@ impl BuildSandbox {
             workdir,
             destdir,
             visible,
+            progress: Task::detached(),
         })
     }
 
@@ -246,7 +257,31 @@ impl BuildSandbox {
             workdir: workdir.to_path_buf(),
             destdir: destdir.to_path_buf(),
             visible: Vec::new(),
+            progress: Task::detached(),
         }
+    }
+
+    /// Report this sandbox's commands under `task`, one nested line each.
+    ///
+    /// Attaching a live task also changes where a command's stdout goes: it is
+    /// captured rather than inherited, because a command writing freely to the
+    /// terminal would shred the region redrawing underneath it. The captured
+    /// output is not thrown away - its latest line becomes the command's
+    /// progress message, and the whole of it is reported if the command fails.
+    ///
+    /// Without this, stdout is inherited exactly as it always was.
+    #[must_use]
+    pub fn with_progress(mut self, task: Task) -> Self {
+        self.progress = task;
+        self
+    }
+
+    /// The progress line this sandbox reports under.
+    ///
+    /// [`crate::step::Step`] needs it to open a line per download, which is
+    /// work the sandbox itself never sees.
+    pub fn progress(&self) -> &Task {
+        &self.progress
     }
 
     /// Run one command string, waiting for it to finish.
@@ -290,11 +325,15 @@ impl BuildSandbox {
         command: &str,
         step_name: &str,
     ) -> miette::Result<()> {
+        // Labelled with the program the build file NAMED, before resolution
+        // rewrites it: a step that says `/bin/sh` should not report itself as
+        // `bash` just because that is what /bin/sh points at on this host.
+        let task = self.progress.child(basename(program));
+
         let program = self.resolve(program, step_name)?;
         debug!(step = %step_name, command = %command, program = %program, "executing in the build sandbox");
-
-        let output = container
-            .command(&program)
+        let mut jailed = container.command(&program);
+        let jailed = jailed
             .args(args.iter().copied())
             .current_dir(CONTAINER_WORKDIR)
             // A jailed process inherits nothing: `hakoniwa` execs with exactly
@@ -308,26 +347,44 @@ impl BuildSandbox {
             .env("TMPDIR", "/tmp")
             .env("LC_ALL", "C")
             .stdin(Stdio::from(devnull()?))
-            // The build's own stdout is the user's primary progress feedback,
-            // so it is passed through; stderr is captured for the diagnostic.
-            .stdout(Stdio::inherit())
-            .stderr(Stdio::piped())
-            .output()
-            .into_diagnostic()
-            .wrap_err_with(|| {
-                format!("Failed to run `{command}` for step `{step_name}` in the build sandbox")
-            })?;
+            .stderr(Stdio::piped());
 
-        if output.status.success() {
-            report_stderr(step_name, command, &output.stderr);
+        let failure =
+            || format!("Failed to run `{command}` for step `{step_name}` in the build sandbox");
+
+        let (status, out) = if task.is_live() {
+            // A live region owns the terminal, so the command's stdout is
+            // captured and fed to its progress line instead of written over
+            // the region.
+            let mut child = jailed
+                .stdout(Stdio::piped())
+                .spawn()
+                .into_diagnostic()
+                .wrap_err_with(failure)?;
+            let out = pump(child.stdout.take(), child.stderr.take(), &task);
+            let status = child.wait().into_diagnostic().wrap_err_with(failure)?;
+            (status, out)
+        } else {
+            // The build's own stdout is the user's primary progress feedback
+            // when nothing else is drawing, so it is passed through.
+            let output = jailed
+                .stdout(Stdio::inherit())
+                .output()
+                .into_diagnostic()
+                .wrap_err_with(failure)?;
+            (output.status, Captured::stderr_only(output.stderr))
+        };
+
+        if status.success() {
+            report_stderr(step_name, command, &out.stderr);
             return Ok(());
         }
 
         Err(miette!(
-            "Command `{command}` in step `{step_name}` failed inside the build sandbox with code {} ({})\nstderr:\n{}",
-            output.status.code,
-            output.status.reason,
-            describe_stderr(&output.stderr)
+            "Command `{command}` in step `{step_name}` failed inside the build sandbox with code {} ({})\n{}",
+            status.code,
+            status.reason,
+            out.describe()
         ))
     }
 
@@ -346,31 +403,49 @@ impl BuildSandbox {
             "running a build command UNSANDBOXED on the host"
         );
 
-        let output = HostCommand::new(program)
+        let task = self.progress.child(basename(program));
+        let mut host = HostCommand::new(program);
+        let host = host
             .args(args)
             .current_dir(&self.workdir)
             .env("DESTDIR", &self.destdir)
             .stdin(HostStdio::null())
-            .stdout(HostStdio::inherit())
-            .stderr(HostStdio::piped())
-            .output()
-            .into_diagnostic()
-            .wrap_err_with(|| {
-                format!(
-                    "Failed to spawn `{command}` in `{}` for step `{step_name}`",
-                    self.workdir.display()
-                )
-            })?;
+            .stderr(HostStdio::piped());
 
-        if output.status.success() {
-            report_stderr(step_name, command, &output.stderr);
+        let failure = || {
+            format!(
+                "Failed to spawn `{command}` in `{}` for step `{step_name}`",
+                self.workdir.display()
+            )
+        };
+
+        let (status, out) = if task.is_live() {
+            let mut child = host
+                .stdout(HostStdio::piped())
+                .spawn()
+                .into_diagnostic()
+                .wrap_err_with(failure)?;
+            let out = pump(child.stdout.take(), child.stderr.take(), &task);
+            let status = child.wait().into_diagnostic().wrap_err_with(failure)?;
+            (status, out)
+        } else {
+            let output = host
+                .stdout(HostStdio::inherit())
+                .output()
+                .into_diagnostic()
+                .wrap_err_with(failure)?;
+            (output.status, Captured::stderr_only(output.stderr))
+        };
+
+        if status.success() {
+            report_stderr(step_name, command, &out.stderr);
             return Ok(());
         }
 
         Err(miette!(
-            "Command `{command}` in step `{step_name}` failed with {}\nstderr:\n{}",
-            output.status,
-            describe_stderr(&output.stderr)
+            "Command `{command}` in step `{step_name}` failed with {}\n{}",
+            status,
+            out.describe()
         ))
     }
 
@@ -583,12 +658,105 @@ fn devnull() -> miette::Result<File> {
         .wrap_err("cannot open /dev/null for a sandboxed command's stdin")
 }
 
-/// Render captured stderr for a diagnostic.
-fn describe_stderr(stderr: &[u8]) -> String {
-    let text = String::from_utf8_lossy(stderr);
+/// What a command wrote, as far as it was captured.
+///
+/// stderr is always captured; stdout only when a progress region is drawing and
+/// the command could not be allowed to write to the terminal itself.
+struct Captured {
+    stdout: Option<Vec<u8>>,
+    stderr: Vec<u8>,
+}
+
+impl Captured {
+    /// The inherited-stdout case: only stderr came back.
+    fn stderr_only(stderr: Vec<u8>) -> Self {
+        Self {
+            stdout: None,
+            stderr,
+        }
+    }
+
+    /// The captured output, formatted for a failure diagnostic.
+    ///
+    /// stdout is included only when it was captured. When it was inherited the
+    /// user has already seen it scroll past, and printing `<no output>` for it
+    /// would claim the command was silent when nobody was listening.
+    fn describe(&self) -> String {
+        let stderr = format!("stderr:\n{}", describe_stream(&self.stderr));
+        match &self.stdout {
+            Some(stdout) => format!("stdout:\n{}\n{stderr}", describe_stream(stdout)),
+            None => stderr,
+        }
+    }
+}
+
+/// Read a command's output, feeding stdout to `task` line by line.
+///
+/// stdout and stderr have to be drained concurrently or the command deadlocks:
+/// a child that fills one pipe's buffer blocks forever while the parent waits
+/// on the other. stderr goes to a scoped thread, stdout stays here so each line
+/// can update the progress message as it arrives.
+fn pump<O, E>(stdout: Option<O>, stderr: Option<E>, task: &Task) -> Captured
+where
+    O: Read,
+    E: Read + Send,
+{
+    scope(|threads| {
+        let errors = threads.spawn(move || {
+            let mut captured = Vec::new();
+            if let Some(mut stderr) = stderr {
+                stderr.read_to_end(&mut captured).ok();
+            }
+            captured
+        });
+
+        let stdout = stdout.map(|stdout| drain_into(stdout, task));
+
+        Captured {
+            stdout,
+            stderr: errors.join().unwrap_or_default(),
+        }
+    })
+}
+
+/// Capture `reader` whole, making each line the task's latest message.
+fn drain_into<R: Read>(reader: R, task: &Task) -> Vec<u8> {
+    let mut reader = BufReader::new(reader);
+    let mut captured = Vec::new();
+    let mut line = Vec::new();
+
+    loop {
+        line.clear();
+        match reader.read_until(b'\n', &mut line) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {}
+        }
+        captured.extend_from_slice(&line);
+
+        let text = String::from_utf8_lossy(&line);
+        let text = text.trim_end();
+        if !text.is_empty() {
+            task.set_message(text);
+        }
+    }
+
+    captured
+}
+
+/// The last path component of a program, which is what a progress line shows.
+///
+/// Programs are resolved to absolute paths before they are executed, and
+/// `/usr/bin/make` is not what a person reading a progress line wants to see.
+fn basename(program: &str) -> &str {
+    program.rsplit('/').next().unwrap_or(program)
+}
+
+/// Render one captured stream for a diagnostic.
+fn describe_stream(bytes: &[u8]) -> String {
+    let text = String::from_utf8_lossy(bytes);
     let text = text.trim();
     if text.is_empty() {
-        "<no output on stderr>".to_owned()
+        "<no output>".to_owned()
     } else {
         text.to_owned()
     }

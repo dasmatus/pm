@@ -5,6 +5,7 @@ use pm::{
     metadata::Metadata,
     perms::Enforcement,
     policy::{BuildPolicy, UNMATCHED},
+    progress::Progress,
     run::PackageRunner,
     signing::{
         Signature, SigningKey, TrustStore, default_key_path, default_trust_dir, sign_file,
@@ -57,6 +58,14 @@ const PROMOTED_SUFFIX: &str = ".promoting";
 struct Arge {
     #[command(subcommand)]
     command: Commands,
+
+    /// Log every step, and let build commands write to the terminal directly.
+    ///
+    /// Turns off the live progress display. A build command's output is then
+    /// inherited rather than captured, which is what you want when you are
+    /// reading a build rather than watching it.
+    #[arg(short, long, global = true)]
+    verbose: bool,
 }
 
 #[derive(Subcommand)]
@@ -252,8 +261,16 @@ enum Commands {
 }
 
 fn main() -> miette::Result<()> {
-    // Initialised before parsing so that argument-parsing failures are logged too.
-    fmt().without_time().init();
+    // Logging is initialised before parsing so that argument-parsing failures
+    // are logged too, which means `--verbose` has to be read off the raw
+    // arguments: clap has not run yet and cannot be asked.
+    let progress = if raw_args_ask_for_verbose() {
+        Progress::disabled()
+    } else {
+        Progress::to_terminal()
+    };
+    fmt().without_time().with_writer(progress.log_sink()).init();
+
     let args = Arge::parse();
 
     match args.command {
@@ -261,7 +278,7 @@ fn main() -> miette::Result<()> {
             file,
             permissive,
             unsandboxed,
-        } => build(&file, permissive, unsandboxed)?,
+        } => build(&file, permissive, unsandboxed, &progress)?,
         Commands::Explain { file, permissive } => explain(&file, permissive)?,
         Commands::Generate { file, force } => generate(&file, force)?,
         Commands::Run {
@@ -350,7 +367,12 @@ fn main() -> miette::Result<()> {
 ///
 /// Fails if the build file is missing or unparseable, if a command matches no
 /// fingerprint and `permissive` is false, or if the build itself fails.
-fn build(file: &Path, permissive: bool, unsandboxed: bool) -> miette::Result<()> {
+fn build(
+    file: &Path,
+    permissive: bool,
+    unsandboxed: bool,
+    progress: &Progress,
+) -> miette::Result<()> {
     if !file.exists() {
         return Err(miette!("The path {} does not exist.", file.display()));
     }
@@ -379,9 +401,18 @@ fn build(file: &Path, permissive: bool, unsandboxed: bool) -> miette::Result<()>
         );
     }
 
-    let archive = run_build(&build_file, &policy, unsandboxed)?;
+    let archive = run_build(&build_file, &policy, unsandboxed, progress)?;
     info!(archive = %archive.display(), "packaged");
     Ok(())
+}
+
+/// Whether the raw command line asks for verbose output.
+///
+/// Scanned rather than parsed because logging is set up before clap runs; the
+/// flag is also declared on [`Arge`] so `--help` documents it and clap accepts
+/// it wherever it appears.
+fn raw_args_ask_for_verbose() -> bool {
+    std::env::args().any(|arg| arg == "-v" || arg == "--verbose")
 }
 
 /// The single seam between the CLI and the builder.
@@ -397,9 +428,10 @@ fn run_build(
     build_file: &BuildFile,
     policy: &BuildPolicy,
     unsandboxed: bool,
+    progress: &Progress,
 ) -> miette::Result<PathBuf> {
     let _ = (policy, unsandboxed);
-    build_file.run()
+    build_file.run_with_progress(pm::bf::BuildOptions::default(), progress)
 }
 
 /// Prints the policy derived from `file` without building it.

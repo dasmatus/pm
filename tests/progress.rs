@@ -321,3 +321,46 @@ fn a_disabled_region_still_passes_log_lines_through() {
         "turning the region off must not turn logging off"
     );
 }
+
+#[test]
+fn a_handle_reports_on_a_line_it_does_not_own() {
+    let sink = Sink::default();
+    let progress = region(&sink);
+    let package = progress.task("zlib-1.3.1");
+
+    {
+        let handle = package.handle();
+        handle.set_message("building");
+        assert_eq!(progress.snapshot().len(), 1, "a handle opens no new line");
+    }
+
+    let lines = progress.snapshot();
+    assert_eq!(
+        lines.len(),
+        1,
+        "dropping a handle must not close the line its owner is still using"
+    );
+    assert!(
+        lines[0].contains("building"),
+        "a handle writes to the line it refers to: {:?}",
+        lines[0]
+    );
+}
+
+#[test]
+fn a_child_of_a_handle_nests_under_the_handles_own_line() {
+    let sink = Sink::default();
+    let progress = region(&sink);
+    let package = progress.task("zlib-1.3.1");
+    let handle = package.handle();
+
+    let _command = handle.child("make");
+
+    let lines = progress.snapshot();
+    assert_eq!(lines.len(), 2);
+    assert!(
+        lines[1].starts_with("    ") && !lines[1].starts_with("        "),
+        "a handle's child sits one level down, not two: {:?}",
+        lines[1]
+    );
+}

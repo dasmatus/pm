@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, info};
 use url::Url;
 
-use crate::{download::Downloader, sandbox::BuildSandbox};
+use crate::{download::Downloader, progress::Task, sandbox::BuildSandbox};
 
 /// A single step of a build: an optional set of downloads followed by a list of
 /// commands to run.
@@ -86,15 +86,16 @@ impl Step {
             ));
         }
 
-        self.download(workdir)?;
+        self.download(sandbox.progress(), workdir)?;
         self.run_commands(sandbox)
     }
 
     /// Fetch every download of this step into `workdir` and verify its hash.
     ///
     /// Downloads are independent of one another, so unlike the commands they are safe to
-    /// run in parallel.
-    fn download(&self, workdir: &Path) -> miette::Result<()> {
+    /// run in parallel. Each opens its own line under `progress`, which is what makes a
+    /// step fetching four tarballs legible rather than four interleaved log streams.
+    fn download(&self, progress: &Task, workdir: &Path) -> miette::Result<()> {
         let Some(dl_urls) = self.dl_urls.as_ref() else {
             return Ok(());
         };
@@ -105,9 +106,12 @@ impl Step {
             .par_iter()
             .try_for_each(|(url, expected)| -> miette::Result<()> {
                 let dest = Self::download_dest(workdir, url)?;
+                let task = progress.child(Self::download_file_name(url)?);
 
                 downloader
-                    .fetch_verified(url, &dest, expected, |_, _| {})
+                    .fetch_verified(url, &dest, expected, |done, total| {
+                        task.set_bytes(done, total);
+                    })
                     .map_err(|report| {
                         report.wrap_err(format!("cannot fetch `{url}` for step `{}`", self.name))
                     })?;
