@@ -6,6 +6,7 @@ use std::fs::{create_dir_all, read_dir, read_to_string, write};
 use std::path::Path;
 use std::process::Command;
 
+use pm::sandbox::BuildSandbox;
 use pm::step::{Stage, Step};
 use tempfile::{TempDir, tempdir};
 use url::Url;
@@ -70,6 +71,18 @@ fn entries_of(dir: &Path) -> Vec<String> {
 
 /// A working directory and a `DESTDIR`, each in its own temporary directory so
 /// a test can tell the two apart.
+/// A `BuildSandbox` that runs commands unconfined on the host.
+///
+/// `Step::execute` drives commands through a sandbox now. These tests exercise
+/// step *mechanics* - download hashing, command ordering, DESTDIR, failure
+/// reporting - not confinement, and the unsandboxed mode keeps exactly the
+/// contract they assert: `current_dir` is the workdir and `DESTDIR` is the
+/// staging directory. Confinement itself is covered by tests/escape.rs, which
+/// needs user namespaces and is ignored by default.
+fn host_sandbox(work: &Path, dest: &Path) -> BuildSandbox {
+    BuildSandbox::unsandboxed(work, dest)
+}
+
 fn workdirs() -> (TempDir, TempDir) {
     (
         tempdir().expect("work directory"),
@@ -86,7 +99,7 @@ fn a_failing_command_is_an_error_carrying_the_child_stderr() {
     let failing = step(Stage::Build, "doomed", vec![format!("/bin/cat {missing}")]);
 
     let error = failing
-        .execute(work.path(), dest.path())
+        .execute(&host_sandbox(work.path(), dest.path()), work.path())
         .expect_err("a command that exits non-zero must fail the step");
 
     let rendered = format!("{error}\n{error:?}");
@@ -110,7 +123,9 @@ fn a_missing_program_is_an_error_not_a_panic() {
     );
 
     assert!(
-        bogus.execute(work.path(), dest.path()).is_err(),
+        bogus
+            .execute(&host_sandbox(work.path(), dest.path()), work.path())
+            .is_err(),
         "a command naming a program that does not exist must return a diagnostic"
     );
 }
@@ -126,7 +141,7 @@ fn blank_and_whitespace_only_commands_do_not_panic() {
 
     // Skipping them or rejecting them are both defensible; indexing argv[0] of
     // an empty split is not. Reaching the assertion at all is the test.
-    let outcome = blank.execute(work.path(), dest.path());
+    let outcome = blank.execute(&host_sandbox(work.path(), dest.path()), work.path());
     if let Err(error) = outcome {
         assert!(
             !format!("{error}").trim().is_empty(),
@@ -155,7 +170,7 @@ fn commands_run_sequentially_in_the_authored_order() {
     );
 
     chain
-        .execute(work.path(), dest.path())
+        .execute(&host_sandbox(work.path(), dest.path()), work.path())
         .expect("a chain of dependent commands must succeed when run in order");
 
     assert!(!one.exists());
@@ -177,7 +192,11 @@ fn a_failing_command_stops_the_ones_after_it() {
         ],
     );
 
-    assert!(aborting.execute(work.path(), dest.path()).is_err());
+    assert!(
+        aborting
+            .execute(&host_sandbox(work.path(), dest.path()), work.path())
+            .is_err()
+    );
     assert!(
         !never.exists(),
         "execution must stop at the first failing command"
@@ -197,7 +216,7 @@ fn destdir_and_the_working_directory_reach_the_child_process() {
         "pwd > \"$DESTDIR/cwd.txt\"\nprintf '%s' \"$DESTDIR\" > \"$DESTDIR/destdir.txt\"\n",
     );
     probe
-        .execute(work.path(), dest.path())
+        .execute(&host_sandbox(work.path(), dest.path()), work.path())
         .expect("the probe commands must run");
 
     let reported_cwd = read_to_string(dest.path().join("cwd.txt")).expect("cwd.txt");
@@ -233,7 +252,7 @@ fn commands_still_run_when_a_download_map_is_present_but_empty() {
     };
 
     with_downloads
-        .execute(work.path(), dest.path())
+        .execute(&host_sandbox(work.path(), dest.path()), work.path())
         .expect("an empty download map must not short-circuit the commands");
 
     assert!(
@@ -247,7 +266,7 @@ fn a_step_with_nothing_to_do_succeeds() {
     let (work, dest) = workdirs();
     let idle = step(Stage::Test, "idle", Vec::new());
 
-    idle.execute(work.path(), dest.path())
+    idle.execute(&host_sandbox(work.path(), dest.path()), work.path())
         .expect("a step with no commands must succeed");
 }
 
@@ -299,7 +318,7 @@ fn a_download_whose_hash_does_not_match_is_rejected() {
     };
 
     let error = download
-        .execute(work.path(), dest.path())
+        .execute(&host_sandbox(work.path(), dest.path()), work.path())
         .expect_err("a hash mismatch must fail the step");
     assert!(
         format!("{error}\n{error:?}")
@@ -322,10 +341,16 @@ fn downloads_sharing_a_basename_do_not_share_a_destination() {
     let second = download_step("second", "file:///pm-integration-test/two/source.tar.gz");
 
     assert!(
-        first.execute(work.path(), dest.path()).is_err(),
+        first
+            .execute(&host_sandbox(work.path(), dest.path()), work.path())
+            .is_err(),
         "an unfetchable URL must fail the step"
     );
-    assert!(second.execute(work.path(), dest.path()).is_err());
+    assert!(
+        second
+            .execute(&host_sandbox(work.path(), dest.path()), work.path())
+            .is_err()
+    );
 
     let after_two = entries_of(work.path());
     assert_eq!(
@@ -340,7 +365,11 @@ fn downloads_sharing_a_basename_do_not_share_a_destination() {
         "first-again",
         "file:///pm-integration-test/one/source.tar.gz",
     );
-    assert!(again.execute(work.path(), dest.path()).is_err());
+    assert!(
+        again
+            .execute(&host_sandbox(work.path(), dest.path()), work.path())
+            .is_err()
+    );
     assert_eq!(
         entries_of(work.path()),
         after_two,
@@ -375,7 +404,7 @@ fn two_downloads_sharing_a_basename_both_land() {
         run: Vec::new(),
     };
     fetching
-        .execute(work.path(), dest.path())
+        .execute(&host_sandbox(work.path(), dest.path()), work.path())
         .expect("both downloads must succeed");
 
     let landed: Vec<String> = read_dir(work.path())
@@ -406,7 +435,7 @@ fn a_command_string_is_not_interpreted_by_a_shell() {
     let literal = install_step("literal", &["/bin/mkdir -p $DESTDIR/oops"]);
 
     literal
-        .execute(work.path(), dest.path())
+        .execute(&host_sandbox(work.path(), dest.path()), work.path())
         .expect("mkdir must succeed; the argument is just an odd directory name");
 
     assert!(
@@ -437,7 +466,7 @@ fn make_install_redirects_into_destdir_through_the_environment() {
     std::fs::write(work.path().join("payload"), "#!/bin/sh\nexit 0\n").expect("write the payload");
 
     install_step("make", &["make install"])
-        .execute(work.path(), dest.path())
+        .execute(&host_sandbox(work.path(), dest.path()), work.path())
         .expect("`make install` must succeed");
 
     assert!(

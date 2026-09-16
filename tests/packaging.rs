@@ -195,7 +195,6 @@ fn extract(archive: &Path) -> TempDir {
 fn entrypoint_of<'a>(metadata: &'a Metadata, suffix: &str) -> Option<&'a Type> {
     metadata
         .entrypoints()
-        .iter()
         .find(|(path, _)| path.ends_with(suffix))
         .map(|(_, ty)| ty)
 }
@@ -289,13 +288,13 @@ fn every_entrypoint_path_is_relative_to_the_package_root() {
             .expect("metadata must be valid YAML");
 
     assert!(
-        !metadata.entrypoints().is_empty(),
+        metadata.entrypoints().len() > 0,
         "the package staged files, so it must have entrypoints"
     );
 
     // Absolute build-time paths are meaningless once the package is extracted
     // somewhere else, so they must never make it into the metadata.
-    for path in metadata.entrypoints().keys() {
+    for (path, _) in metadata.entrypoints() {
         assert!(
             path.is_relative(),
             "entrypoint {} is an absolute build-time path",
@@ -309,7 +308,7 @@ fn every_entrypoint_path_is_relative_to_the_package_root() {
     }
 
     // And they must resolve against the extracted tree.
-    for path in metadata.entrypoints().keys() {
+    for (path, _) in metadata.entrypoints() {
         assert!(
             built.dest.path().join(path).exists(),
             "entrypoint {} does not exist in the extracted package",
@@ -396,9 +395,9 @@ fn a_build_that_stages_nothing_still_produces_an_archive() {
             .expect("metadata must be valid YAML");
     assert_eq!(metadata.name(), "stagednothing");
     assert!(
-        metadata.entrypoints().is_empty(),
+        metadata.entrypoints().len() == 0,
         "nothing was staged, so there is nothing to run: {:?}",
-        metadata.entrypoints()
+        metadata.entrypoints().collect::<Vec<_>>()
     );
 }
 
@@ -504,7 +503,6 @@ fn a_diamond_dependency_builds_the_shared_package_once() {
             .expect("metadata must be valid YAML");
     let mut deps: Vec<String> = metadata
         .dependencies()
-        .iter()
         .map(|path| path.display().to_string())
         .collect();
     deps.sort();
@@ -623,9 +621,12 @@ fn destdir_reaches_a_real_makefile() {
         from_str(&read_to_string(dest.path().join("metadata")).expect("read the metadata"))
             .expect("the metadata must parse");
     assert_eq!(
-        metadata.entrypoints().get(Path::new("usr/bin/mytool")),
+        metadata
+            .entrypoints()
+            .find(|(p, _)| *p == Path::new("usr/bin/mytool"))
+            .map(|(_, t)| t),
         Some(&Type::Binary),
         "the make-installed binary must be recorded as an entrypoint, got {:?}",
-        metadata.entrypoints()
+        metadata.entrypoints().collect::<Vec<_>>()
     );
 }

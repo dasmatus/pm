@@ -147,9 +147,15 @@ fn metadata_yaml_round_trip_keeps_the_entrypoint_map_intact() {
     assert_eq!(parsed.name(), "demo");
     let version: Vec<&str> = parsed.version().iter().map(String::as_str).collect();
     assert_eq!(version, ["0", "1", "0"]);
-    let deps: Vec<&Path> = parsed.dependencies().iter().map(PathBuf::as_path).collect();
+    let deps: Vec<&Path> = parsed.dependencies().collect();
     assert_eq!(deps, [Path::new("deps/other.cpkg")]);
-    assert_eq!(parsed.entrypoints(), &entrypoints);
+    assert_eq!(
+        parsed
+            .entrypoints()
+            .map(|(p, t)| (p.to_path_buf(), *t))
+            .collect::<HashMap<_, _>>(),
+        entrypoints
+    );
 }
 
 #[test]
@@ -166,7 +172,13 @@ fn create_stores_exactly_what_it_is_given_without_touching_the_filesystem() {
     assert_eq!(metadata.name(), "nowhere");
     assert_eq!(metadata.version().len(), 1);
     assert_eq!(metadata.dependencies().len(), 1);
-    assert_eq!(metadata.entrypoints(), &entrypoints);
+    assert_eq!(
+        metadata
+            .entrypoints()
+            .map(|(p, t)| (p.to_path_buf(), *t))
+            .collect::<HashMap<_, _>>(),
+        entrypoints
+    );
 }
 
 #[test]
@@ -177,8 +189,8 @@ fn metadata_with_no_entrypoints_round_trips() {
     let parsed: Metadata = from_str(&yaml).expect("parse back");
 
     assert_eq!(parsed.name(), "bare");
-    assert!(parsed.dependencies().is_empty());
-    assert!(parsed.entrypoints().is_empty());
+    assert_eq!(parsed.dependencies().len(), 0);
+    assert_eq!(parsed.entrypoints().len(), 0);
 }
 
 #[test]
@@ -191,11 +203,6 @@ fn a_binary_entrypoint_is_distinguishable_from_a_library_after_a_round_trip() {
 
     let parsed: Metadata = from_str(&to_string(&metadata).expect("serialise")).expect("parse back");
 
-    let binaries: Vec<&PathBuf> = parsed
-        .entrypoints()
-        .iter()
-        .filter(|(_, ty)| **ty == Type::Binary)
-        .map(|(path, _)| path)
-        .collect();
+    let binaries: Vec<&Path> = parsed.binaries().collect();
     assert_eq!(binaries, [&PathBuf::from("bin/tool")]);
 }

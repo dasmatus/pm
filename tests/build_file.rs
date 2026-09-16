@@ -3,7 +3,7 @@
 
 use std::ffi::OsStr;
 use std::fs::{read_to_string, write};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Command, Output, Stdio};
 
 use pm::bf::BuildFile;
@@ -32,7 +32,10 @@ fn generate_round_trips_through_yaml() {
 
     assert_eq!(parsed.name(), generated.name());
     assert_eq!(parsed.version(), generated.version());
-    assert_eq!(parsed.dependencies(), generated.dependencies());
+    assert_eq!(
+        parsed.dependencies().collect::<Vec<_>>(),
+        generated.dependencies().collect::<Vec<_>>()
+    );
     assert_eq!(parsed.version_string(), generated.version_string());
 }
 
@@ -42,7 +45,8 @@ fn generate_produces_a_file_that_load_accepts() {
     let yaml = to_string(&generated).expect("serialise");
     let (_dir, path) = build_file_with(&yaml);
 
-    let loaded = BuildFile::load_unverified(&path).expect("a generated build file must load from disk");
+    let loaded =
+        BuildFile::load_unverified(&path).expect("a generated build file must load from disk");
 
     assert_eq!(loaded.name(), generated.name());
     assert_eq!(loaded.version(), generated.version());
@@ -139,7 +143,7 @@ fn dependencies_are_preserved_across_a_load() {
     );
     let loaded = BuildFile::load_unverified(&path).expect("load");
 
-    let deps: Vec<&Path> = loaded.dependencies().iter().map(PathBuf::as_path).collect();
+    let deps: Vec<&Path> = loaded.dependencies().collect();
     assert_eq!(
         deps,
         [Path::new("/tmp/one.yaml"), Path::new("/tmp/two.yaml")]

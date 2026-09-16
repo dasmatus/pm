@@ -82,15 +82,25 @@ impl Metadata {
         &self.version
     }
 
-    /// Paths of the bundled dependencies, relative to the package root.
-    pub fn dependencies(&self) -> &[PathBuf] {
-        &self.dependencies
+    /// Paths of the bundled dependencies, relative to the package root, borrowed
+    /// in place.
+    pub fn dependencies(&self) -> impl ExactSizeIterator<Item = &Path> {
+        self.dependencies.iter().map(PathBuf::as_path)
     }
 
-    /// The runnable and linkable files of this package, keyed by their path
-    /// relative to the package root.
-    pub fn entrypoints(&self) -> &HashMap<PathBuf, Type> {
-        &self.entrypoints
+    /// Every declared entrypoint, borrowed in place, keyed by its path relative to
+    /// the package root.
+    pub fn entrypoints(&self) -> impl ExactSizeIterator<Item = (&Path, &Type)> {
+        self.entrypoints
+            .iter()
+            .map(|(path, r#type)| (path.as_path(), r#type))
+    }
+
+    /// The runnable subset of [`Self::entrypoints`].
+    pub fn binaries(&self) -> impl Iterator<Item = &Path> {
+        self.entrypoints()
+            .filter(|&(_, r#type)| *r#type == Type::Binary)
+            .map(|(path, _)| path)
     }
 
     /// Classify one file on disk.

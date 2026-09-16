@@ -4,9 +4,7 @@ use pm::{
     bf::BuildFile,
     policy::{BuildPolicy, UNMATCHED},
     run::PackageRunner,
-    signing::{
-        Signature, SigningKey, TrustStore, default_key_path, default_trust_dir, sign_file,
-    },
+    signing::{Signature, SigningKey, TrustStore, default_key_path, default_trust_dir, sign_file},
 };
 use serde_yaml::to_string;
 use std::{
@@ -175,7 +173,9 @@ fn main() -> miette::Result<()> {
             // that call terminates immediately and runs no destructors, so were a guard
             // still live here it would leak the staging directory and leave the child
             // unreaped. Do not move the exit into a scope that still holds one.
-            let status = PackageRunner::new(package).allow_network(network).run(bin)?;
+            let status = PackageRunner::new(package)
+                .allow_network(network)
+                .run(bin)?;
             if !status.success() {
                 warn!(
                     code = status.code,
@@ -338,7 +338,11 @@ fn explain(file: &Path, permissive: bool) -> miette::Result<()> {
                     `pm build --permissive` and accept that those commands get no \
                     capabilities at all.",
             "{unmatched} {} in {} {} no built-in fingerprint.",
-            if unmatched == 1 { "command" } else { "commands" },
+            if unmatched == 1 {
+                "command"
+            } else {
+                "commands"
+            },
             file.display(),
             if unmatched == 1 { "matches" } else { "match" }
         ));

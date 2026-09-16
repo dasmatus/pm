@@ -23,7 +23,7 @@ use std::{
 };
 
 use crate::{
-    metadata::{Metadata, Type},
+    metadata::Metadata,
     signing::{TrustStore, default_trust_dir, verify_file},
     workspace::{SandboxedChild, Workspace},
 };
@@ -340,14 +340,12 @@ impl PackageRunner {
         package_root: &Path,
     ) -> miette::Result<PathBuf> {
         // Entrypoints live in a HashMap, whose iteration order is not stable;
-        // sort so the prompt and the error listing are reproducible.
-        let mut declared: Vec<&PathBuf> = metadata
-            .entrypoints()
-            .iter()
-            .filter(|(_, ty)| **ty == Type::Binary)
-            .map(|(path, _)| path)
-            .collect();
-        declared.sort();
+        // sort so the prompt and the error listing are reproducible. This is one
+        // of the few collects that has to stay: the list is walked twice and the
+        // prompt answers with a *position*, which an iterator cannot be indexed
+        // by. It holds `&Path`, so it is one pointer-sized push per entrypoint.
+        let mut declared: Vec<&Path> = metadata.binaries().collect();
+        declared.sort_unstable();
 
         if declared.is_empty() {
             return Err(miette!(
@@ -361,7 +359,7 @@ impl PackageRunner {
             .copied()
             .filter_map(|path| match Self::resolve_entrypoint(package_root, path) {
                 Ok(resolved) => Some(Entrypoint {
-                    declared: path.as_path(),
+                    declared: path,
                     resolved,
                 }),
                 Err(error) => {

@@ -209,8 +209,8 @@ impl BuildFile {
 
     /// Paths of the build files this package depends on.
     #[must_use]
-    pub fn dependencies(&self) -> &[PathBuf] {
-        &self.dependencies
+    pub fn dependencies(&self) -> impl ExactSizeIterator<Item = &Path> {
+        self.dependencies.iter().map(PathBuf::as_path)
     }
 
     /// The build steps, in the order the file declares them.
@@ -470,9 +470,8 @@ impl BuildFile {
 
         let read_only = self.read_only_mounts(dependency_archives);
         let borrowed: Vec<&Path> = read_only.iter().map(PathBuf::as_path).collect();
-        BuildSandbox::new(policy, workdir, staging, &borrowed).wrap_err_with(|| {
-            format!("cannot build the sandbox for {}", self.name)
-        })
+        BuildSandbox::new(policy, workdir, staging, &borrowed)
+            .wrap_err_with(|| format!("cannot build the sandbox for {}", self.name))
     }
 
     /// Host directories the steps may read, mounted read-only at their own

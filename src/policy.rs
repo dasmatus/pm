@@ -99,52 +99,88 @@ static TABLE: &[Fingerprint] = &[
         pattern: program!(r"g?make"),
         // `make` runs every recipe line through /bin/sh, and those lines are
         // overwhelmingly compiler and coreutils invocations.
-        capabilities: &[Capability::Toolchain, Capability::Coreutils, Capability::Shell],
+        capabilities: &[
+            Capability::Toolchain,
+            Capability::Coreutils,
+            Capability::Shell,
+        ],
     },
     Fingerprint {
         name: "configure",
         // `./configure`, `../configure` and `/src/configure`; a generated
         // configure script is a shell script that probes the toolchain.
         pattern: program!(r"configure"),
-        capabilities: &[Capability::Toolchain, Capability::Coreutils, Capability::Shell],
+        capabilities: &[
+            Capability::Toolchain,
+            Capability::Coreutils,
+            Capability::Shell,
+        ],
     },
     Fingerprint {
         name: "cmake",
         pattern: program!(r"cmake|ctest|cpack"),
-        capabilities: &[Capability::Toolchain, Capability::Coreutils, Capability::Shell],
+        capabilities: &[
+            Capability::Toolchain,
+            Capability::Coreutils,
+            Capability::Shell,
+        ],
     },
     Fingerprint {
         name: "ninja",
         pattern: program!(r"ninja|samu"),
-        capabilities: &[Capability::Toolchain, Capability::Coreutils, Capability::Shell],
+        capabilities: &[
+            Capability::Toolchain,
+            Capability::Coreutils,
+            Capability::Shell,
+        ],
     },
     Fingerprint {
         name: "meson",
         pattern: program!(r"meson"),
-        capabilities: &[Capability::Toolchain, Capability::Coreutils, Capability::Shell],
+        capabilities: &[
+            Capability::Toolchain,
+            Capability::Coreutils,
+            Capability::Shell,
+        ],
     },
     Fingerprint {
         name: "cargo",
         // Cargo resolves and downloads the dependency graph itself.
         pattern: program!(r"cargo|rustc"),
-        capabilities: &[Capability::Toolchain, Capability::Coreutils, Capability::Network],
+        capabilities: &[
+            Capability::Toolchain,
+            Capability::Coreutils,
+            Capability::Network,
+        ],
     },
     Fingerprint {
         name: "go",
         // `go build` fetches modules; `gofmt` is a different word and does not
         // match, because the pattern demands a word terminator after `go`.
         pattern: program!(r"go"),
-        capabilities: &[Capability::Toolchain, Capability::Coreutils, Capability::Network],
+        capabilities: &[
+            Capability::Toolchain,
+            Capability::Coreutils,
+            Capability::Network,
+        ],
     },
     Fingerprint {
         name: "node",
         pattern: program!(r"npm|yarn|pnpm|npx|node"),
-        capabilities: &[Capability::Toolchain, Capability::Coreutils, Capability::Network],
+        capabilities: &[
+            Capability::Toolchain,
+            Capability::Coreutils,
+            Capability::Network,
+        ],
     },
     Fingerprint {
         name: "pip",
         pattern: program!(r"pip[23]?"),
-        capabilities: &[Capability::Toolchain, Capability::Coreutils, Capability::Network],
+        capabilities: &[
+            Capability::Toolchain,
+            Capability::Coreutils,
+            Capability::Network,
+        ],
     },
     Fingerprint {
         name: "python",
@@ -189,9 +225,7 @@ static TABLE: &[Fingerprint] = &[
     },
     Fingerprint {
         name: "archive",
-        pattern: program!(
-            r"tar|unzip|zip|xz|unxz|gzip|gunzip|bzip2|bunzip2|zstd|unzstd|7z|cpio"
-        ),
+        pattern: program!(r"tar|unzip|zip|xz|unxz|gzip|gunzip|bzip2|bunzip2|zstd|unzstd|7z|cpio"),
         capabilities: &[Capability::Archive, Capability::Coreutils],
     },
     Fingerprint {

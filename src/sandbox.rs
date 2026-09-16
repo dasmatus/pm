@@ -274,7 +274,9 @@ impl BuildSandbox {
         let args: Vec<&str> = words.collect();
 
         match &self.mode {
-            Mode::Jailed(container) => self.run_jailed(container, program, &args, command, step_name),
+            Mode::Jailed(container) => {
+                self.run_jailed(container, program, &args, command, step_name)
+            }
             Mode::Host => self.run_on_host(program, &args, command, step_name),
         }
     }

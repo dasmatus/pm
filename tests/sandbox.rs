@@ -451,7 +451,8 @@ fn pm_command(args: &[&str], config: &Path) -> Output {
 ///
 /// The keys are quoted, so `..`, a leading `/` and anything else stay verbatim.
 fn write_metadata(root: &Path, name: &str, entrypoints: &[&str]) {
-    let mut yaml = format!("name: {name}\nversion:\n- '0'\n- '1'\ndependencies: []\nentrypoints:\n");
+    let mut yaml =
+        format!("name: {name}\nversion:\n- '0'\n- '1'\ndependencies: []\nentrypoints:\n");
     for entrypoint in entrypoints {
         yaml.push_str(&format!("  \"{entrypoint}\": Binary\n"));
     }
@@ -647,7 +648,10 @@ fn allow_unsigned_is_the_documented_escape_hatch() {
         .run(Some("usr/bin/hello".into()))
         .expect("the opt-out must run the package anyway");
 
-    assert!(status.success(), "the package should still run to completion");
+    assert!(
+        status.success(),
+        "the package should still run to completion"
+    );
 }
 
 #[test]
