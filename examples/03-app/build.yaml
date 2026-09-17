@@ -1,8 +1,10 @@
 # examples/03-app -- the third link, and the one the run-time demo uses.
 #
-# Depends on 02-lib, which depends on 01-seed. Dependencies are built
-# depth-first and sequentially, with a visiting stack that rejects cycles and a
-# memo map so a diamond builds once (BuildFile::build_dependency).
+# Depends on 02-lib, which depends on 01-seed. The whole graph is resolved
+# before any of it is built, keyed by canonical path, so a diamond is one node
+# and builds once, and a cycle is rejected before a single step runs
+# (graph::Graph::resolve). Packages with no dependency on each other then build
+# at the same time, as many as -j allows.
 #
 # This package stages TWO entrypoints on purpose, because the interesting half
 # of pm happens after the build: a run-time permission profile is inferred from

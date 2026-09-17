@@ -126,14 +126,14 @@ classification gate plus a network switch.
 the file, against `$XDG_CONFIG_HOME/pm/trusted/` (`BuildFile::load`). How the
 top-level file was loaded rides on the value, so dependencies are held to the
 same standard all the way down — signed all the way, or not at all
-(`BuildFile::build_dependency`). `pm run` and `pm profile` verify the `.cpkg` too.
+(`graph::Graph::resolve`). `pm run` and `pm profile` verify the `.cpkg` too.
 
 Editing a build file invalidates its signature, including a comment. `demo.sh`
 re-signs everything on each run.
 
 ### Dependencies resolve against the *process* working directory
 
-Not against the build file's directory (`BuildFile::build_dependency`). That is
+Not against the build file's directory (`graph::Graph::resolve`). That is
 why every `dependencies:` entry here is spelled `../examples/...`: `demo.sh` runs `pm`
 from the repo's `out/` directory throughout.
 

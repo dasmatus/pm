@@ -522,27 +522,44 @@ impl Schedule {
                 }
             }
             Err(report) => {
-                warn!(
-                    package = graph.nodes[index].build.name(),
-                    "package failed; skipping everything that depends on it"
-                );
                 self.progression[index] = Progression::Failed(report);
-                self.skip_dependents_of(index);
+                let skipped = self.skip_dependents_of(index);
+                // Say what was actually skipped. A package nothing depends on
+                // takes nothing down with it, and claiming otherwise sends
+                // whoever is reading the log looking for casualties there
+                // aren't any of.
+                if skipped == 0 {
+                    warn!(package = graph.nodes[index].build.name(), "package failed");
+                } else {
+                    warn!(
+                        package = graph.nodes[index].build.name(),
+                        skipped, "package failed; skipping what depends on it"
+                    );
+                }
             }
         }
     }
 
-    /// Mark everything transitively depending on `index` as skipped.
-    fn skip_dependents_of(&mut self, index: usize) {
+    /// Mark everything transitively depending on `index` as skipped, and say
+    /// how many that was.
+    fn skip_dependents_of(&mut self, index: usize) -> usize {
         let mut doomed = self.dependents[index].clone();
+        let mut skipped = 0;
+
         while let Some(next) = doomed.pop() {
+            // Already settled: reached twice through a diamond, or failed on
+            // its own. Skipping it again would decrement `unsettled` twice for
+            // one package and end the build with work still outstanding.
             if !matches!(self.progression[next], Progression::Waiting) {
                 continue;
             }
             self.progression[next] = Progression::Skipped;
             self.unsettled -= 1;
+            skipped += 1;
             doomed.extend_from_slice(&self.dependents[next]);
         }
+
+        skipped
     }
 
     /// Give up on whatever is left, so a stalled schedule reports instead of hanging.

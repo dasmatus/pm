@@ -36,7 +36,7 @@ fail() { printf '%sFAILED: %s%s\n' "$red" "$*" "$off"; exit 1; }
 # pm runs from out/ throughout. Dependency paths inside a build file are
 # resolved against the PROCESS working directory, not the build file's own
 # directory, which is why every dependency in examples/ is spelled
-# ../examples/... -- it is relative to here. See BuildFile::build_dependency.
+# ../examples/... -- it is relative to here. See graph::Graph::resolve.
 pm() { ( cd "$OUT" && "$PM" "$@" ); }
 
 # ---------------------------------------------------------------------------
@@ -77,7 +77,7 @@ step "2. Generate a throwaway signing key"
 # ---------------------------------------------------------------------------
 # pm build verifies a detached <FILE>.sig BEFORE it parses the build file, and
 # every dependency is held to the same standard all the way down
-# (BuildFile::load, then BuildFile::build_dependency for each one below it). A
+# (BuildFile::load, then graph::Graph::resolve for each one below it). A
 # build file names the commands that will run, so reading an unsigned one is
 # already the interesting half of running it.
 rm -rf "$XDG_CONFIG_HOME"
@@ -161,10 +161,14 @@ note "step 7 runs this exact file again, jailed, and every probe passes"
 # ---------------------------------------------------------------------------
 step "7. Build the chain: 01-seed -> 02-lib -> 03-app -> pm"
 # ---------------------------------------------------------------------------
-# One command builds all four. Dependencies are built depth-first and
-# sequentially, with a visiting stack that rejects cycles and a memo map so a
-# diamond builds once, all of it in BuildFile::build_dependency. pm itself is
-# compiled from source by cargo, inside the same jail every other package got.
+# One command builds all four. The graph is resolved first, in full: every
+# build file is read and keyed by canonical path, so a diamond is one node, and
+# a cycle, a missing build file or an unclassifiable command is rejected before
+# a single step runs (graph::Graph::resolve). A scheduler then builds it, up to
+# -j packages at once, defaulting to the core count -- though this chain is
+# linear, so each package here waits for the one below it either way. pm itself
+# is compiled from source by cargo, inside the same jail every other package
+# got.
 #
 # This downloads and compiles pm's entire dependency graph, so it takes a few
 # minutes. CARGO_HOME is /build/.cargo -- inside the workspace -- so the cache
@@ -256,7 +260,7 @@ note "remove the demo key with: rm -rf $XDG_CONFIG_HOME"
 note "remove the decoy with:    rm -rf $DECOY"
 # Steps 6 and 8 are meant to fail, and pm deliberately retains the workspace of
 # a failed build so the half-finished tree can be inspected. See
-# BuildFile::run_tracked. Those land under TMPDIR, which is out/tmp here, so
+# BuildFile::build_alone. Those land under TMPDIR, which is out/tmp here, so
 # removing out/ takes them with it.
 note "two builds here fail on purpose; pm kept their workspaces under $TMPDIR"
 note "remove everything with: rm -rf $OUT"

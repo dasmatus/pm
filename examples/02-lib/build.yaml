@@ -5,7 +5,7 @@
 # `dependencies` field of BuildFile. The path is resolved against the process
 # working directory, NOT against this file's directory, which is why it reads
 # `../examples/...` -- every pm invocation in examples/demo.sh runs from the
-# repo's out/ directory. See BuildFile::build_dependency.
+# repo's out/ directory. See graph::Graph::resolve.
 #
 # Running from out/ is deliberate. The directory holding each dependency
 # archive gets bind-mounted read-only into the dependent's jail, so keeping

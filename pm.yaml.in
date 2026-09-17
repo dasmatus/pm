@@ -2,9 +2,11 @@
 #
 #   examples/01-seed  <-  examples/02-lib  <-  examples/03-app  <-  pm
 #
-# Dependencies are built depth-first, so `pm build ../pm.yaml` runs 01-seed,
-# then 02-lib, then 03-app, then this. pm is genuinely compiled from source
-# here: cargo runs inside the same jail every other package got.
+# The graph is resolved before any of it is built, then built with as many
+# packages in flight as -j allows. This chain is linear, so the order is forced
+# anyway: `pm build ../pm.yaml` runs 01-seed, then 02-lib, then 03-app, then
+# this. pm is genuinely compiled from source here: cargo runs inside the same
+# jail every other package got.
 #
 # ---------------------------------------------------------------------------
 # THIS IS A TEMPLATE. examples/demo.sh substitutes five placeholders and
