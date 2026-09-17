@@ -409,30 +409,33 @@ fn a_shared_dependency_is_built_once_however_many_workers_there_are() {
 }
 
 #[test]
-fn a_package_is_never_started_twice_even_when_workers_outnumber_it() {
+fn every_dependent_of_one_package_is_built_when_it_finishes() {
     let dir = tempdir().expect("a temporary directory");
-    // Five dependents of one slow package, and more workers than packages.
-    // Every one of them becomes ready at the same instant the shared build
-    // finishes, which is the moment a scheduler that tracked readiness badly
-    // would hand the same node out again.
-    let shared = slow_package(&dir, "wshared", "2", &[]);
+    // Five dependents of one package, and more workers than there is work.
+    // All five become ready at the same instant `wshared` settles, which is
+    // the moment a scheduler that released readiness badly would drop one.
+    let shared = slow_package(&dir, "wshared", "1", &[]);
     let dependents: Vec<PathBuf> = (0..5)
         .map(|i| slow_package(&dir, &format!("wdep{i}"), "0", &[&shared]))
         .collect();
     let borrowed: Vec<&Path> = dependents.iter().map(PathBuf::as_path).collect();
     let top = slow_package(&dir, "wtop", "0", &borrowed);
 
-    let (result, elapsed) = timed_build_at(&top, dir.path(), 8);
-    result.expect("the graph must build");
+    build_at(&top, dir.path(), 8).expect("the graph must build");
 
-    assert!(
-        elapsed < Duration::from_secs(4),
-        "the shared package appears to have been built more than once"
-    );
+    // Deliberately not timed. Everything here is dominated by fixed
+    // per-package overhead - workspaces, sandboxes, permission inference,
+    // packaging - so a wall-clock budget would be measuring the machine, not
+    // the scheduler. That a shared package is built once is settled
+    // structurally by `a_diamond_resolves_to_one_node_per_build_file`.
     for i in 0..5 {
         assert!(
             dir.path().join(format!("wdep{i}-1.cpkg")).is_file(),
-            "wdep{i} was not built"
+            "wdep{i} was not built, though wshared finished"
         );
     }
+    assert!(
+        dir.path().join("wtop-1.cpkg").is_file(),
+        "the root must build once all five of its dependencies have"
+    );
 }

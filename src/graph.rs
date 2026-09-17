@@ -16,8 +16,10 @@
 //! "build it once" rule stops being something the walk has to remember.
 
 use std::{
+    any::Any,
     collections::HashMap,
     num::NonZeroUsize,
+    panic::{AssertUnwindSafe, catch_unwind},
     path::{Path, PathBuf},
     sync::{Condvar, Mutex, MutexGuard, PoisonError},
     thread::{available_parallelism, scope},
@@ -177,9 +179,25 @@ impl Graph {
         while let Some((index, archives)) = self.claim(schedule, wakeup, summary) {
             let node = &self.nodes[index];
             // Built outside the lock: this is the part that takes minutes.
-            let result = node
-                .build
-                .build_alone(options, &node.policy, progress, &archives)
+            //
+            // A panic has to be caught rather than allowed to unwind. This
+            // worker would never reach `settle`, so the package it claimed
+            // would stay `running` for ever, the other workers would wait on a
+            // condvar nobody can notify, and `scope` would block joining them:
+            // a hang instead of a failure. Sequentially a panic simply
+            // propagated; making the walk concurrent is what introduced this.
+            let attempt = catch_unwind(AssertUnwindSafe(|| {
+                node.build
+                    .build_alone(options, &node.policy, progress, &archives)
+            }));
+            let result = attempt
+                .unwrap_or_else(|panic| {
+                    Err(miette!(
+                        "the build of {} panicked: {}",
+                        node.build.name(),
+                        describe_panic(&panic)
+                    ))
+                })
                 .wrap_err_with(|| format!("package {} failed", node.build.name()));
 
             let mut state = lock(schedule);
@@ -386,6 +404,15 @@ pub(crate) fn cycle_chain(visiting: &[PathBuf], key: &Path) -> String {
         .chain(std::iter::once(key.display().to_string()))
         .collect::<Vec<_>>()
         .join(" -> ")
+}
+
+/// Pull a readable message out of whatever was panicked with.
+fn describe_panic(panic: &Box<dyn Any + Send>) -> String {
+    panic
+        .downcast_ref::<&str>()
+        .map(|message| (*message).to_string())
+        .or_else(|| panic.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "a panic carrying no message".to_string())
 }
 
 /// How many packages build at once when nothing said otherwise.
