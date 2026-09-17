@@ -233,14 +233,31 @@ fn failing_package(dir: &TempDir, name: &str, deps: &[&Path]) -> PathBuf {
 
 /// Resolves and builds `root` from inside `at`, with `jobs` workers.
 fn build_at(root: &Path, at: &Path, jobs: usize) -> miette::Result<PathBuf> {
+    timed_build_at(root, at, jobs).0
+}
+
+/// As [`build_at`], also reporting how long the build itself took.
+///
+/// The clock starts **after** the current-directory lock has been taken. Tests
+/// in one binary run as threads and every build here serialises on that lock,
+/// so a clock started any earlier would be measuring how long a sibling test
+/// held it - which is how a timing assertion turns into a flake that gets worse
+/// every time another test is added.
+fn timed_build_at(root: &Path, at: &Path, jobs: usize) -> (miette::Result<PathBuf>, Duration) {
     let options = BuildOptions {
         jobs: NonZeroUsize::new(jobs),
         ..BuildOptions::default()
     };
     let build = BuildFile::load_unverified(root).expect("the root build file must load");
-    let graph = Graph::resolve(&build, options)?;
+    let graph = match Graph::resolve(&build, options) {
+        Ok(graph) => graph,
+        Err(report) => return (Err(report), Duration::ZERO),
+    };
+
     let _cwd = CwdGuard::enter(at);
-    graph.build(options, &Progress::disabled())
+    let started = Instant::now();
+    let result = graph.build(options, &Progress::disabled());
+    (result, started.elapsed())
 }
 
 #[test]
@@ -274,9 +291,8 @@ fn independent_packages_build_at_the_same_time() {
     let borrowed: Vec<&Path> = deps.iter().map(PathBuf::as_path).collect();
     let top = slow_package(&dir, "partop", "0", &borrowed);
 
-    let started = Instant::now();
-    build_at(&top, dir.path(), 4).expect("the graph must build");
-    let elapsed = started.elapsed();
+    let (result, elapsed) = timed_build_at(&top, dir.path(), 4);
+    result.expect("the graph must build");
 
     // Four 2-second sleeps take 8s sequentially. The margin is deliberately
     // enormous: this asserts "they overlapped", not a throughput figure.
@@ -295,9 +311,8 @@ fn one_job_builds_them_one_at_a_time() {
     let borrowed: Vec<&Path> = deps.iter().map(PathBuf::as_path).collect();
     let top = slow_package(&dir, "seqtop", "0", &borrowed);
 
-    let started = Instant::now();
-    build_at(&top, dir.path(), 1).expect("the graph must build");
-    let elapsed = started.elapsed();
+    let (result, elapsed) = timed_build_at(&top, dir.path(), 1);
+    result.expect("the graph must build");
 
     assert!(
         elapsed >= Duration::from_secs(3),
@@ -365,4 +380,59 @@ fn a_package_whose_dependency_failed_is_never_started() {
         report.to_lowercase().contains("skip"),
         "the diagnostic must say what was skipped and why: {report}"
     );
+}
+
+#[test]
+fn a_shared_dependency_is_built_once_however_many_workers_there_are() {
+    let dir = tempdir().expect("a temporary directory");
+    // `dshared` takes 3 seconds. Both `dleft` and `dright` need it, and at -j4
+    // there are workers spare to build it twice over if the scheduler ever let
+    // them. Timing is the assertion because "built once" is not visible in the
+    // output: a second build would overwrite the first archive and look
+    // identical. Two builds of a 3s package cannot finish in under 5s.
+    let shared = slow_package(&dir, "dshared", "3", &[]);
+    let left = slow_package(&dir, "dleft", "0", &[&shared]);
+    let right = slow_package(&dir, "dright", "0", &[&shared]);
+    let top = slow_package(&dir, "dtop", "0", &[&left, &right]);
+
+    let (result, elapsed) = timed_build_at(&top, dir.path(), 4);
+    result.expect("the diamond must build");
+
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "a diamond took {elapsed:?} at -j4; the shared dependency was built more than once"
+    );
+    assert!(
+        dir.path().join("dshared-1.cpkg").is_file(),
+        "the shared dependency must have been built at all"
+    );
+}
+
+#[test]
+fn a_package_is_never_started_twice_even_when_workers_outnumber_it() {
+    let dir = tempdir().expect("a temporary directory");
+    // Five dependents of one slow package, and more workers than packages.
+    // Every one of them becomes ready at the same instant the shared build
+    // finishes, which is the moment a scheduler that tracked readiness badly
+    // would hand the same node out again.
+    let shared = slow_package(&dir, "wshared", "2", &[]);
+    let dependents: Vec<PathBuf> = (0..5)
+        .map(|i| slow_package(&dir, &format!("wdep{i}"), "0", &[&shared]))
+        .collect();
+    let borrowed: Vec<&Path> = dependents.iter().map(PathBuf::as_path).collect();
+    let top = slow_package(&dir, "wtop", "0", &borrowed);
+
+    let (result, elapsed) = timed_build_at(&top, dir.path(), 8);
+    result.expect("the graph must build");
+
+    assert!(
+        elapsed < Duration::from_secs(4),
+        "the shared package appears to have been built more than once"
+    );
+    for i in 0..5 {
+        assert!(
+            dir.path().join(format!("wdep{i}-1.cpkg")).is_file(),
+            "wdep{i} was not built"
+        );
+    }
 }
