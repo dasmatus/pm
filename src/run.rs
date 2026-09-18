@@ -280,8 +280,8 @@ impl PackageRunner {
     /// never run and never offered in the prompt, whoever asked for them.
     ///
     /// Delegates to [`PackageRunner::run_with`], passing
-    /// [`PackageRunner::choose_interactively`] as the entrypoint chooser and
-    /// [`trace`] as the tracer - today's behaviour, unchanged. Every existing
+    /// `choose_interactively` as the entrypoint chooser and [`trace`] as the
+    /// tracer - today's behaviour, unchanged. Every existing
     /// caller of `run`, including the ones that assert on its exact numeric
     /// exit codes, keeps working exactly as it does today; the two seams a
     /// daemon needs are additions on `run_with`, not changes here.
@@ -307,15 +307,15 @@ impl PackageRunner {
     ///   must return one of them BY NAME - never a positional index, which
     ///   would be meaningless once the list has been re-derived on the other
     ///   side of a process boundary. [`PackageRunner::run`] passes
-    ///   [`PackageRunner::choose_interactively`], which still prompts and
-    ///   picks by index internally before translating the answer back to a
-    ///   name; a daemon instead passes a closure that already has the
-    ///   caller's answer in hand, with nothing to prompt at all. Whichever
-    ///   chooser is asked, a name that does not match a usable entrypoint is
-    ///   refused with the same diagnostic a bad `--bin` gets - both go
-    ///   through the same lookup.
+    ///   `choose_interactively`, which still prompts and picks by index
+    ///   internally before translating the answer back to a name; a daemon
+    ///   instead passes a closure that already has the caller's answer in
+    ///   hand, with nothing to prompt at all. Whichever chooser is asked, a
+    ///   name that does not match a usable entrypoint is refused with the
+    ///   same diagnostic a bad `--bin` gets - both go through the same
+    ///   lookup.
     /// - **`tracer`** replaces the in-process [`trace`] call inside
-    ///   [`PackageRunner::audit_run`]. `monitor::supervise` reaps with
+    ///   `audit_run`. `monitor::supervise` reaps with
     ///   `waitpid(-1, __WALL)`, which would eat a daemon's other children if
     ///   it ran in the daemon's own process; a daemon instead hands in a
     ///   closure that spawns `pm-trace` as a separate process and reports
@@ -341,7 +341,7 @@ impl PackageRunner {
     /// valid YAML; when the package exposes no usable binary entrypoints; when
     /// `bin` (or `choose`'s answer) names something that is not one of them;
     /// when an entrypoint path is not valid UTF-8; when `choose` itself errors -
-    /// including [`PackageRunner::choose_interactively`] finding no terminal to
+    /// including `choose_interactively` finding no terminal to
     /// prompt on, or the user dismissing the prompt; when
     /// [`PackageRunner::enforce`] was asked for but the package records no
     /// profile; or when the sandbox cannot be configured, spawned or waited on.
