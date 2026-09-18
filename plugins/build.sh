@@ -23,7 +23,7 @@ out="$here/dist"
 # time so `cargo test` needs no wasm toolchain at all.
 fixtures="$here/../tests/fixtures/plugins"
 
-crates=${*:-"zig greedy runaway nameless scanner"}
+crates=${*:-"systemd sysext sysupdate zig greedy runaway nameless scanner"}
 
 mkdir -p "$out"
 cargo build --release --target "$target" $(for c in $crates; do echo "-p $c"; done)
@@ -46,7 +46,7 @@ fi
 
 if [ $# -eq 0 ]; then
     mkdir -p "$fixtures"
-    for crate in greedy nameless runaway scanner wasi zig; do
+    for crate in greedy nameless runaway scanner systemd sysext sysupdate wasi zig; do
         cp "$out/$crate.wasm" "$fixtures/$crate.wasm"
     done
     echo "refreshed $fixtures"

@@ -128,16 +128,52 @@ Rust-specific; Rust is simply what these examples are written in.
 
 ## What is here
 
-| crate            | what it is                                                                 |
-|------------------|----------------------------------------------------------------------------|
-| `zig/`           | the reference plugin: classifies `zig` commands and reads `.zig` sources    |
-| `encoder/`       | core module → component, so `build.sh` needs no `cargo install`             |
-| `fixtures/*`     | deliberately badly behaved plugins, for `tests/plugins.rs`                  |
+| crate         | what it is                                                                |
+|---------------|---------------------------------------------------------------------------|
+| `zig/`        | classifies `zig` commands and reads `.zig` sources                        |
+| `systemd/`    | classifies systemd tooling and reads the unit files a package installs    |
+| `sysupdate/`  | classifies `systemd-sysupdate` and reads its transfer definitions         |
+| `sysext/`     | classifies the system-extension image toolchain; one hook, on purpose     |
+| `unitfile/`   | the unit-file parser the three systemd plugins share - an ordinary lib    |
+| `encoder/`    | core module → component, so `build.sh` needs no `cargo install`           |
+| `fixtures/*`  | deliberately badly behaved plugins, for `tests/plugins.rs`                |
 
 The fixtures are the interesting reading if you want to know what pm does when
 a plugin misbehaves: `greedy` asks for more than it published, `runaway` never
-returns, `nameless` cannot be attributed, and `scanner` contributes run-time
-grants from a file type pm has no grammar for.
+returns, `nameless` cannot be attributed, `wasi` wants more of the host than pm
+lends anybody, and `scanner` contributes run-time grants from a file type pm has
+no grammar for.
+
+## Three things the systemd plugins are worth reading for
+
+**A declaration beats a heuristic.** pm's own source analysis reads a syntax
+tree looking for calls that *imply* a permission, and its module documentation
+lists six things it cannot see. A `.service` unit needs none of that: it is the
+author saying, in a vocabulary that lines up almost one-for-one with pm's
+`Permission`, where the writes go and what gets executed. That precision buys
+something a source scanner can never have - **negative** information.
+`PrivateNetwork=yes` does not merely fail to suggest network access, it denies
+it, so `systemd/` drops every network grant it derived from the same file. Not
+finding a `socket()` call never means there is not one.
+
+**Claim a generic extension, then gate on content.** `sysupdate/` reads `.conf`
+files, an extension a source tree is full of. It looks for a `[Transfer]`
+section before it records anything, and produces nothing at all for a `.conf`
+belonging to something else. Any plugin claiming a generic extension should do
+the same - a plausible-looking wrong grant is worse than no grant.
+
+**Refusing is a legitimate answer.** `systemd/` recognises `systemd-nspawn`,
+`systemd-run` and `machinectl` and then declines to classify them; `sysext/`
+does the same for `mkosi` and `debootstrap`. Each runs something of its own
+choosing, so a verdict would size a jail for a program nobody has read. pm's
+answer to an unclassified command is a diagnostic naming it, and `--permissive`
+is still there for a human who has decided. A plugin that classified everything
+it saw would publish a ceiling wide enough to make `pm plugins` useless.
+
+`sysext/` is also the example of a **single-hook** plugin: a `systemd-repart`
+definition says how an image is assembled at build time, which is not what
+`scan-source` asks about, so it declares only `classify-command` and its
+`scan-source` export is never reached.
 
 ## On writing a good `scan-source`
 
