@@ -15,12 +15,13 @@ use std::fs::{read, read_to_string, remove_dir_all, write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
+use hakoniwa::{Container, Runctl};
 use pm::bf::{BuildFile, BuildOptions};
 use pm::context::BuildContext;
 use pm::progress::Progress;
 use pm::run::PackageRunner;
 use pm::signing::{SigningKey, TrustStore, sign_file};
-use pm::workspace::Workspace;
+use pm::workspace::{HostChild, SandboxedChild, Workspace};
 use serde::Serialize;
 use serde_yaml::to_string;
 use tempfile::tempdir;
@@ -124,6 +125,71 @@ fn persist_to_an_unwritable_destination_is_an_error_not_a_panic() {
             .persist(&artifact, Path::new("/pm-integration-test/nope/out.cpkg"))
             .is_err(),
         "persisting into a nonexistent directory must return a diagnostic"
+    );
+}
+
+/// Whether `pid` still names a live process, checked the same way `kill -0`
+/// would: by looking for its `/proc` entry. A reaped process leaves none.
+fn process_is_alive(pid: u32) -> bool {
+    Path::new(&format!("/proc/{pid}")).exists()
+}
+
+#[test]
+fn dropping_a_host_child_without_waiting_kills_it() {
+    // The shape `BuildSandbox::run_on_host` is in between `spawn` and `wait`:
+    // if the caller returned early right here, nothing but the guard would
+    // ever touch this child again.
+    let child = Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .expect("spawn a long-running host process");
+    let pid = child.id();
+    assert!(
+        process_is_alive(pid),
+        "the freshly spawned child must be alive"
+    );
+
+    {
+        let _guard = HostChild::new(child, "sleep");
+        // No `wait()` call: this block is the early return.
+    }
+
+    assert!(
+        !process_is_alive(pid),
+        "pid {pid} must be gone once its guard drops without a wait - a live process here means \
+         the early-return path orphans it"
+    );
+}
+
+#[test]
+#[ignore = "requires unprivileged user namespaces; run with `cargo test --test sandbox -- --ignored`"]
+fn dropping_a_sandboxed_child_without_waiting_reaps_it() {
+    // The shape `BuildSandbox::run_jailed` is in between `spawn` and `wait`:
+    // if the caller returned early right here, `hakoniwa::Child` has no
+    // `Drop` of its own to catch it.
+    let mut container = Container::new();
+    container
+        .rootfs("/")
+        .expect("mirror the host system directories")
+        .devfsmount("/dev")
+        .runctl(Runctl::MountFallback);
+
+    let child = container
+        .command("/usr/bin/sleep")
+        .arg("30")
+        .spawn()
+        .expect("spawn a long-running jailed process");
+    let pid = child.id();
+
+    {
+        let _guard = SandboxedChild::new(child, "sleep");
+        // No `wait()` call: this block is the early return.
+    }
+
+    assert!(
+        !process_is_alive(pid),
+        "pid {pid} must be gone once its guard drops without a wait - a live process here means \
+         the early-return path orphans a jailed child"
     );
 }
 
@@ -368,6 +434,104 @@ fn an_unknown_bin_lists_the_available_binaries_in_sorted_order() {
 }
 
 #[test]
+#[ignore = "requires unprivileged user namespaces; run with `cargo test --test sandbox -- --ignored`"]
+fn the_chooser_seam_picks_an_entrypoint_by_name_without_a_terminal() {
+    let (_work, archive) = package_with_three_binaries("choosebyname");
+
+    // This closure never touches stdin - it does not need to, and that is
+    // exactly the point: a daemon with no terminal to prompt on can answer
+    // just like this. It answers BY NAME, matching one of the names it was
+    // handed, never a position - `usr/bin/mike` here has no relationship to
+    // any index a caller might otherwise have derived.
+    let status = PackageRunner::new(archive)
+        .trust_dir(trust_dir(_work.path()))
+        .run_with(
+            None,
+            |names| {
+                assert!(
+                    names.contains(&"usr/bin/mike"),
+                    "the chooser must see the usable entrypoint names, got: {names:?}"
+                );
+                Ok("usr/bin/mike".to_owned())
+            },
+            pm::perms::monitor::trace,
+        )
+        .expect("a valid name returned by the chooser must run the package");
+
+    assert!(
+        status.success(),
+        "the entrypoint the chooser named must actually run: exit {} ({})",
+        status.code,
+        status.reason
+    );
+}
+
+#[test]
+fn an_unknown_name_from_the_chooser_is_refused_like_a_bad_bin() {
+    let (_work, archive) = package_with_three_binaries("badchoice");
+
+    let error = PackageRunner::new(archive)
+        .trust_dir(trust_dir(_work.path()))
+        .run_with(
+            None,
+            |_names| Ok("not-in-this-package".to_owned()),
+            pm::perms::monitor::trace,
+        )
+        .expect_err("a name the chooser invents must be refused, not run");
+
+    let rendered = format!("{error}\n{error:?}");
+    assert!(
+        rendered.contains("not-in-this-package")
+            && rendered.contains("is not a binary entrypoint of"),
+        "a bad answer from the chooser must get the exact diagnostic a bad --bin gets, got: {rendered}"
+    );
+    let alpha = rendered
+        .find("usr/bin/alpha")
+        .expect("alpha must be listed");
+    let mike = rendered.find("usr/bin/mike").expect("mike must be listed");
+    let zulu = rendered.find("usr/bin/zulu").expect("zulu must be listed");
+    assert!(
+        alpha < mike && mike < zulu,
+        "the available binaries must be listed in sorted order, got: {rendered}"
+    );
+}
+
+#[test]
+#[ignore = "requires unprivileged user namespaces; run with `cargo test --test sandbox -- --ignored`"]
+fn the_tracer_seam_is_called_instead_of_monitor_trace_when_supplied() {
+    let (_work, archive) = package_with_a_runnable_binary("tracerseam");
+    let called = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let called_in_closure = called.clone();
+
+    let status = PackageRunner::new(archive)
+        .trust_dir(trust_dir(_work.path()))
+        .audit(true)
+        .run_with(
+            Some("usr/bin/hello".into()),
+            // `bin` is `Some`, so the chooser must never be consulted at all.
+            |_names| unreachable!("the chooser must not be called when `bin` is `Some`"),
+            move |_program, _args, _options| {
+                called_in_closure.store(true, std::sync::atomic::Ordering::SeqCst);
+                Err(miette::miette!(
+                    "test tracer: refusing to actually trace, to exercise the fallback path"
+                ))
+            },
+        )
+        .expect("audit_run failing must fall back to a normal run, not fail the whole call");
+
+    assert!(
+        called.load(std::sync::atomic::Ordering::SeqCst),
+        "the supplied tracer must be called in place of monitor::trace when `--audit` is set"
+    );
+    assert!(
+        status.success(),
+        "the fallback run must still complete: exit {} ({})",
+        status.code,
+        status.reason
+    );
+}
+
+#[test]
 fn without_a_terminal_and_without_a_bin_the_cli_lists_what_it_could_have_run() {
     let (_work, archive) = package_with_three_binaries("noprompt");
 
@@ -521,6 +685,100 @@ fn an_absolute_entrypoint_does_not_escape_the_package() {
         "an absolute entrypoint must be refused"
     );
     assert!(!marker.exists(), "the host payload must never run");
+}
+
+#[test]
+#[ignore = "requires unprivileged user namespaces; run with `cargo test --test sandbox -- --ignored`"]
+fn a_hostile_tar_cannot_write_outside_the_extraction_destination() {
+    // The three hostile member shapes named in the task brief - a `../`
+    // traversal, an absolute path, a symlink written through - all turn out
+    // to be refused by this host's own `tar` (GNU tar 1.35) before the jail's
+    // mount layout is ever exercised: a `..` component is a hard error, a
+    // leading `/` is silently rewritten to land under the destination, and
+    // writing through a symlink to an existing directory is refused as "is
+    // not a directory". None of them discriminate a jailed extraction from
+    // an unjailed one on THIS system - the real `tar` never gets far enough
+    // to test the mount boundary at all, whichever member shape is used.
+    //
+    // So this test does not trust the real `tar`. `extract_jailed` finds
+    // `tar` with its own PATH search (`locate_tar`), so a fake `tar` placed
+    // first on `PATH` stands in for exactly the kind of compromised or
+    // misconfigured build environment that seam exists to be robust against.
+    // Unlike a hostile member, this fake `tar` does not need `tar` itself to
+    // cooperate: it ignores every argument and tries to write straight
+    // through the container's mount layout, at a HOST path that indisputably
+    // exists and is writable by this test process, but is mounted nowhere
+    // inside the jail. If that write ever lands, the two-mount claim in
+    // `extract_jailed`'s doc comment - the archive read-only, the
+    // destination writable, nothing else reachable - is false.
+    let (work, archive) = package_with_a_runnable_binary("shimescape");
+
+    let marker = work.path().join("escaped-marker");
+    let fakebin = work.path().join("fakebin");
+    std::fs::create_dir_all(&fakebin).expect("create the fake PATH directory");
+    let shim = fakebin.join("tar");
+    write(
+        &shim,
+        format!(
+            "#!/bin/sh\nif echo pwned > '{}'; then\n  echo 'ESCAPED: wrote outside the extraction jail' >&2\n  exit 1\nfi\necho 'confined: could not write outside the extraction jail' >&2\nexit 0\n",
+            marker.display()
+        ),
+    )
+    .expect("write the fake tar shim");
+    Command::new("chmod")
+        .arg("755")
+        .arg(&shim)
+        .status()
+        .expect("chmod the fake tar shim");
+
+    // `locate_tar` does its own manual `PATH` search (`src/run.rs`), so
+    // putting `fakebin` first is enough for `PackageRunner::run` to resolve
+    // this shim instead of the real system `tar`. The real `PATH` stays
+    // appended so nothing else the run needs stops resolving.
+    let real_path = std::env::var_os("PATH").unwrap_or_default();
+    let path = std::env::join_paths(
+        std::iter::once(fakebin.clone()).chain(std::env::split_paths(&real_path)),
+    )
+    .expect("join the fake bin directory onto PATH");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_pm"))
+        .arg("run")
+        .arg(&archive)
+        .arg("--bin")
+        .arg("usr/bin/hello")
+        .env("XDG_CONFIG_HOME", config_dir(work.path()))
+        .env("PATH", &path)
+        .stdin(Stdio::null())
+        .output()
+        .expect("run the pm binary");
+
+    assert!(
+        !marker.exists(),
+        "the fake tar escaped the extraction jail and wrote outside the destination: found {}",
+        marker.display()
+    );
+
+    // `extract_jailed` only surfaces the shim's own stderr when the shim
+    // exits non-zero; a clean exit (the confined case, which is what should
+    // happen here) discards it, exactly as the unjailed path already did
+    // before this test existed. So the shim's own "confined"/"ESCAPED" lines
+    // are not always visible from here - but a run that reaches THIS
+    // specific downstream error only does so if extraction reported success,
+    // which only happens if the shim actually ran to completion and exited
+    // 0. An unreachable shim (the container never starting `tar` at all)
+    // fails differently, and an escaping shim's exit-1 diagnostic would
+    // mention "ESCAPED" right here instead.
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("ESCAPED"),
+        "the shim reported an escape, got: {stderr}"
+    );
+    assert!(
+        stderr.contains("has no `metadata` member"),
+        "the shim must actually have run to completion for this test to mean anything - an \
+         extraction that never gets this far never gave the shim a chance to attempt the escape \
+         at all; got: {stderr}"
+    );
 }
 
 #[test]
