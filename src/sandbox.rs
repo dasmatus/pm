@@ -52,6 +52,7 @@ use crate::{
     context::BuildContext,
     policy::{BuildPolicy, Capability},
     progress::Task,
+    workspace::{HostChild, SandboxedChild},
 };
 
 /// Where the step's working directory is mounted inside the jail.
@@ -393,14 +394,20 @@ impl BuildSandbox {
         let (status, out) = if task.is_live() {
             // A live region owns the terminal, so the command's stdout is
             // captured and fed to its progress line instead of written over
-            // the region.
-            let mut child = jailed
+            // the region. Spawned straight into a `SandboxedChild`: `pump`
+            // below can still block for a while on a slow command, and
+            // without the guard an early return between `spawn` and `wait`
+            // would leave the jailed process orphaned with nothing left to
+            // reap it.
+            let child = jailed
                 .stdout(Stdio::piped())
                 .spawn()
                 .into_diagnostic()
                 .wrap_err_with(failure)?;
-            let out = pump(child.stdout.take(), child.stderr.take(), &task);
-            let status = child.wait().into_diagnostic().wrap_err_with(failure)?;
+            let mut guard = SandboxedChild::new(child, program);
+            let (stdout, stderr) = guard.take_pipes();
+            let out = pump(stdout, stderr, &task);
+            let status = guard.wait().wrap_err_with(failure)?;
             (status, out)
         } else {
             // The build's own stdout is the user's primary progress feedback
@@ -458,13 +465,20 @@ impl BuildSandbox {
         };
 
         let (status, out) = if task.is_live() {
-            let mut child = host
+            // Same reasoning as the jailed branch in `run_jailed`: the guard
+            // makes sure an early return between `spawn` and `wait` cannot
+            // orphan this host process, which `SandboxedChild` cannot cover -
+            // it only accepts a `hakoniwa::Child` - so `HostChild` does the
+            // same job for the plain `std::process::Child` this branch spawns.
+            let child = host
                 .stdout(HostStdio::piped())
                 .spawn()
                 .into_diagnostic()
                 .wrap_err_with(failure)?;
-            let out = pump(child.stdout.take(), child.stderr.take(), &task);
-            let status = child.wait().into_diagnostic().wrap_err_with(failure)?;
+            let mut guard = HostChild::new(child, program.to_owned());
+            let (stdout, stderr) = guard.take_pipes();
+            let out = pump(stdout, stderr, &task);
+            let status = guard.wait().wrap_err_with(failure)?;
             (status, out)
         } else {
             let output = host

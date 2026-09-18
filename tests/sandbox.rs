@@ -15,12 +15,13 @@ use std::fs::{read, read_to_string, remove_dir_all, write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
+use hakoniwa::{Container, Runctl};
 use pm::bf::{BuildFile, BuildOptions};
 use pm::context::BuildContext;
 use pm::progress::Progress;
 use pm::run::PackageRunner;
 use pm::signing::{SigningKey, TrustStore, sign_file};
-use pm::workspace::Workspace;
+use pm::workspace::{HostChild, SandboxedChild, Workspace};
 use serde::Serialize;
 use serde_yaml::to_string;
 use tempfile::tempdir;
@@ -124,6 +125,68 @@ fn persist_to_an_unwritable_destination_is_an_error_not_a_panic() {
             .persist(&artifact, Path::new("/pm-integration-test/nope/out.cpkg"))
             .is_err(),
         "persisting into a nonexistent directory must return a diagnostic"
+    );
+}
+
+/// Whether `pid` still names a live process, checked the same way `kill -0`
+/// would: by looking for its `/proc` entry. A reaped process leaves none.
+fn process_is_alive(pid: u32) -> bool {
+    Path::new(&format!("/proc/{pid}")).exists()
+}
+
+#[test]
+fn dropping_a_host_child_without_waiting_kills_it() {
+    // The shape `BuildSandbox::run_on_host` is in between `spawn` and `wait`:
+    // if the caller returned early right here, nothing but the guard would
+    // ever touch this child again.
+    let child = Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .expect("spawn a long-running host process");
+    let pid = child.id();
+    assert!(process_is_alive(pid), "the freshly spawned child must be alive");
+
+    {
+        let _guard = HostChild::new(child, "sleep");
+        // No `wait()` call: this block is the early return.
+    }
+
+    assert!(
+        !process_is_alive(pid),
+        "pid {pid} must be gone once its guard drops without a wait - a live process here means \
+         the early-return path orphans it"
+    );
+}
+
+#[test]
+#[ignore = "requires unprivileged user namespaces; run with `cargo test --test sandbox -- --ignored`"]
+fn dropping_a_sandboxed_child_without_waiting_reaps_it() {
+    // The shape `BuildSandbox::run_jailed` is in between `spawn` and `wait`:
+    // if the caller returned early right here, `hakoniwa::Child` has no
+    // `Drop` of its own to catch it.
+    let mut container = Container::new();
+    container
+        .rootfs("/")
+        .expect("mirror the host system directories")
+        .devfsmount("/dev")
+        .runctl(Runctl::MountFallback);
+
+    let child = container
+        .command("/usr/bin/sleep")
+        .arg("30")
+        .spawn()
+        .expect("spawn a long-running jailed process");
+    let pid = child.id();
+
+    {
+        let _guard = SandboxedChild::new(child, "sleep");
+        // No `wait()` call: this block is the early return.
+    }
+
+    assert!(
+        !process_is_alive(pid),
+        "pid {pid} must be gone once its guard drops without a wait - a live process here means \
+         the early-return path orphans a jailed child"
     );
 }
 
