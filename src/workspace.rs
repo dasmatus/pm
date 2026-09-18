@@ -1,18 +1,22 @@
 //! RAII guards for the two resources a build owns: the staging directory it
-//! writes into, and the sandboxed process it spawns out of that directory.
+//! writes into, and the child process it spawns out of that directory -
+//! [`SandboxedChild`] for a `hakoniwa`-jailed one, [`HostChild`] for a plain
+//! [`std::process::Child`] run through the [`crate::sandbox::BuildSandbox`]
+//! escape hatch.
 //!
 //! # Drop order
 //!
-//! A [`SandboxedChild`] executes binaries that live inside a [`Workspace`].
+//! Both child guards execute binaries that live inside a [`Workspace`].
 //! Unlinking the workspace while the child is still running yanks the
 //! executable, its libraries and its working directory out from under it, so
 //! the child MUST be dropped first.
 //!
 //! Rust drops struct fields in declaration order and local variables in
-//! reverse declaration order. Anything holding both therefore has to either
+//! reverse declaration order. Anything holding both a workspace and a child
+//! guard therefore has to either
 //!
-//! - declare the `SandboxedChild` field *before* the `Workspace` field, or
-//! - declare the `Workspace` local *before* the `SandboxedChild` local.
+//! - declare the child guard field *before* the `Workspace` field, or
+//! - declare the `Workspace` local *before* the child guard local.
 //!
 //! Both spellings put the kill before the unlink. Getting it backwards is not
 //! a compile error, so it is worth a comment at every site that owns the pair.
@@ -243,6 +247,24 @@ impl SandboxedChild {
         );
         Ok(status)
     }
+
+    /// Take the child's captured stdout and stderr, if the command was spawned
+    /// with `hakoniwa::Stdio::piped()` on either.
+    ///
+    /// The guard owns the whole [`hakoniwa::Child`] so it can kill and reap it
+    /// on an early return, which leaves the caller with no other way to reach
+    /// the pipes it needs to drain concurrently with [`SandboxedChild::wait`] -
+    /// a command that fills one pipe's buffer while nobody reads it deadlocks
+    /// against a `wait` that is still waiting for the other. Call this once,
+    /// right after [`SandboxedChild::new`]; a second call returns `(None,
+    /// None)` because the pipes are already taken, same as calling it after
+    /// [`SandboxedChild::wait`] consumed the child outright.
+    pub fn take_pipes(&mut self) -> (Option<std::io::PipeReader>, Option<std::io::PipeReader>) {
+        let Some(child) = self.child.as_mut() else {
+            return (None, None);
+        };
+        (child.stdout.take(), child.stderr.take())
+    }
 }
 
 impl Drop for SandboxedChild {
@@ -280,6 +302,117 @@ impl Drop for SandboxedChild {
         }
         if let Err(error) = child.wait() {
             warn!(pid, program = %self.program, %error, "failed to reap sandboxed child");
+        }
+    }
+}
+
+/// A plain host process child that is killed and reaped if it is still
+/// running when the guard drops.
+///
+/// [`crate::sandbox::BuildSandbox::unsandboxed`] spawns a
+/// [`std::process::Child`] instead of a [`hakoniwa::Child`], so it cannot use
+/// [`SandboxedChild`]: the two child types share no common trait for killing
+/// and waiting on them (different error types, different exit status types),
+/// and building one just to serve two call sites would cost more in
+/// indirection than the two small, independent `Drop` impls save. This is
+/// that second guard, kept deliberately parallel to `SandboxedChild` rather
+/// than merged with it - see the module docs on drop order, which apply here
+/// exactly the same way.
+pub struct HostChild {
+    /// Declared first for the same reason as [`SandboxedChild::child`]: killed
+    /// before anything else this struct owns goes away.
+    ///
+    /// `None` after [`HostChild::wait`] has taken it.
+    child: Option<std::process::Child>,
+    program: String,
+}
+
+impl HostChild {
+    /// Take ownership of a spawned host process. `program` is used in
+    /// diagnostics and tracing output only.
+    #[must_use]
+    pub fn new(child: std::process::Child, program: impl Into<String>) -> Self {
+        let program = program.into();
+        debug!(pid = child.id(), program = %program, "supervising unsandboxed child");
+        Self {
+            child: Some(child),
+            program,
+        }
+    }
+
+    /// Wait for the child and return its exit status. Consumes the guard, which
+    /// is the normal path: no kill happens afterwards.
+    ///
+    /// # Errors
+    ///
+    /// Returns a diagnostic if the child cannot be waited on.
+    pub fn wait(mut self) -> miette::Result<std::process::ExitStatus> {
+        let Some(mut child) = self.child.take() else {
+            return Err(miette::miette!(
+                "host child `{}` was already waited on",
+                self.program
+            ));
+        };
+
+        let status = child
+            .wait()
+            .into_diagnostic()
+            .wrap_err_with(|| format!("failed to wait for host child `{}`", self.program))?;
+        debug!(program = %self.program, code = ?status.code(), "host child exited");
+        Ok(status)
+    }
+
+    /// Take the child's captured stdout and stderr, if the command was spawned
+    /// with `Stdio::piped()` on either. See [`SandboxedChild::take_pipes`] for
+    /// why this indirection is necessary at all.
+    pub fn take_pipes(
+        &mut self,
+    ) -> (
+        Option<std::process::ChildStdout>,
+        Option<std::process::ChildStderr>,
+    ) {
+        let Some(child) = self.child.as_mut() else {
+            return (None, None);
+        };
+        (child.stdout.take(), child.stderr.take())
+    }
+}
+
+impl Drop for HostChild {
+    /// Best-effort kill and reap; never panics.
+    fn drop(&mut self) {
+        let Some(mut child) = self.child.take() else {
+            return;
+        };
+        let pid = child.id();
+
+        // Do not kill a child that already exited on its own; `try_wait` reaps
+        // it in that case.
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                debug!(
+                    pid,
+                    program = %self.program,
+                    code = ?status.code(),
+                    "host child had already exited at drop"
+                );
+                return;
+            }
+            Ok(None) => {}
+            Err(error) => warn!(
+                pid,
+                program = %self.program,
+                %error,
+                "failed to poll host child at drop; killing it anyway"
+            ),
+        }
+
+        warn!(pid, program = %self.program, "killing host child left running at drop");
+        if let Err(error) = child.kill() {
+            warn!(pid, program = %self.program, %error, "failed to kill host child");
+        }
+        if let Err(error) = child.wait() {
+            warn!(pid, program = %self.program, %error, "failed to reap host child");
         }
     }
 }
