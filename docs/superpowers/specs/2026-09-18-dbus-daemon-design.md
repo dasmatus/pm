@@ -341,7 +341,7 @@ invariant 5.
 |---|---|---|
 | `CallerContext { cwd, output_dir, trust_dir, path, home: String }` | `(sssss)` | every field absolute; an empty `home` means none |
 | `Diagnostic { name, message, help: String, causes: Vec<String> }` | `(sssas)` | `name` is a stable key (for example `pm::run::untrusted_signature`); all fields sanitised; 64 KiB cap total across message, help and causes |
-| `ProgressNode { id, parent, depth: u32, label: String, kind: u8, text: String, done, total, started_unix_us: u64 }` | `(uuusysttt)` | `parent == 0` means root (`Screen::next_id` starts at 1); `kind` is 0 Silent, 1 Message, 2 Bytes; `total == 0` means unknown; `text` is sanitised and capped at 512 characters |
+| `ProgressNode { id, parent, depth: u32, label: String, kind: u8, text: String, done, total, started_usec: u64 }` | `(uuusysttt)` | `parent == 0` means root (`Screen::next_id` starts at 1); `kind` is 0 Silent, 1 Message, 2 Bytes; `total == 0` means unknown; `text` is sanitised and capped at 512 characters |
 | `LogLine { seq: u64, stream: u8, text: String }` | `(tys)` | `stream` is 0 stdout, 1 stderr, 2 log |
 | `JobRow { path: OwnedObjectPath, id, kind, state, subject: String, created_usec, finished_usec: i64, exit_code: i32 }` | `(ossssxxi)` | eight fields, eight type letters: `o` path, `s` id, `s` kind, `s` state, `s` subject, `x` created_usec, `x` finished_usec, `i` exit_code |
 | `Observation { syscall, pid: i32, permission, label, path: String, resolved, succeeded: bool, evidence: String }` | `(sisssbbs)` | `syscall` is an owned `String`; monitor.rs:319's `&'static str` into `TABLE` cannot cross a process boundary |
@@ -358,7 +358,7 @@ invariant 5.
 `org.freedesktop.DBus`'s own convention for realtime stamps. Every other
 wall-clock microsecond value on the surface, `Job.CreatedUsec`,
 `Job.StartedUsec`, `Job.FinishedUsec`, `StateChanged`'s `usec`,
-`ProgressChanged`'s `usec`, `ProgressNode.started_unix_us`, and
+`ProgressChanged`'s `usec`, `ProgressNode.started_usec`, and
 `Manager.Prune`'s argument, is `t` (unsigned), where 0 is the "not yet"
 sentinel and a negative value is meaningless. The split between `JobRow`
 and everything else is deliberate: `JobRow` is a flat row inside a
