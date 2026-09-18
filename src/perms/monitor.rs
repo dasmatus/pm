@@ -910,24 +910,54 @@ mod x86_64 {
     ) -> ! {
         // Own process group, so the timeout can kill the whole tree with one killpg.
         if let Err(errno) = setpgid(Pid::from_raw(0), Pid::from_raw(0)) {
-            fail(failure_pipe, ChildFailure::WIRE_SETPGID, errno as i32);
+            fail(
+                failure_pipe,
+                ChildFailure::WIRE_SETPGID,
+                errno_to_wire(errno),
+            );
         }
         if let Some(dir) = working_dir {
             // SAFETY: `dir` is a live NUL-terminated string; `chdir` is async-signal-safe.
             // `nix::unistd::chdir` would need the crate's `fs` feature, which is not on.
             if unsafe { libc::chdir(dir.as_ptr()) } != 0 {
-                fail(failure_pipe, ChildFailure::WIRE_CHDIR, Errno::last() as i32);
+                fail(
+                    failure_pipe,
+                    ChildFailure::WIRE_CHDIR,
+                    errno_to_wire(Errno::last()),
+                );
             }
         }
         if let Err(errno) = ptrace::traceme() {
-            fail(failure_pipe, ChildFailure::WIRE_TRACEME, errno as i32);
+            fail(
+                failure_pipe,
+                ChildFailure::WIRE_TRACEME,
+                errno_to_wire(errno),
+            );
         }
         match execve(program, argv, envp) {
             // `execve` has no successful return - the image it names is running instead
             // of this one - so `Infallible` has no value to match here.
             Ok(never) => match never {},
-            Err(errno) => fail(failure_pipe, ChildFailure::WIRE_EXECVE, errno as i32),
+            Err(errno) => fail(
+                failure_pipe,
+                ChildFailure::WIRE_EXECVE,
+                errno_to_wire(errno),
+            ),
         }
+    }
+
+    /// A future `nix` that changes `Errno`'s size would silently change what
+    /// `errno_to_wire` puts on the wire; this fails the build instead, the moment that
+    /// version is compiled against.
+    const _: () = assert!(size_of::<Errno>() == size_of::<i32>());
+
+    /// The raw errno [`fail`] puts on the wire, as a plain discriminant read rather than
+    /// a bit-reinterpretation - sound only because `nix` declares `Errno` `#[repr(i32)]`,
+    /// which is what keeps this allocation-free and safe to call between `fork` and
+    /// `execve`. Re-check this on a `nix` upgrade; the `const` assertion above catches a
+    /// size change but not a repr change that keeps the same size.
+    fn errno_to_wire(errno: Errno) -> i32 {
+        errno as i32
     }
 
     /// Write one discriminant byte and the raw `errno` to the CLOEXEC failure pipe, then
