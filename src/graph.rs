@@ -21,7 +21,7 @@ use std::{
     num::NonZeroUsize,
     panic::{AssertUnwindSafe, catch_unwind},
     path::{Path, PathBuf},
-    sync::{Condvar, Mutex, MutexGuard, PoisonError},
+    sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError},
     thread::{available_parallelism, scope},
 };
 
@@ -30,6 +30,8 @@ use tracing::{debug, info, warn};
 
 use crate::{
     bf::{BuildFile, BuildOptions, Verification},
+    cancel::Cancel,
+    context::BuildContext,
     policy::BuildPolicy,
     progress::{Progress, Task},
 };
@@ -57,6 +59,20 @@ struct Node {
     dependencies: Vec<usize>,
 }
 
+/// What every worker in one [`Graph::build_with`] call needs, and does not
+/// change while the schedule runs.
+///
+/// Bundled into one value instead of four parameters on [`Graph::work`]: it is
+/// exactly the set of things every worker shares unchanged for the whole
+/// build, as distinct from `schedule`, `wakeup` and `summary`, which are the
+/// scheduler's own mutable state.
+struct BuildRun<'a> {
+    ctx: &'a BuildContext,
+    options: BuildOptions,
+    progress: &'a Progress,
+    cancel: &'a Cancel,
+}
+
 impl Graph {
     /// Read the whole graph rooted at `root` and check that it can be built.
     ///
@@ -74,6 +90,21 @@ impl Graph {
     /// commands cannot be classified, or when two packages in the graph would
     /// be packaged to the same archive name.
     pub fn resolve(root: &BuildFile, options: BuildOptions) -> miette::Result<Self> {
+        Self::resolve_in(&BuildContext::from_env()?, root, options)
+    }
+
+    /// As [`Graph::resolve`], resolving relative dependency paths against
+    /// `ctx.cwd` and verifying signed dependencies against `ctx.trust_dir`
+    /// instead of reading either from the process.
+    ///
+    /// # Errors
+    ///
+    /// As [`Graph::resolve`].
+    pub fn resolve_in(
+        ctx: &BuildContext,
+        root: &BuildFile,
+        options: BuildOptions,
+    ) -> miette::Result<Self> {
         let key = match root.source() {
             // Fall back to the path as given when it cannot be canonicalised,
             // exactly as parsing does: identity degrades, resolution still runs.
@@ -87,6 +118,7 @@ impl Graph {
         };
 
         let mut resolver = Resolver {
+            ctx,
             nodes: Vec::new(),
             order: Vec::new(),
             state: HashMap::new(),
@@ -143,6 +175,40 @@ impl Graph {
     /// Returns a diagnostic naming every package that failed, and how many were
     /// skipped because something they needed did.
     pub fn build(&self, options: BuildOptions, progress: &Progress) -> miette::Result<PathBuf> {
+        self.build_in(&BuildContext::from_env()?, options, progress)
+    }
+
+    /// As [`Graph::build`], with the caller's environment made explicit: every
+    /// package's archive lands under `ctx.output_dir`, and its sandbox reads
+    /// `ctx.path`/`ctx.home`/`ctx.scratch_root` instead of the process's.
+    ///
+    /// # Errors
+    ///
+    /// As [`Graph::build`].
+    pub fn build_in(
+        &self,
+        ctx: &BuildContext,
+        options: BuildOptions,
+        progress: &Progress,
+    ) -> miette::Result<PathBuf> {
+        self.build_with(ctx, options, progress, &Cancel::new())
+    }
+
+    /// As [`Graph::build_in`], with a [`Cancel`] token the caller can trip to
+    /// stop the scheduler handing out any package that has not already
+    /// started. Best-effort: a package already claimed keeps running to
+    /// completion, since nothing here kills it.
+    ///
+    /// # Errors
+    ///
+    /// As [`Graph::build_in`].
+    pub fn build_with(
+        &self,
+        ctx: &BuildContext,
+        options: BuildOptions,
+        progress: &Progress,
+        cancel: &Cancel,
+    ) -> miette::Result<PathBuf> {
         let jobs = options
             .jobs
             .map_or_else(default_jobs, NonZeroUsize::get)
@@ -152,11 +218,23 @@ impl Graph {
 
         let summary = progress.task(format!("{} packages", self.len()));
         let schedule = Mutex::new(Schedule::new(self));
-        let wakeup = Condvar::new();
+        // Wrapped in an `Arc` so `cancel` can hold a reference to the very
+        // condvar workers park on below: a plain `AtomicBool` flag is
+        // invisible to a thread already asleep in `Condvar::wait`, so a
+        // parked worker needs the condvar itself notified to wake before its
+        // next natural wakeup, which could be an arbitrarily long time away.
+        let wakeup = Arc::new(Condvar::new());
+        cancel.register_wakeup(Arc::clone(&wakeup));
+        let run = BuildRun {
+            ctx,
+            options,
+            progress,
+            cancel,
+        };
 
         scope(|threads| {
             for _ in 0..jobs {
-                threads.spawn(|| self.work(&schedule, &wakeup, options, progress, &summary));
+                threads.spawn(|| self.work(&run, &schedule, &wakeup, &summary));
             }
         });
 
@@ -168,15 +246,8 @@ impl Graph {
     }
 
     /// One worker: take a ready package, build it, release what it unblocks.
-    fn work(
-        &self,
-        schedule: &Mutex<Schedule>,
-        wakeup: &Condvar,
-        options: BuildOptions,
-        progress: &Progress,
-        summary: &Task,
-    ) {
-        while let Some((index, archives)) = self.claim(schedule, wakeup, summary) {
+    fn work(&self, run: &BuildRun, schedule: &Mutex<Schedule>, wakeup: &Condvar, summary: &Task) {
+        while let Some((index, archives)) = self.claim(schedule, wakeup, summary, run.cancel) {
             let node = &self.nodes[index];
             // Built outside the lock: this is the part that takes minutes.
             //
@@ -188,7 +259,7 @@ impl Graph {
             // propagated; making the walk concurrent is what introduced this.
             let attempt = catch_unwind(AssertUnwindSafe(|| {
                 node.build
-                    .build_alone(options, &node.policy, progress, &archives)
+                    .build_alone(run.ctx, run.options, &node.policy, run.progress, &archives)
             }));
             let result = attempt
                 .unwrap_or_else(|panic| {
@@ -209,16 +280,26 @@ impl Graph {
     }
 
     /// Wait for a package to become ready and claim it, with its dependencies'
-    /// archives. `None` means there is no work left for anybody.
+    /// archives. `None` means there is no work left for anybody, or that
+    /// `cancel` has been tripped.
     fn claim(
         &self,
         schedule: &Mutex<Schedule>,
         wakeup: &Condvar,
         summary: &Task,
+        cancel: &Cancel,
     ) -> Option<(usize, Vec<PathBuf>)> {
         let mut state = lock(schedule);
 
         loop {
+            // Checked before anything else, on every pass through this loop -
+            // including the one right after a spurious or cancel-driven
+            // wakeup - so a package that becomes ready only after `cancel()`
+            // was called is never handed out either.
+            if cancel.is_cancelled() {
+                return None;
+            }
+
             if let Some(index) = state.ready.pop() {
                 state.running += 1;
                 let archives = state.archives_for(self, index);
@@ -296,7 +377,8 @@ fn archive_name(build: &BuildFile) -> String {
 }
 
 /// Depth-first resolution state.
-struct Resolver {
+struct Resolver<'a> {
+    ctx: &'a BuildContext,
     nodes: Vec<Node>,
     order: Vec<usize>,
     state: HashMap<PathBuf, State>,
@@ -312,7 +394,7 @@ enum State {
     Resolved(usize),
 }
 
-impl Resolver {
+impl Resolver<'_> {
     /// Resolve `build` and everything under it, returning its node index.
     ///
     /// `stack` is the current depth-first path, used to render a cycle.
@@ -361,13 +443,22 @@ impl Resolver {
         parent: &str,
         stack: &mut Vec<PathBuf>,
     ) -> miette::Result<usize> {
-        if !dependency.is_file() {
+        // A relative dependency path is resolved against the CALLER's cwd, not
+        // the process's: a daemon builds on a client's behalf, whose working
+        // directory is not the daemon's own.
+        let resolved = if dependency.is_relative() {
+            self.ctx.cwd.join(dependency)
+        } else {
+            dependency.to_path_buf()
+        };
+
+        if !resolved.is_file() {
             return Err(miette!(
                 "dependency of {parent} is not a build file: {}",
                 dependency.display()
             ));
         }
-        let key = dependency
+        let key = resolved
             .canonicalize()
             .into_diagnostic()
             .wrap_err_with(|| format!("cannot resolve dependency {}", dependency.display()))?;
@@ -385,11 +476,11 @@ impl Resolver {
 
         // A dependency is loaded exactly as strictly as the root was:
         // signatures are checked all the way down, or not at all.
-        let load = match self.verification {
-            Verification::Signed => BuildFile::load,
-            Verification::Unverified => BuildFile::load_unverified,
-        };
-        let build = load(&key).wrap_err_with(|| format!("dependency {} failed", key.display()))?;
+        let build = match self.verification {
+            Verification::Signed => BuildFile::load_in(self.ctx, &key),
+            Verification::Unverified => BuildFile::load_unverified(&key),
+        }
+        .wrap_err_with(|| format!("dependency {} failed", key.display()))?;
 
         self.visit(key, build, stack)
     }
