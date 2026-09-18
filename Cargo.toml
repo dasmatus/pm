@@ -11,6 +11,10 @@ harness = false
 name = "entrypoints"
 harness = false
 
+[[bin]]
+name = "pm-trace"
+path = "src/bin/pm-trace.rs"
+
 [dependencies]
 arbitrary = { version = "1.4.2", features = ["derive"] }
 clap = { version = "4.6.6", features = ["derive"] }

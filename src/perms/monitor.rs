@@ -45,6 +45,7 @@
 use std::{path::PathBuf, time::Duration};
 
 use nix::errno::Errno;
+use serde::Serialize;
 
 use crate::perms::{Permission, Permissions, Provenance};
 
@@ -84,7 +85,14 @@ impl Default for TraceOptions {
 /// A single syscall can yield more than one observation (`rename` names two paths,
 /// `execve` implies both [`Permission::Spawn`] and [`Permission::ExecPath`]), so
 /// observations are per-permission rather than per-syscall.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// Only [`Serialize`] is derived here, not `Deserialize`: `syscall` is `&'static str`,
+/// interned in the `x86_64` module's private `TABLE`, and there is no lookup yet that
+/// turns a deserialised owned string back into one of those statics. `pm-trace` (the
+/// only thing writing this out today) only ever serialises a report, never reads one
+/// back, so a `Deserialize` impl - and the `TABLE` lookup it needs - is left for
+/// whichever future caller does, most likely a daemon reading `pm-trace`'s report file.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Observation {
     pid: i32,
     syscall: &'static str,
@@ -156,7 +164,9 @@ impl Observation {
 /// for the unfolded detail behind it. Always check [`TraceReport::timed_out`]: a report
 /// from a run that was killed describes a prefix of the program's behaviour, so it is
 /// even less complete than a monitor report normally is.
-#[derive(Debug, Clone)]
+///
+/// Derives [`Serialize`] only, for the same reason [`Observation`] does - see its doc.
+#[derive(Debug, Clone, Serialize)]
 pub struct TraceReport {
     permissions: Permissions,
     observations: Vec<Observation>,
