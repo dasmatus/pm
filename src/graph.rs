@@ -229,16 +229,23 @@ impl Graph {
 
         // `cancel.cancel()` runs this closure in addition to setting its own
         // flag. It locks `schedule` - the exact mutex `claim`'s check-then-park
-        // sequence holds throughout - sets `Schedule::cancelled` while holding
-        // it, and notifies `wakeup` before releasing it. That ordering is
-        // what a condvar needs: a plain flag set outside this lock, followed
-        // by a separately locked `notify_all`, leaves a window where a worker
-        // can see the flag still clear, decide to park, and only reach
-        // `Condvar::wait` after the notification already fired - a condvar
-        // remembers nothing, so that wakeup is simply lost, and the worker
-        // would sleep until an unrelated package happened to settle and
-        // notify for its own reasons, possibly the rest of that package's
-        // build time later.
+        // sequence holds throughout - sets `Schedule::cancelled` WHILE HOLDING
+        // that lock, then releases it and only afterwards notifies `wakeup`.
+        // The notify need not happen before the unlock - a condvar does not
+        // require that, and this one does not do it. What closes the race is
+        // that the WRITE happens under the same lock a worker's
+        // check-then-park sequence also holds throughout: by the time the
+        // write lands, a worker has either not yet checked (and will see the
+        // new value) or has already parked (and is registered as a waiter the
+        // notify will reach). There is no instant where the flag is set and a
+        // worker holds neither the lock nor a wait registration. A plain flag
+        // set outside this lock, followed by a separately locked
+        // `notify_all`, gives you no such thing: a worker can see the flag
+        // still clear, decide to park, and only reach `Condvar::wait` after
+        // the notification already fired - a condvar remembers nothing, so
+        // that wakeup is simply lost, and the worker would sleep until an
+        // unrelated package happened to settle and notify for its own
+        // reasons, possibly the rest of that package's build time later.
         let bridge_schedule = Arc::clone(&schedule);
         let bridge_wakeup = Arc::clone(&wakeup);
         cancel.register_wakeup(move || {

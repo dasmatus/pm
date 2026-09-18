@@ -47,12 +47,18 @@ pub struct Cancel {
     /// [`crate::graph::Graph`]'s scheduler state, and knows nothing about it.
     /// What it buys is real: [`crate::graph::Graph::build_with`] registers a
     /// closure that locks the *same* mutex its workers already hold across
-    /// their whole check-then-park sequence, updates whatever the scheduler
-    /// checks under that lock, and notifies its condvar before releasing it.
-    /// That is the only way to close a lost-wakeup race against a condvar -
-    /// the predicate a waiter checks and the signal a canceller sends have to
-    /// share one mutex - and a bare flag store followed by a separately
-    /// locked `notify_all` does not do that: a worker can observe the flag
+    /// their whole check-then-park sequence, sets whatever the scheduler
+    /// checks WHILE HOLDING that lock, then releases it and only afterwards
+    /// notifies the condvar. The notify does not need to happen before the
+    /// unlock - a condvar does not require that, and this one does not do
+    /// it. What closes the race is that the WRITE happens under the same
+    /// lock a worker's check-then-park sequence also holds throughout: by
+    /// the time the write lands, a worker has either not yet checked (and
+    /// will see the new value) or has already parked (and is registered as
+    /// a waiter the notify will reach). There is no instant where the flag
+    /// is set and a worker holds neither the lock nor a wait registration.
+    /// A bare flag store outside any lock, followed by a separately locked
+    /// `notify_all`, gives you no such thing: a worker can observe the flag
     /// still clear, decide to park, and only reach `Condvar::wait` after the
     /// notification already fired and was dropped on the floor, because a
     /// condvar remembers nothing. It would then sleep until some unrelated
@@ -97,11 +103,12 @@ impl Cancel {
     /// Register the action [`Cancel::cancel`] runs to reach a parked worker.
     ///
     /// Crate-private: [`crate::graph::Graph::build_with`] is the only caller.
-    /// It registers a closure that locks its own scheduler mutex, updates the
-    /// cancellation flag the scheduler checks under that same lock, and
-    /// notifies its condvar - all before releasing the lock - which is what
-    /// makes it safe against the race described on the `action` field.
-    /// Replaces whatever was registered before.
+    /// It registers a closure that locks its own scheduler mutex, sets the
+    /// cancellation flag the scheduler checks WHILE HOLDING that lock, then
+    /// releases it and notifies its condvar - see the `action` field for why
+    /// setting the flag under that lock, not the notify's timing relative to
+    /// the unlock, is what actually closes the race. Replaces whatever was
+    /// registered before.
     pub(crate) fn register_wakeup<F>(&self, action: F)
     where
         F: Fn() + Send + Sync + 'static,
