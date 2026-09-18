@@ -1,0 +1,154 @@
+# Writing a pm plugin
+
+A pm plugin is a **WebAssembly component**. pm loads every `*.wasm` in
+`$XDG_CONFIG_HOME/pm/plugins/` (or `$HOME/.config/pm/plugins/`) and calls it to
+answer the two questions its own built-in tables cannot always answer:
+
+| hook               | question                                                                  | what pm does without it                        |
+|--------------------|---------------------------------------------------------------------------|------------------------------------------------|
+| `classify-command` | what does this build-step command need from the build jail?               | refuses to build, naming the command           |
+| `scan-source`      | what does this source file imply the built program needs at run time?     | contributes nothing for file types it cannot parse |
+
+The interface is `wit/plugin.wit` at the repository root. Read it first; it is
+the contract, and it is commented.
+
+## The sandbox
+
+A plugin runs **inside pm's own process**. There is no jail around it, because
+pm is the thing doing the jailing, so the WebAssembly sandbox is the entire
+boundary. What that boundary is:
+
+* **One import.** `pm:plugin/host.log`, which takes a level and a string and
+  returns nothing. That is the whole host surface. There is **no WASI**: no
+  files, no clock, no randomness, no network, no environment, no arguments, no
+  `proc_exit`. A component that imports anything else does not instantiate.
+* **A fuel budget per call.** Fuel counts executed instructions, so it bounds
+  work rather than time, and it is deterministic - the same call on the same
+  input traps at the same instruction on every machine. A plugin cannot hang a
+  build.
+* **A memory cap, a table cap and a stack cap.**
+* **A fresh instance per call.** Nothing carries between calls: one build file's
+  commands cannot influence how the next is classified, and one source file
+  cannot influence the grants derived from another.
+
+Because `log` returns nothing, no information flows *into* a plugin through it.
+A plugin's answer is a function of its own bytes and its argument, and of
+nothing else - which is what lets pm fold the plugin set into a build policy's
+digest and have that mean something.
+
+## What a plugin may and may not change
+
+* It is **only asked about commands pm's own table did not match**. No plugin
+  can decide that `cargo` needs no network or that `git` is not version
+  control, because no plugin is ever asked.
+* It **publishes a ceiling** in its manifest, and pm drops any capability a
+  verdict asks for outside it. The ceiling is the plugin's own claim, enforced;
+  its value is that reading `pm plugins` is a cheap substitute for reading the
+  plugin. It is not a defence against a key you should not have trusted.
+* Its fingerprints are recorded as `<plugin>:<name>`, so `pm explain` shows who
+  classified what. Its run-time grants carry `plugin` provenance and an
+  evidence line naming it, so `pm profile` shows who asked for what.
+* Its grants land in a profile recorded in **audit mode**, exactly like pm's
+  own signals. Nothing on the build path turns enforcement on.
+* A plugin that traps, runs out of fuel or answers with something unusable is
+  logged and treated as having had no answer. It cannot fail a build to spite
+  you.
+
+## Trust
+
+**A plugin must be signed**, by a key in the same trust store that governs build
+files, or pm refuses to load it:
+
+```sh
+pm sign  ~/.config/pm/plugins/zig.wasm         # writes zig.wasm.sig
+pm trust <the signer's public key hex>         # once, per key
+```
+
+`--allow-unsigned-plugins` skips the check. It is for a plugin you are writing
+and have not signed yet. A build file names commands that run inside a jail; a
+plugin *is* code that runs inside pm and helps decide what that jail allows, so
+the escape hatch gives up rather more here than it does there.
+
+`--no-plugins` loads none at all, which is the honest way to find out whether a
+plugin is responsible for a surprising policy.
+
+## Building one
+
+The crates here are a separate cargo workspace, so `cargo build` at the
+repository root never drags a `wasm32` target in.
+
+```sh
+rustup target add wasm32-unknown-unknown
+./build.sh              # everything, into dist/, and refresh the test fixtures
+./build.sh zig          # just one
+```
+
+Two steps happen inside: `cargo build --target wasm32-unknown-unknown` produces
+a **core module**, and then `encoder/` wraps it into a component.
+`wasm-tools component new` does the same job if you have it installed;
+`encoder/` exists so `build.sh` needs nothing but a Rust toolchain.
+
+A plugin of your own, in outline:
+
+```toml
+# Cargo.toml
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wit-bindgen = { version = "0.51", default-features = false, features = ["macros", "realloc"] }
+```
+
+```rust
+wit_bindgen::generate!({ path: "path/to/pm/wit", world: "plugin" });
+
+use pm::plugin::types::{Capability, Hook};
+
+struct MyPlugin;
+
+impl Guest for MyPlugin {
+    fn describe() -> Manifest { /* name, version, summary, hooks, ceiling, extensions */ }
+    fn classify_command(command: String) -> Option<Verdict> { /* ... */ }
+    fn scan_source(file: SourceFile) -> Vec<Grant> { /* ... */ }
+}
+
+export!(MyPlugin);
+```
+
+Both exports are mandatory - the component model has no optional export - but
+pm calls a hook only when `describe` lists it, so the one you do not implement
+returns `None` or an empty `Vec`.
+
+`Manifest`, `Verdict`, `Grant` and `SourceFile` are re-exported into the crate
+root because the world's own functions name them; `Capability`, `Permission`
+and `Hook` are reached through `pm::plugin::types`.
+
+Any language with a component toolchain works. Nothing about the interface is
+Rust-specific; Rust is simply what these examples are written in.
+
+## What is here
+
+| crate            | what it is                                                                 |
+|------------------|----------------------------------------------------------------------------|
+| `zig/`           | the reference plugin: classifies `zig` commands and reads `.zig` sources    |
+| `encoder/`       | core module → component, so `build.sh` needs no `cargo install`             |
+| `fixtures/*`     | deliberately badly behaved plugins, for `tests/plugins.rs`                  |
+
+The fixtures are the interesting reading if you want to know what pm does when
+a plugin misbehaves: `greedy` asks for more than it published, `runaway` never
+returns, `nameless` cannot be attributed, and `scanner` contributes run-time
+grants from a file type pm has no grammar for.
+
+## On writing a good `scan-source`
+
+The reference plugin matches over a token stream with comments and string
+literals removed. That is the least a scanner can do to be honest, and it is
+still a long way short of what pm does for the languages it knows: pm's own
+queries in `src/perms/source.rs` match against a *syntax tree*, which is how
+`fopen(path, "a")` becomes a write and `fopen(path, "r")` a read, decided from
+the same call node rather than from what happened to be nearby.
+
+Nothing in the plugin interface stops you doing as well. A component can carry
+a whole parser - tree-sitter grammars compile to WebAssembly - and the fuel and
+memory budgets are sized for a real one. The reference plugin is small because
+it is an example, not because that is the ceiling.

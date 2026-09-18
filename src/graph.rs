@@ -30,6 +30,7 @@ use tracing::{debug, info, warn};
 
 use crate::{
     bf::{BuildFile, BuildOptions, Verification},
+    plugin::Registry,
     policy::BuildPolicy,
     progress::{Progress, Task},
 };
@@ -73,7 +74,7 @@ impl Graph {
     /// verified, when the dependencies close a cycle, when a build file's
     /// commands cannot be classified, or when two packages in the graph would
     /// be packaged to the same archive name.
-    pub fn resolve(root: &BuildFile, options: BuildOptions) -> miette::Result<Self> {
+    pub fn resolve(root: &BuildFile, options: BuildOptions<'_>) -> miette::Result<Self> {
         let key = match root.source() {
             // Fall back to the path as given when it cannot be canonicalised,
             // exactly as parsing does: identity degrades, resolution still runs.
@@ -92,6 +93,7 @@ impl Graph {
             state: HashMap::new(),
             verification: root.verification(),
             permissive: options.permissive,
+            plugins: options.plugins,
         };
 
         let root_index = resolver.visit(key, root.clone(), &mut Vec::new())?;
@@ -142,7 +144,7 @@ impl Graph {
     ///
     /// Returns a diagnostic naming every package that failed, and how many were
     /// skipped because something they needed did.
-    pub fn build(&self, options: BuildOptions, progress: &Progress) -> miette::Result<PathBuf> {
+    pub fn build(&self, options: BuildOptions<'_>, progress: &Progress) -> miette::Result<PathBuf> {
         let jobs = options
             .jobs
             .map_or_else(default_jobs, NonZeroUsize::get)
@@ -172,7 +174,7 @@ impl Graph {
         &self,
         schedule: &Mutex<Schedule>,
         wakeup: &Condvar,
-        options: BuildOptions,
+        options: BuildOptions<'_>,
         progress: &Progress,
         summary: &Task,
     ) {
@@ -296,12 +298,16 @@ fn archive_name(build: &BuildFile) -> String {
 }
 
 /// Depth-first resolution state.
-struct Resolver {
+struct Resolver<'a> {
     nodes: Vec<Node>,
     order: Vec<usize>,
     state: HashMap<PathBuf, State>,
     verification: Verification,
     permissive: bool,
+    /// Carried down the walk for the same reason `permissive` is: every package in the
+    /// graph is classified by the plugin set the root was resolved with, so a
+    /// dependency cannot be judged by a different table from its dependents.
+    plugins: &'a Registry,
 }
 
 /// How far a build file has got through resolution.
@@ -312,7 +318,7 @@ enum State {
     Resolved(usize),
 }
 
-impl Resolver {
+impl Resolver<'_> {
     /// Resolve `build` and everything under it, returning its node index.
     ///
     /// `stack` is the current depth-first path, used to render a cycle.
@@ -325,13 +331,14 @@ impl Resolver {
         self.state.insert(key.clone(), State::Visiting);
         stack.push(key.clone());
 
-        let policy = BuildPolicy::derive(&build, self.permissive).wrap_err_with(|| {
-            format!(
-                "cannot derive a sandbox policy for {}; run `pm explain` on it to see the \
+        let policy = BuildPolicy::derive_with(&build, self.permissive, self.plugins)
+            .wrap_err_with(|| {
+                format!(
+                    "cannot derive a sandbox policy for {}; run `pm explain` on it to see the \
                  whole build file, or build with --permissive to allow the commands anyway",
-                build.name()
-            )
-        })?;
+                    build.name()
+                )
+            })?;
 
         let mut dependencies = Vec::with_capacity(build.dependencies().len());
         for dependency in build.dependencies() {

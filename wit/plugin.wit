@@ -1,0 +1,178 @@
+// The interface a pm plugin is compiled against.
+//
+// A plugin is a WebAssembly *component*: pm loads it into its own process and
+// calls it to answer two questions the built-in tables cannot always answer.
+//
+//   * `classify-command` is asked what a build-step command needs from the
+//     build jail, and is only ever asked about a command that matched NO
+//     built-in fingerprint. A plugin therefore cannot reclassify `cargo` as
+//     needing no network, or `git` as needing no version control: it can only
+//     name a command pm would otherwise have refused to run at all.
+//
+//   * `scan-source` is asked what a source file implies the built program will
+//     need at run time, for the file extensions the plugin claimed in its
+//     manifest. Its answers land in the package's permission profile with
+//     `plugin` provenance, in audit mode, where they deny nothing until a
+//     human promotes the profile.
+//
+// The world imports exactly one thing - a one-way `log` - and nothing else. No
+// WASI, no filesystem, no clock, no randomness, no network, no environment. A
+// plugin is a pure function from the bytes pm hands it to the answer it hands
+// back, and pm enforces that by never linking anything else into it.
+package pm:plugin@0.1.0;
+
+/// The values that cross the boundary.
+///
+/// Each mirrors a type pm already has, and the host refuses anything it cannot
+/// map back - see `pm::plugin::convert`.
+interface types {
+    /// One capability a build step may need from the jail.
+    ///
+    /// Mirrors pm's `policy::Capability`. A plugin may only return the ones it
+    /// listed in `manifest.grants-at-most`; anything else is dropped and
+    /// logged, so a plugin cannot quietly grow its reach after it was reviewed.
+    enum capability {
+        /// Compilers, linkers, headers and build systems.
+        toolchain,
+        /// The basic file-manipulation utilities.
+        coreutils,
+        /// A POSIX shell.
+        shell,
+        /// Archive and compression tools.
+        archive,
+        /// The host's network namespace.
+        network,
+        /// Version-control clients.
+        version-control,
+    }
+
+    /// One thing the built package may do at run time.
+    ///
+    /// Mirrors pm's `perms::Permission`. Paths are absolute or
+    /// package-relative exactly as the source spelled them; pm normalises but
+    /// deliberately does not canonicalise them, because they routinely name
+    /// files that do not exist on the machine doing the building.
+    variant permission {
+        /// Read this path, and everything under it if it is a directory.
+        read-path(string),
+        /// Write this path, and everything under it if it is a directory.
+        write-path(string),
+        /// Execute this path, or anything under it if it is a directory.
+        exec-path(string),
+        /// Reach the network.
+        network,
+        /// Fork or exec child processes at all.
+        spawn,
+    }
+
+    /// What a plugin says about a command it recognises.
+    record verdict {
+        /// A short, stable name for the thing that was recognised, e.g.
+        /// `zig-build`. pm records it prefixed with the plugin's own name, so
+        /// `pm explain` shows `zig:zig-build` and a plugin can never be
+        /// mistaken for a built-in. Must be 1-32 characters of
+        /// `[a-z0-9]` and `-`.
+        fingerprint: string,
+        /// What a command matching it needs from the jail.
+        capabilities: list<capability>,
+    }
+
+    /// One permission the plugin asks for, and the reason.
+    record grant {
+        /// What is being asked for.
+        permission: permission,
+        /// One line a human can check the claim against, conventionally
+        /// `<line>: <what was found>`. pm prefixes it with the plugin name and
+        /// the file, so the reader always knows who asked and about what.
+        evidence: string,
+    }
+
+    /// A source file handed to `scan-source`.
+    record source-file {
+        /// Path relative to the scanned tree, `/` separated. Never absolute,
+        /// and never escaping the tree.
+        path: string,
+        /// The file's contents. Only valid UTF-8 is ever handed over; pm skips
+        /// anything else before the plugin is reached.
+        contents: string,
+    }
+
+    /// A hook a plugin implements.
+    ///
+    /// pm calls a hook only if the manifest lists it. The exports are all
+    /// mandatory - the component model has no optional export - so a plugin
+    /// that implements one hook still exports the other and returns the empty
+    /// answer from it.
+    enum hook {
+        /// `classify-command` is implemented.
+        classify-command,
+        /// `scan-source` is implemented.
+        scan-source,
+    }
+
+    /// What a plugin is, and the most it will ever ask for.
+    ///
+    /// pm asks for this exactly once, when it loads the plugin, and prints it
+    /// under `pm plugins`. It is the plugin's own claim about itself: pm holds
+    /// it to the claim, which is what makes reviewing a plugin cheap, but a
+    /// claim is not a defence against a key you should not have trusted.
+    record manifest {
+        /// Identifies the plugin everywhere pm mentions it. Must be 1-32
+        /// characters of `[a-z0-9]` and `-`.
+        name: string,
+        /// Free-form version string, shown but not interpreted.
+        version: string,
+        /// One line saying what the plugin is for.
+        summary: string,
+        /// Which hooks pm should call.
+        hooks: list<hook>,
+        /// The most `classify-command` will ever return. A verdict asking for
+        /// anything outside this set has the extra capabilities dropped.
+        /// Ignored when `classify-command` is not among the hooks.
+        grants-at-most: list<capability>,
+        /// File extensions, without the dot, that `scan-source` wants to see.
+        /// Ignored when `scan-source` is not among the hooks.
+        source-extensions: list<string>,
+    }
+}
+
+/// The only thing pm lends a plugin.
+interface host {
+    /// How loud a message is. Mapped onto pm's own `tracing` levels.
+    enum level {
+        error,
+        warn,
+        info,
+        debug,
+        trace,
+    }
+
+    /// Write a line into pm's log, tagged with the plugin's name.
+    ///
+    /// One-way and returns nothing, so it tells the plugin nothing about the
+    /// host and cannot make one call's answer depend on another's. That is why
+    /// it is safe to hand a plugin at all.
+    log: func(level: level, message: string);
+}
+
+/// The world every pm plugin exports.
+world plugin {
+    use types.{manifest, verdict, grant, source-file};
+
+    import host;
+
+    /// Name the plugin and the most it will ask for. Called once, at load.
+    export describe: func() -> manifest;
+
+    /// Classify a build-step command that matched no built-in fingerprint.
+    ///
+    /// `none` means "I do not recognise this", which is the answer that leaves
+    /// pm's own behaviour unchanged.
+    export classify-command: func(command: string) -> option<verdict>;
+
+    /// Infer what a source file implies the built program will need.
+    ///
+    /// The empty list means "nothing found", which is the answer that leaves
+    /// the profile unchanged.
+    export scan-source: func(file: source-file) -> list<grant>;
+}

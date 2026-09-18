@@ -7,8 +7,23 @@
 //! [`Fingerprint`]s, and the capabilities of the fingerprints that matched are
 //! the only ones the jail in [`crate::sandbox`] hands out. A command that
 //! matches nothing is an error rather than an unconstrained wildcard.
+//!
+//! # Where plugins fit
+//!
+//! The built-in table is finite, so a build system pm has never heard of stops a build
+//! before it starts. [`BuildPolicy::derive_with`] gives a [`crate::plugin::Registry`] a
+//! say - but only about the commands the table did **not** match. That ordering is the
+//! guarantee: a plugin can name a command pm would have refused, and can never rename
+//! one pm already knows, so no plugin can strip [`Capability::Network`] from `cargo` or
+//! decide that `git` is not version control. A plugin's answer is recorded under its own
+//! name (`zig:zig`), and the plugin set folds into the policy digest, so the same
+//! build file under different plugins does not produce the same policy.
 
-use std::{collections::BTreeSet, fmt::Write as _, sync::LazyLock};
+use std::{
+    collections::BTreeSet,
+    fmt::Write as _,
+    sync::{LazyLock, Mutex, PoisonError},
+};
 
 use miette::{IntoDiagnostic, WrapErr, miette};
 use regex::Regex;
@@ -16,7 +31,7 @@ use serde::{Deserialize, Serialize};
 use serde_yaml::{Value, from_value, to_value};
 use tracing::{debug, error, warn};
 
-use crate::step::Step;
+use crate::{plugin::Registry, step::Step};
 
 /// One capability a build step may need from the sandbox.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -304,6 +319,27 @@ impl BuildPolicy {
     /// inspection, or if a built-in pattern does not compile - the latter is a
     /// bug in this module, not in the build file.
     pub fn derive(build: &crate::bf::BuildFile, permissive: bool) -> miette::Result<Self> {
+        Self::derive_with(build, permissive, Registry::none())
+    }
+
+    /// As [`BuildPolicy::derive`], letting `plugins` classify what the built-in table
+    /// could not.
+    ///
+    /// A plugin is consulted **only** for a command no built-in fingerprint matched, and
+    /// only the capabilities it published a ceiling for survive - see
+    /// [`crate::plugin`]. Passing [`Registry::none`], which is what [`BuildPolicy::derive`]
+    /// does, makes this identical to the derivation pm performed before plugins existed,
+    /// digest included.
+    ///
+    /// # Errors
+    ///
+    /// As [`BuildPolicy::derive`]: a command that neither the table nor any plugin
+    /// recognises is still an error unless `permissive` is set.
+    pub fn derive_with(
+        build: &crate::bf::BuildFile,
+        permissive: bool,
+        plugins: &Registry,
+    ) -> miette::Result<Self> {
         let compiled = &*COMPILED;
         if !compiled.broken.is_empty() {
             return Err(miette!(
@@ -344,17 +380,37 @@ impl BuildPolicy {
                         capabilities.extend(fingerprint.capabilities);
                         matches.push((command.clone(), fingerprint.name));
                     }
-                    None => {
-                        unknown.push(format!("{} (step `{}`)", quoted(command), step.name));
-                        matches.push((command.clone(), UNMATCHED));
-                    }
+                    // The built-in table had nothing, so - and only so - the plugins
+                    // get a say.
+                    None => match plugins.classify(command.trim()) {
+                        Some((fingerprint, granted)) => {
+                            debug!(
+                                step = %step.name,
+                                command = %command,
+                                fingerprint = %fingerprint,
+                                capabilities = ?granted,
+                                "matched by a plugin"
+                            );
+                            capabilities.extend(granted);
+                            matches.push((command.clone(), intern(&fingerprint)));
+                        }
+                        None => {
+                            unknown.push(format!("{} (step `{}`)", quoted(command), step.name));
+                            matches.push((command.clone(), UNMATCHED));
+                        }
+                    },
                 }
             }
         }
 
         if !unknown.is_empty() {
             let report = miette!(
-                "no built-in fingerprint matches {}: {}\nknown fingerprints: {}",
+                "{} matches {}: {}\nknown fingerprints: {}",
+                if plugins.is_empty() {
+                    "no built-in fingerprint"
+                } else {
+                    "no built-in fingerprint, and no installed plugin,"
+                },
                 if unknown.len() == 1 {
                     "this command"
                 } else {
@@ -372,7 +428,7 @@ impl BuildPolicy {
         }
 
         let capabilities: Vec<Capability> = capabilities.into_iter().collect();
-        let fingerprint = digest(&value, &capabilities);
+        let fingerprint = digest(&value, &capabilities, plugins.digest());
         debug!(
             fingerprint = %fingerprint,
             capabilities = ?capabilities,
@@ -480,8 +536,11 @@ fn quoted(command: &str) -> String {
 ///
 /// Any change to a command, to a step's stage or name, to the order of the
 /// steps, to the downloads, or to the resolved capability set changes the
-/// output.
-fn digest(build: &Value, capabilities: &[Capability]) -> String {
+/// output - and so does installing, removing or upgrading a plugin, because
+/// [`crate::plugin::Registry::digest`] is mixed in whenever it is non-empty. The
+/// same build file can derive a different capability set under a different plugin
+/// set, and two policies that differ must not print the same digest.
+fn digest(build: &Value, capabilities: &[Capability], plugins: &str) -> String {
     const GOLDEN: u64 = 0x9e37_79b9_7f4a_7c15;
 
     let mut canon = String::new();
@@ -489,6 +548,12 @@ fn digest(build: &Value, capabilities: &[Capability]) -> String {
     // The separator cannot occur in the canonical form of a value, so the
     // build file and the capability list cannot be confused for one another.
     let _ = write!(canon, "|capabilities:{capabilities:?}");
+    // Appended only when there are plugins, so a pm with none installed digests a
+    // build file to exactly what it digested to before plugins existed - which is what
+    // makes this whole feature invisible to anyone not using it.
+    if !plugins.is_empty() {
+        let _ = write!(canon, "|plugins:{plugins}");
+    }
 
     let seed = fnv1a(canon.as_bytes());
     format!("{:016x}{:016x}", splitmix(seed), splitmix(seed ^ GOLDEN))
@@ -613,7 +678,11 @@ impl TryFrom<PolicyWire> for BuildPolicy {
     }
 }
 
-/// Map a fingerprint name back to the `&'static str` in the built-in table.
+/// Map a fingerprint name back to a `&'static str`.
+///
+/// The built-in table first, then [`UNMATCHED`], then the interner - a plugin's
+/// fingerprint has no entry in the table but is just as much a name this installation
+/// produced, and a policy that was serialised with one has to deserialise again.
 fn static_name(name: &str) -> Option<&'static str> {
     if name == UNMATCHED {
         return Some(UNMATCHED);
@@ -622,4 +691,42 @@ fn static_name(name: &str) -> Option<&'static str> {
         .iter()
         .find(|fingerprint| fingerprint.name == name)
         .map(|fingerprint| fingerprint.name)
+        .or_else(|| interned(name))
+}
+
+/// Fingerprint names contributed by plugins, kept alive for the rest of the process.
+///
+/// [`BuildPolicy::matches`] hands out `&'static str`, because the built-in names point
+/// into [`TABLE`] and nothing else needed a lifetime. A plugin's names arrive as owned
+/// strings at run time, so they are leaked into `'static` once each and shared from
+/// then on.
+///
+/// The honest accounting: this leaks at most one 32-byte name per *distinct* name a
+/// plugin returns, which for an honest plugin is the handful of build systems it knows
+/// and is allocated once for the whole process. A plugin that invented a fresh name for
+/// every command it saw would leak one per classified command, which is bounded by the
+/// build files pm reads in one run and is why the name length is capped at all. The
+/// alternative - making the whole `matches` list owned - would spend an allocation per
+/// command on every build, plugins or not, to bound something no honest plugin does.
+static INTERNED: LazyLock<Mutex<BTreeSet<&'static str>>> =
+    LazyLock::new(|| Mutex::new(BTreeSet::new()));
+
+/// The interned copy of `name`, interning it if this is the first time it is seen.
+fn intern(name: &str) -> &'static str {
+    let mut names = INTERNED.lock().unwrap_or_else(PoisonError::into_inner);
+    if let Some(existing) = names.get(name) {
+        return existing;
+    }
+    let leaked: &'static str = Box::leak(name.to_owned().into_boxed_str());
+    names.insert(leaked);
+    leaked
+}
+
+/// The interned copy of `name`, or `None` if nothing in this process ever produced it.
+fn interned(name: &str) -> Option<&'static str> {
+    INTERNED
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .get(name)
+        .copied()
 }

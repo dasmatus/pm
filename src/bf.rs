@@ -32,6 +32,7 @@ use crate::{
     graph::Graph,
     metadata::{Metadata, Type},
     perms::{Enforcement, Permissions, elf, source},
+    plugin::Registry,
     policy::BuildPolicy,
     progress::{Progress, Task},
     sandbox::BuildSandbox,
@@ -61,8 +62,12 @@ pub(crate) enum Verification {
 }
 
 /// Knobs [`BuildFile::run_with`] takes, all of which default to the safe answer.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct BuildOptions {
+///
+/// The lifetime is the borrow of the plugin registry, which travels *with* the options
+/// rather than beside them because it has exactly the same reach: whatever the caller
+/// hands the top-level build governs every package built out of it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BuildOptions<'a> {
     /// Allow step commands that match no built-in fingerprint.
     ///
     /// The default, `false`, aborts the build before a single step runs when a
@@ -82,6 +87,27 @@ pub struct BuildOptions {
     /// scheduler, and is the honest way to take concurrency out of the picture
     /// when a build misbehaves.
     pub jobs: Option<NonZeroUsize>,
+    /// The WebAssembly plugins consulted for whatever the built-in tables cannot
+    /// answer.
+    ///
+    /// The default, [`Registry::none`], is the empty registry: every hook a no-op, and
+    /// every derivation identical - digests included - to the pm that had no plugin
+    /// system at all. See [`crate::plugin`] for what a non-empty one can and, more to
+    /// the point, cannot change about a build.
+    pub plugins: &'a Registry,
+}
+
+impl Default for BuildOptions<'_> {
+    /// Confined, strict about classification, as parallel as the machine allows, and
+    /// with no plugins consulted.
+    fn default() -> Self {
+        Self {
+            permissive: false,
+            unsandboxed: false,
+            jobs: None,
+            plugins: Registry::none(),
+        }
+    }
 }
 
 /// A parsed build file: everything needed to build and package one package.
@@ -198,7 +224,7 @@ impl BuildFile {
     /// # Errors
     ///
     /// As [`BuildFile::run`].
-    pub fn run_with(&self, options: BuildOptions) -> miette::Result<PathBuf> {
+    pub fn run_with(&self, options: BuildOptions<'_>) -> miette::Result<PathBuf> {
         self.run_with_progress(options, &Progress::disabled())
     }
 
@@ -214,7 +240,7 @@ impl BuildFile {
     /// Everything [`BuildFile::run_with`] returns.
     pub fn run_with_progress(
         &self,
-        options: BuildOptions,
+        options: BuildOptions<'_>,
         progress: &Progress,
     ) -> miette::Result<PathBuf> {
         Graph::resolve(self, options)?.build(options, progress)
@@ -302,7 +328,7 @@ impl BuildFile {
     /// deleting it, so the half-finished tree can still be inspected.
     pub(crate) fn build_alone(
         &self,
-        options: BuildOptions,
+        options: BuildOptions<'_>,
         policy: &BuildPolicy,
         progress: &Progress,
         dependency_archives: &[PathBuf],
@@ -346,7 +372,7 @@ impl BuildFile {
     fn stage(
         &self,
         policy: &BuildPolicy,
-        options: BuildOptions,
+        options: BuildOptions<'_>,
         task: &Task,
         root: &Path,
         dependency_archives: &[PathBuf],
@@ -391,7 +417,8 @@ impl BuildFile {
                 staging.display()
             );
         }
-        let permissions = self.derive_permissions(&workdir, &staging, &entrypoints)?;
+        let permissions =
+            self.derive_permissions(options.plugins, &workdir, &staging, &entrypoints)?;
         let metadata = Metadata::create(
             self.name.clone(),
             self.version.clone(),
@@ -423,10 +450,12 @@ impl BuildFile {
     ///
     /// Two signals, merged into one set:
     ///
-    /// * **[`source::scan`] over `workdir`.** The steps unpacked and patched the
+    /// * **[`source::scan_with`] over `workdir`.** The steps unpacked and patched the
     ///   package's sources there, so that tree is what the shipped program was compiled
     ///   from. It sees intent a binary no longer records - a `getenv("HOME")`, a config
-    ///   path built up from string literals.
+    ///   path built up from string literals. Any [`crate::plugin`] component that
+    ///   claimed a file extension is asked about the files carrying it, in the same
+    ///   walk, and its grants arrive stamped [`crate::perms::Provenance::Plugin`].
     /// * **[`elf::analyse`] over each staged entrypoint.** The entrypoints were already
     ///   classified by [`collect_entrypoints`], so this re-uses that list instead of
     ///   walking the staging tree a second time. `analyse` answers `Ok(None)` for
@@ -455,11 +484,12 @@ impl BuildFile {
     /// at all.
     fn derive_permissions(
         &self,
+        plugins: &Registry,
         workdir: &Path,
         staging: &Path,
         entrypoints: &HashMap<PathBuf, Type>,
     ) -> miette::Result<Permissions> {
-        let sources = source::scan(workdir).wrap_err_with(|| {
+        let sources = source::scan_with(workdir, plugins).wrap_err_with(|| {
             format!(
                 "cannot scan the sources of {} in {} for the run-time permission profile",
                 self.name,
@@ -523,7 +553,7 @@ impl BuildFile {
     fn sandbox(
         &self,
         policy: &BuildPolicy,
-        options: BuildOptions,
+        options: BuildOptions<'_>,
         workdir: &Path,
         staging: &Path,
         dependency_archives: &[PathBuf],
