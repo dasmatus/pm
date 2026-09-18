@@ -1,12 +1,14 @@
 //! The permission model: what a package is allowed to do at run time, and why.
 //!
 //! Every package used to get the *same* run sandbox. This module replaces that with a
-//! per-package permission set, derived from three independent signals that each live in
-//! a sibling module:
+//! per-package permission set, derived from independent signals that each live in a
+//! sibling module:
 //!
 //! - [`source`] reads the package's sources with tree-sitter,
 //! - [`monitor`] watches one real execution with `ptrace`,
-//! - [`elf`] inspects the built binaries.
+//! - [`elf`] inspects the built binaries,
+//! - and, when any are installed, [`crate::plugin`] components contribute what they
+//!   made of the source files the built-in scanners have no grammar for.
 //!
 //! Each signal produces a [`Permissions`] set of [`Grant`]s, and [`Permissions::merge`]
 //! folds them into one. A grant carries its [`Provenance`] and its evidence strings, so
@@ -115,15 +117,23 @@ pub enum Provenance {
     /// The built ELF objects imply it - a `DT_NEEDED`, an interpreter, an imported
     /// symbol.
     ElfAnalysis,
+    /// A [`crate::plugin`] component asked for it while scanning the sources.
+    ///
+    /// Which plugin is not in the variant - it is at the front of the grant's evidence
+    /// line, where [`Permissions::report`] already shows it - because [`Provenance`] is
+    /// [`Copy`] and a sort key, and carrying a name here would cost both for something
+    /// the reader is reading anyway.
+    Plugin,
 }
 
 impl Provenance {
-    /// A short, stable label: `source`, `runtime` or `elf`.
+    /// A short, stable label: `source`, `runtime`, `elf` or `plugin`.
     pub fn label(self) -> &'static str {
         match self {
             Self::SourceAnalysis => "source",
             Self::RuntimeMonitor => "runtime",
             Self::ElfAnalysis => "elf",
+            Self::Plugin => "plugin",
         }
     }
 }

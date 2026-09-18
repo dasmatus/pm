@@ -9,6 +9,8 @@ pub mod metadata;
 /// Inferring the permissions a package actually needs, from its source, its
 /// built objects and a traced execution.
 pub mod perms;
+/// Extending pm's built-in tables with sandboxed WebAssembly components.
+pub mod plugin;
 /// Deriving a sandbox policy from the contents of a build file.
 pub mod policy;
 /// A live, redrawable region that reports what a build is doing right now.

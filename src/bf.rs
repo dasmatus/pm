@@ -13,7 +13,7 @@
 //! produced. The two are never interchangeable.
 
 use std::{
-    collections::HashMap,
+    collections::{BTreeSet, HashMap},
     env::current_dir,
     fs::{copy, create_dir_all, read_to_string, write},
     iter::once,
@@ -32,6 +32,7 @@ use crate::{
     graph::Graph,
     metadata::{Metadata, Type},
     perms::{Enforcement, Permissions, elf, source},
+    plugin::Registry,
     policy::BuildPolicy,
     progress::{Progress, Task},
     sandbox::BuildSandbox,
@@ -61,8 +62,12 @@ pub(crate) enum Verification {
 }
 
 /// Knobs [`BuildFile::run_with`] takes, all of which default to the safe answer.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct BuildOptions {
+///
+/// The lifetime is the borrow of the plugin registry, which travels *with* the options
+/// rather than beside them because it has exactly the same reach: whatever the caller
+/// hands the top-level build governs every package built out of it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BuildOptions<'a> {
     /// Allow step commands that match no built-in fingerprint.
     ///
     /// The default, `false`, aborts the build before a single step runs when a
@@ -82,6 +87,27 @@ pub struct BuildOptions {
     /// scheduler, and is the honest way to take concurrency out of the picture
     /// when a build misbehaves.
     pub jobs: Option<NonZeroUsize>,
+    /// The WebAssembly plugins consulted for whatever the built-in tables cannot
+    /// answer.
+    ///
+    /// The default, [`Registry::none`], is the empty registry: every hook a no-op, and
+    /// every derivation identical - digests included - to the pm that had no plugin
+    /// system at all. See [`crate::plugin`] for what a non-empty one can and, more to
+    /// the point, cannot change about a build.
+    pub plugins: &'a Registry,
+}
+
+impl Default for BuildOptions<'_> {
+    /// Confined, strict about classification, as parallel as the machine allows, and
+    /// with no plugins consulted.
+    fn default() -> Self {
+        Self {
+            permissive: false,
+            unsandboxed: false,
+            jobs: None,
+            plugins: Registry::none(),
+        }
+    }
 }
 
 /// A parsed build file: everything needed to build and package one package.
@@ -198,7 +224,7 @@ impl BuildFile {
     /// # Errors
     ///
     /// As [`BuildFile::run`].
-    pub fn run_with(&self, options: BuildOptions) -> miette::Result<PathBuf> {
+    pub fn run_with(&self, options: BuildOptions<'_>) -> miette::Result<PathBuf> {
         self.run_with_progress(options, &Progress::disabled())
     }
 
@@ -214,7 +240,7 @@ impl BuildFile {
     /// Everything [`BuildFile::run_with`] returns.
     pub fn run_with_progress(
         &self,
-        options: BuildOptions,
+        options: BuildOptions<'_>,
         progress: &Progress,
     ) -> miette::Result<PathBuf> {
         Graph::resolve(self, options)?.build(options, progress)
@@ -261,6 +287,78 @@ impl BuildFile {
         self.dependencies.iter().map(PathBuf::as_path)
     }
 
+    /// Substitute the plugin symbols this build file's step commands refer to.
+    ///
+    /// Returns every reference it resolved, sorted, so `pm explain` can show which
+    /// symbols shaped the commands that will actually run.
+    ///
+    /// # Where this sits, and why it matters
+    ///
+    /// **After the signature is checked, before the policy is derived.** Both halves of
+    /// that are load-bearing:
+    ///
+    /// * the detached signature covers the file as its author wrote it, so expansion
+    ///   cannot be what a signature is checked against - the author signed
+    ///   `%{systemd:unitdir}`, not whatever a plugin says that is today. The effective
+    ///   command is then the product of two separately signed things, the build file and
+    ///   the plugin, and neither one alone decides it;
+    /// * [`BuildPolicy::derive`] must see the **expanded** commands, or the jail would be
+    ///   sized for a command that is not the one that runs. Since a symbol can never
+    ///   occupy the first word (below), the *program* is the same either way - but the
+    ///   arguments are what `pm explain` prints, and a table showing a command nobody
+    ///   ran would be worse than no table.
+    ///
+    /// # A symbol may not be the program
+    ///
+    /// A reference in the first word of a command is refused. The first word is the
+    /// program: it is what the fingerprint table classifies and what
+    /// [`crate::sandbox::BuildSandbox`] resolves and hands to `execve`. Letting a plugin
+    /// supply it would let a plugin choose what runs, which is a different and much
+    /// larger power than naming what a command needs - and the whole design of
+    /// [`crate::plugin`] is that a plugin can widen a decision pm already refused, never
+    /// make one pm never asked about.
+    ///
+    /// Together with the single-word rule on values - see [`Registry::expand`] - that
+    /// bounds what a symbol can do to a command to exactly this: it fills in part of one
+    /// argument that the build file already wrote out.
+    ///
+    /// # Errors
+    ///
+    /// Fails when a command refers to a symbol no loaded plugin offers, and when a
+    /// reference appears in a command's first word. Both name the command and the step.
+    pub fn expand(&mut self, plugins: &Registry) -> miette::Result<BTreeSet<String>> {
+        let mut used = BTreeSet::new();
+        for step in &mut self.steps {
+            for command in &mut step.run {
+                if first_word_refers_to_a_symbol(command) {
+                    return Err(miette!(
+                        help = "A symbol can fill in part of an argument, never the \
+                                program. Spell the program out.",
+                        "the command {} in step `{}` names a plugin symbol as the \
+                         program to run",
+                        quoted(command),
+                        step.name
+                    ));
+                }
+                *command = plugins.expand_into(command, &mut used).wrap_err_with(|| {
+                    format!(
+                        "cannot expand the command {} in step `{}`",
+                        quoted(command),
+                        step.name
+                    )
+                })?;
+            }
+        }
+        if !used.is_empty() {
+            debug!(
+                package = %self.name,
+                symbols = ?used,
+                "expanded plugin symbols into the build file"
+            );
+        }
+        Ok(used)
+    }
+
     /// The build steps, in the order the file declares them.
     ///
     /// Sorting into execution order is [`BuildFile::execute_steps`]'s job; this
@@ -302,7 +400,7 @@ impl BuildFile {
     /// deleting it, so the half-finished tree can still be inspected.
     pub(crate) fn build_alone(
         &self,
-        options: BuildOptions,
+        options: BuildOptions<'_>,
         policy: &BuildPolicy,
         progress: &Progress,
         dependency_archives: &[PathBuf],
@@ -346,7 +444,7 @@ impl BuildFile {
     fn stage(
         &self,
         policy: &BuildPolicy,
-        options: BuildOptions,
+        options: BuildOptions<'_>,
         task: &Task,
         root: &Path,
         dependency_archives: &[PathBuf],
@@ -391,7 +489,8 @@ impl BuildFile {
                 staging.display()
             );
         }
-        let permissions = self.derive_permissions(&workdir, &staging, &entrypoints)?;
+        let permissions =
+            self.derive_permissions(options.plugins, &workdir, &staging, &entrypoints)?;
         let metadata = Metadata::create(
             self.name.clone(),
             self.version.clone(),
@@ -423,10 +522,12 @@ impl BuildFile {
     ///
     /// Two signals, merged into one set:
     ///
-    /// * **[`source::scan`] over `workdir`.** The steps unpacked and patched the
+    /// * **[`source::scan_with`] over `workdir`.** The steps unpacked and patched the
     ///   package's sources there, so that tree is what the shipped program was compiled
     ///   from. It sees intent a binary no longer records - a `getenv("HOME")`, a config
-    ///   path built up from string literals.
+    ///   path built up from string literals. Any [`crate::plugin`] component that
+    ///   claimed a file extension is asked about the files carrying it, in the same
+    ///   walk, and its grants arrive stamped [`crate::perms::Provenance::Plugin`].
     /// * **[`elf::analyse`] over each staged entrypoint.** The entrypoints were already
     ///   classified by [`collect_entrypoints`], so this re-uses that list instead of
     ///   walking the staging tree a second time. `analyse` answers `Ok(None)` for
@@ -455,11 +556,12 @@ impl BuildFile {
     /// at all.
     fn derive_permissions(
         &self,
+        plugins: &Registry,
         workdir: &Path,
         staging: &Path,
         entrypoints: &HashMap<PathBuf, Type>,
     ) -> miette::Result<Permissions> {
-        let sources = source::scan(workdir).wrap_err_with(|| {
+        let sources = source::scan_with(workdir, plugins).wrap_err_with(|| {
             format!(
                 "cannot scan the sources of {} in {} for the run-time permission profile",
                 self.name,
@@ -523,7 +625,7 @@ impl BuildFile {
     fn sandbox(
         &self,
         policy: &BuildPolicy,
-        options: BuildOptions,
+        options: BuildOptions<'_>,
         workdir: &Path,
         staging: &Path,
         dependency_archives: &[PathBuf],
@@ -600,6 +702,28 @@ impl BuildFile {
             step.execute(sandbox, workdir)
                 .wrap_err_with(|| format!("step {} failed", step.name))
         })
+    }
+}
+
+/// Whether a command's first word holds a symbol reference.
+///
+/// Checked on the raw command, before expansion, because afterwards there is nothing
+/// left to see. A command that is blank has no first word and no reference in it;
+/// [`crate::sandbox::BuildSandbox::run`] is what rejects it, with a better message.
+fn first_word_refers_to_a_symbol(command: &str) -> bool {
+    command
+        .split_whitespace()
+        .next()
+        .is_some_and(|program| program.contains("%{"))
+}
+
+/// Render a command for a diagnostic, keeping an empty one visible.
+fn quoted(command: &str) -> String {
+    let command = command.trim();
+    if command.is_empty() {
+        "an empty command".to_string()
+    } else {
+        format!("`{command}`")
     }
 }
 
