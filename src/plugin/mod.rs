@@ -71,7 +71,7 @@ mod engine;
 mod wit;
 
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     fmt,
     fs::{read, read_dir},
     path::{Path, PathBuf},
@@ -95,6 +95,14 @@ use crate::{
 
 /// The extension a plugin file must have to be loaded.
 const PLUGIN_EXTENSION: &str = "wasm";
+
+/// What introduces a symbol reference in a build file.
+///
+/// `%{` rather than `${`: a build file's commands are run with **no shell**, so `$HOME`
+/// and `$DESTDIR` are already literal text there, and a `${...}` that did expand beside
+/// a `$DESTDIR` that did not would be the worst of both. `%{` is also what rpm spells
+/// its macros with, which is the right neighbourhood for a package manager.
+const OPEN: &str = "%{";
 
 /// The registry handed to anything that was not given a real one.
 ///
@@ -145,6 +153,21 @@ impl fmt::Display for Hook {
     }
 }
 
+/// A named constant a build file may substitute into a step command.
+///
+/// Published by a plugin in its manifest, printed by `pm plugins`, and referred to from
+/// a build file as `%{<plugin>:<name>}`. See [`Registry::expand`] for the substitution
+/// itself and for why the value is always a single word.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Symbol {
+    /// The part after the plugin's name in a reference.
+    pub name: String,
+    /// What it expands to: one word, no whitespace.
+    pub value: String,
+    /// One line saying what it is.
+    pub summary: String,
+}
+
 /// What a plugin says it is, after pm has checked that it can use the answer.
 ///
 /// Built by [`convert::manifest`] from the plugin's own `describe` export, once, at
@@ -172,6 +195,11 @@ pub struct Manifest {
     /// File extensions, without the dot, that `scan-source` is called for. Empty when
     /// [`Hook::ScanSource`] is not among the hooks.
     pub source_extensions: BTreeSet<String>,
+    /// Named constants build files may substitute into step commands, keyed by name.
+    ///
+    /// Not gated on a hook: nothing calls back into the plugin to read these, they are
+    /// data pm took once at load and keeps. Most plugins publish none.
+    pub symbols: BTreeMap<String, Symbol>,
 }
 
 /// How a plugin came to be loaded.
@@ -487,6 +515,126 @@ impl Registry {
         })
     }
 
+    /// The symbol `plugin` publishes under `name`, if it publishes one.
+    #[must_use]
+    pub fn symbol(&self, plugin: &str, name: &str) -> Option<&Symbol> {
+        self.plugins
+            .iter()
+            .find(|candidate| candidate.manifest.name == plugin)?
+            .manifest
+            .symbols
+            .get(name)
+    }
+
+    /// Every symbol every plugin publishes, as `(<plugin>:<name>, symbol)`, sorted.
+    pub fn symbols(&self) -> impl Iterator<Item = (String, &Symbol)> {
+        self.plugins.iter().flat_map(|plugin| {
+            plugin
+                .manifest
+                .symbols
+                .values()
+                .map(move |symbol| (format!("{}:{}", plugin.manifest.name, symbol.name), symbol))
+        })
+    }
+
+    /// Substitute `%{<plugin>:<name>}` references in `text`.
+    ///
+    /// The point is the things a build file would otherwise hardcode and get wrong:
+    /// `install -Dm644 foo.service %{systemd:unitdir}/foo.service` names where unit
+    /// files go without the build file having to know, or be rewritten when the answer
+    /// changes.
+    ///
+    /// # What is and is not a reference
+    ///
+    /// `%{...}` is a reference **only** when what is inside it is a well-formed
+    /// `<plugin>:<name>` - a plugin name, one colon, a symbol name, both in their own
+    /// narrow charsets. A well-formed reference that names nothing is an **error**: a
+    /// mistyped `%{systemd:unitdirr}` must not end up in a command as itself, quietly
+    /// installing a file into a directory named after the typo.
+    ///
+    /// Anything else keeps its shape and passes through untouched - `%{NAME}`,
+    /// `--queryformat=%{VERSION}`, a bare `%`, `%%`. There is no escape character,
+    /// because there is nothing to escape: a string that is not shaped like a reference
+    /// is already literal. That also means a command cannot contain a literal `%{` that
+    /// *is* shaped like one, which is the whole cost of having no escape and is worth
+    /// it against making every `%` in every command mean something.
+    ///
+    /// # Errors
+    ///
+    /// Returns a diagnostic naming the reference when no loaded plugin offers it, and
+    /// listing what is on offer. A registry with no plugins in it is the common way to
+    /// reach that, so the diagnostic says so rather than listing nothing.
+    pub fn expand(&self, text: &str) -> Result<String> {
+        self.expand_into(text, &mut BTreeSet::new())
+    }
+
+    /// As [`Registry::expand`], recording every reference it resolved into `used`.
+    ///
+    /// `pm explain` prints what it collected, so a reader of a build file can see which
+    /// symbols shaped the commands that actually ran without going and reading the
+    /// plugins.
+    ///
+    /// # Errors
+    ///
+    /// As [`Registry::expand`].
+    pub fn expand_into(&self, text: &str, used: &mut BTreeSet<String>) -> Result<String> {
+        // The overwhelmingly common case, and the one that has to cost nothing: no
+        // build file anybody has today holds a reference.
+        if !text.contains(OPEN) {
+            return Ok(text.to_owned());
+        }
+
+        let mut out = String::with_capacity(text.len());
+        let mut rest = text;
+        while let Some(at) = rest.find(OPEN) {
+            out.push_str(&rest[..at]);
+            let after = &rest[at + OPEN.len()..];
+            // An unterminated `%{` is not a reference; it is a `%` followed by a brace.
+            let Some(end) = after.find('}') else {
+                out.push_str(OPEN);
+                rest = after;
+                continue;
+            };
+            let reference = &after[..end];
+            let Some((plugin, name)) = well_formed(reference) else {
+                out.push_str(OPEN);
+                rest = after;
+                continue;
+            };
+            let Some(symbol) = self.symbol(plugin, name) else {
+                return Err(self.unknown_symbol(reference));
+            };
+            debug!(
+                reference,
+                value = %symbol.value,
+                "substituted a plugin symbol into a build file"
+            );
+            out.push_str(&symbol.value);
+            used.insert(reference.to_owned());
+            rest = &after[end + 1..];
+        }
+        out.push_str(rest);
+        Ok(out)
+    }
+
+    /// The diagnostic for a well-formed reference nothing offers.
+    fn unknown_symbol(&self, reference: &str) -> miette::Report {
+        let offered: Vec<String> = self.symbols().map(|(qualified, _)| qualified).collect();
+        if offered.is_empty() {
+            return miette!(
+                help = "Install the plugin that offers it, or run with --no-plugins to \
+                        see what the build file does without one.",
+                "the build file uses `{OPEN}{reference}}}`, but no loaded plugin offers \
+                 any symbols"
+            );
+        }
+        miette!(
+            "the build file uses `{OPEN}{reference}}}`, which no loaded plugin \
+             offers\navailable symbols: {}",
+            offered.join(", ")
+        )
+    }
+
     /// Ask the plugins to classify a command the built-in table did not recognise.
     ///
     /// **Only ever called for an unmatched command** - see [`crate::policy::BuildPolicy::derive`].
@@ -693,6 +841,25 @@ fn sha256_hex(bytes: &[u8]) -> String {
             let _ = write!(text, "{byte:02x}");
             text
         })
+}
+
+/// Split a reference's contents into a plugin name and a symbol name, if it is shaped
+/// like one at all.
+///
+/// Exactly one colon, and both halves in the charsets [`convert`] validates a plugin
+/// name and a symbol name against. Anything else is not a reference and is left alone -
+/// see [`Registry::expand`].
+fn well_formed(reference: &str) -> Option<(&str, &str)> {
+    let (plugin, name) = reference.split_once(':')?;
+    let plugin_ok = !plugin.is_empty()
+        && plugin
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-');
+    let name_ok = !name.is_empty()
+        && name.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-' || byte == b'_'
+        });
+    (plugin_ok && name_ok).then_some((plugin, name))
 }
 
 /// The lower-case extension of a `/`-separated relative path, without the dot.

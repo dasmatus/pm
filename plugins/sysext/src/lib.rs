@@ -26,7 +26,7 @@ wit_bindgen::generate!({ path: "../../wit", world: "plugin" });
 
 use pm::plugin::{
     host::{Level, log},
-    types::{Capability, Hook},
+    types::{Capability, Hook, Symbol},
 };
 
 struct SysExt;
@@ -68,6 +68,30 @@ const TOOLS: &[(&[&str], &str, &[Capability])] = &[
     ),
 ];
 
+/// The directories a system extension is assembled from and installed into.
+///
+/// `extensionreleasedir` is the one worth having: every sysext image must carry an
+/// `extension-release.<name>` file at exactly that path or systemd refuses to merge it,
+/// and it is the single most common thing to get wrong when building one by hand.
+const SYMBOLS: &[(&str, &str, &str)] = &[
+    (
+        "extensionreleasedir",
+        "/usr/lib/extension-release.d",
+        "where an image's extension-release marker must live",
+    ),
+    ("imagedir", "/var/lib/extensions", "system extension images"),
+    (
+        "confextdir",
+        "/var/lib/confexts",
+        "configuration extension images",
+    ),
+    (
+        "repartdir",
+        "/usr/lib/repart.d",
+        "systemd-repart partition definitions",
+    ),
+];
+
 /// Tools that fetch and assemble a whole distribution, and are therefore refused.
 ///
 /// `mkosi` genuinely needs a compiler, a shell, an archiver and the network, so a
@@ -87,6 +111,14 @@ impl Guest for SysExt {
             hooks: vec![Hook::ClassifyCommand],
             grants_at_most: vec![Capability::Coreutils, Capability::Archive],
             source_extensions: Vec::new(),
+            symbols: SYMBOLS
+                .iter()
+                .map(|(name, value, summary)| Symbol {
+                    name: (*name).into(),
+                    value: (*value).into(),
+                    summary: (*summary).into(),
+                })
+                .collect(),
         }
     }
 

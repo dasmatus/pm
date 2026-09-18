@@ -33,6 +33,12 @@ const LABEL_WIDTH: usize = 12;
 /// Header of the command column `pm explain` prints.
 const COMMAND_HEADER: &str = "COMMAND";
 
+/// Width the symbol column of `pm explain` is padded to.
+///
+/// Wide enough for `%{plugin:name}` at the name lengths the plugin loader allows,
+/// without pushing the value column off a terminal.
+const SYMBOL_WIDTH: usize = 34;
+
 /// Widest the command column is padded to. A longer command is not truncated -
 /// the row simply runs past the column - because a build file is something the
 /// user has to be able to read back verbatim.
@@ -481,7 +487,10 @@ fn build(
         return Err(miette!("The path {} does not exist.", file.display()));
     }
 
-    let build_file = BuildFile::load(file)?;
+    let mut build_file = BuildFile::load(file)?;
+    // The graph expands every package again as it resolves it; this copy exists so the
+    // policy logged below is the one the top-level package will actually build under.
+    build_file.expand(plugins)?;
     let policy =
         BuildPolicy::derive_with(&build_file, permissive, plugins).wrap_err_with(|| {
             format!(
@@ -603,6 +612,20 @@ fn list_plugins(plugins: &Registry, digests: bool) -> miette::Result<()> {
                 )
             );
         }
+        if !manifest.symbols.is_empty() {
+            println!("{:<LABEL_WIDTH$}{}", "symbols:", manifest.symbols.len());
+            for symbol in manifest.symbols.values() {
+                let summary = if symbol.summary.is_empty() {
+                    String::new()
+                } else {
+                    format!("  ({})", symbol.summary)
+                };
+                println!(
+                    "  %{{{}:{}}} = {}{summary}",
+                    manifest.name, symbol.name, symbol.value
+                );
+            }
+        }
         println!("{:<LABEL_WIDTH$}{}", "file:", plugin.path().display());
         if digests {
             println!("{:<LABEL_WIDTH$}{}", "sha256:", plugin.sha256());
@@ -676,7 +699,10 @@ fn explain(file: &Path, permissive: bool, plugins: &Registry) -> miette::Result<
         return Err(miette!("The path {} does not exist.", file.display()));
     }
 
-    let build_file = BuildFile::load(file)?;
+    let mut build_file = BuildFile::load(file)?;
+    // Expanded first, so the table below prints the commands that would run rather than
+    // the ones the file was written with. Which symbols did that is printed too.
+    let symbols = build_file.expand(plugins)?;
     let policy =
         BuildPolicy::derive_with(&build_file, permissive, plugins).wrap_err_with(|| {
             format!(
@@ -720,6 +746,19 @@ fn explain(file: &Path, permissive: bool, plugins: &Registry) -> miette::Result<
                 .collect::<Vec<_>>()
                 .join(", ")
         );
+    }
+    if !symbols.is_empty() {
+        println!();
+        println!("{:<SYMBOL_WIDTH$}VALUE", "SYMBOL");
+        for reference in &symbols {
+            // Every reference in the set resolved, or `expand` would have failed, so a
+            // plugin that no longer offers one is not a case that can arrive here.
+            let value = reference
+                .split_once(':')
+                .and_then(|(plugin, name)| plugins.symbol(plugin, name))
+                .map_or("", |symbol| symbol.value.as_str());
+            println!("{reference:<SYMBOL_WIDTH$}{value}");
+        }
     }
     println!();
 

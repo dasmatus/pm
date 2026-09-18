@@ -54,6 +54,64 @@ digest and have that mean something.
   logged and treated as having had no answer. It cannot fail a build to spite
   you.
 
+## Symbols: values a build file can use
+
+Beside the two hooks, a plugin publishes **symbols** — named constants a build file
+substitutes into a step command as `%{<plugin>:<name>}`:
+
+```yaml
+run:
+  - install -Dm644 demo.service %{systemd:unitdir}/demo.service
+  - install -Dm644 demo.conf %{systemd:tmpfilesdir}/demo.conf
+```
+
+The point is what a build file would otherwise hardcode and get wrong. Where unit
+files go is a fact about systemd, not about your package, and digging it out of
+`pkg-config --variable=systemdsystemunitdir systemd` needs pkg-config *and* systemd's
+development files inside the build jail to answer. `pm plugins` prints every symbol
+every installed plugin offers.
+
+They are constants, not computed values: a plugin has no filesystem, no environment and
+no clock, so there is nothing to compute one *from*. The list is fixed in the component
+and pm reads it once, at load, which is also what makes it reviewable.
+
+### What a symbol may and may not do to a command
+
+A symbol changes **what command runs**, which is a larger power than anything else a
+plugin has — classification only decides what a command may reach. Two rules bound it,
+and between them a symbol can do exactly one thing: fill in part of an argument the
+build file already wrote out.
+
+- **A value is one word.** Commands are split on whitespace and handed to `execve` with
+  no shell in between, so a value containing whitespace would not fill an argument in,
+  it would *add* arguments. pm drops any value holding whitespace, a control character
+  or a NUL at load, and a build file naming a dropped symbol then fails loudly.
+- **A symbol may not be the program.** A reference in a command's first word is refused.
+  The first word is what the fingerprint table classifies and what the jail resolves and
+  execs; a plugin choosing that is a different power from a plugin describing it.
+
+And it cannot hide. Expansion happens *after* the build file's signature is checked and
+*before* the policy is derived, so the jail is always sized for the command that runs,
+`pm explain` prints both the expanded commands and the symbols that shaped them, and
+the expanded text feeds the policy digest. The author signed `%{systemd:unitdir}`, not
+whatever that is today — the effective command is the product of two separately signed
+things, the build file and the plugin, and neither alone decides it.
+
+### What is and is not a reference
+
+`%{…}` is a reference **only** when what is inside is a well-formed `plugin:symbol` —
+a plugin name, one colon, a symbol name, both lower-case. A well-formed reference that
+names nothing is an error, so a mistyped `%{systemd:unitdirr}` fails rather than
+installing into a directory named after the typo.
+
+Anything else keeps its shape: `%{NAME}` has no colon, `printf %s` and `100%%` have no
+brace. There is no escape character because there is nothing to escape — a string that
+is not shaped like a reference is already literal. The one cost is that a command cannot
+contain a literal `%{` that *is* shaped like a reference.
+
+Symbols are not substituted into `dl_urls`. A download's identity is its URL and its
+hash, both of which the build file states; and `%` already means something in a URL.
+
 ## Trust
 
 **A plugin must be signed**, by a key in the same trust store that governs build
@@ -107,7 +165,7 @@ use pm::plugin::types::{Capability, Hook};
 struct MyPlugin;
 
 impl Guest for MyPlugin {
-    fn describe() -> Manifest { /* name, version, summary, hooks, ceiling, extensions */ }
+    fn describe() -> Manifest { /* name, version, summary, hooks, ceiling, extensions, symbols */ }
     fn classify_command(command: String) -> Option<Verdict> { /* ... */ }
     fn scan_source(file: SourceFile) -> Vec<Grant> { /* ... */ }
 }
@@ -120,8 +178,8 @@ pm calls a hook only when `describe` lists it, so the one you do not implement
 returns `None` or an empty `Vec`.
 
 `Manifest`, `Verdict`, `Grant` and `SourceFile` are re-exported into the crate
-root because the world's own functions name them; `Capability`, `Permission`
-and `Hook` are reached through `pm::plugin::types`.
+root because the world's own functions name them; `Capability`, `Permission`,
+`Hook` and `Symbol` are reached through `pm::plugin::types`.
 
 Any language with a component toolchain works. Nothing about the interface is
 Rust-specific; Rust is simply what these examples are written in.
@@ -131,7 +189,7 @@ Rust-specific; Rust is simply what these examples are written in.
 | crate         | what it is                                                                |
 |---------------|---------------------------------------------------------------------------|
 | `zig/`        | classifies `zig` commands and reads `.zig` sources                        |
-| `systemd/`    | classifies systemd tooling and reads the unit files a package installs    |
+| `systemd/`    | classifies systemd tooling, reads unit files, publishes the install dirs  |
 | `sysupdate/`  | classifies `systemd-sysupdate` and reads its transfer definitions         |
 | `sysext/`     | classifies the system-extension image toolchain; one hook, on purpose     |
 | `unitfile/`   | the unit-file parser the three systemd plugins share - an ordinary lib    |

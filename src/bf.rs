@@ -13,7 +13,7 @@
 //! produced. The two are never interchangeable.
 
 use std::{
-    collections::HashMap,
+    collections::{BTreeSet, HashMap},
     env::current_dir,
     fs::{copy, create_dir_all, read_to_string, write},
     iter::once,
@@ -285,6 +285,78 @@ impl BuildFile {
     #[must_use]
     pub fn dependencies(&self) -> impl ExactSizeIterator<Item = &Path> {
         self.dependencies.iter().map(PathBuf::as_path)
+    }
+
+    /// Substitute the plugin symbols this build file's step commands refer to.
+    ///
+    /// Returns every reference it resolved, sorted, so `pm explain` can show which
+    /// symbols shaped the commands that will actually run.
+    ///
+    /// # Where this sits, and why it matters
+    ///
+    /// **After the signature is checked, before the policy is derived.** Both halves of
+    /// that are load-bearing:
+    ///
+    /// * the detached signature covers the file as its author wrote it, so expansion
+    ///   cannot be what a signature is checked against - the author signed
+    ///   `%{systemd:unitdir}`, not whatever a plugin says that is today. The effective
+    ///   command is then the product of two separately signed things, the build file and
+    ///   the plugin, and neither one alone decides it;
+    /// * [`BuildPolicy::derive`] must see the **expanded** commands, or the jail would be
+    ///   sized for a command that is not the one that runs. Since a symbol can never
+    ///   occupy the first word (below), the *program* is the same either way - but the
+    ///   arguments are what `pm explain` prints, and a table showing a command nobody
+    ///   ran would be worse than no table.
+    ///
+    /// # A symbol may not be the program
+    ///
+    /// A reference in the first word of a command is refused. The first word is the
+    /// program: it is what the fingerprint table classifies and what
+    /// [`crate::sandbox::BuildSandbox`] resolves and hands to `execve`. Letting a plugin
+    /// supply it would let a plugin choose what runs, which is a different and much
+    /// larger power than naming what a command needs - and the whole design of
+    /// [`crate::plugin`] is that a plugin can widen a decision pm already refused, never
+    /// make one pm never asked about.
+    ///
+    /// Together with the single-word rule on values - see [`Registry::expand`] - that
+    /// bounds what a symbol can do to a command to exactly this: it fills in part of one
+    /// argument that the build file already wrote out.
+    ///
+    /// # Errors
+    ///
+    /// Fails when a command refers to a symbol no loaded plugin offers, and when a
+    /// reference appears in a command's first word. Both name the command and the step.
+    pub fn expand(&mut self, plugins: &Registry) -> miette::Result<BTreeSet<String>> {
+        let mut used = BTreeSet::new();
+        for step in &mut self.steps {
+            for command in &mut step.run {
+                if first_word_refers_to_a_symbol(command) {
+                    return Err(miette!(
+                        help = "A symbol can fill in part of an argument, never the \
+                                program. Spell the program out.",
+                        "the command {} in step `{}` names a plugin symbol as the \
+                         program to run",
+                        quoted(command),
+                        step.name
+                    ));
+                }
+                *command = plugins.expand_into(command, &mut used).wrap_err_with(|| {
+                    format!(
+                        "cannot expand the command {} in step `{}`",
+                        quoted(command),
+                        step.name
+                    )
+                })?;
+            }
+        }
+        if !used.is_empty() {
+            debug!(
+                package = %self.name,
+                symbols = ?used,
+                "expanded plugin symbols into the build file"
+            );
+        }
+        Ok(used)
     }
 
     /// The build steps, in the order the file declares them.
@@ -630,6 +702,28 @@ impl BuildFile {
             step.execute(sandbox, workdir)
                 .wrap_err_with(|| format!("step {} failed", step.name))
         })
+    }
+}
+
+/// Whether a command's first word holds a symbol reference.
+///
+/// Checked on the raw command, before expansion, because afterwards there is nothing
+/// left to see. A command that is blank has no first word and no reference in it;
+/// [`crate::sandbox::BuildSandbox::run`] is what rejects it, with a better message.
+fn first_word_refers_to_a_symbol(command: &str) -> bool {
+    command
+        .split_whitespace()
+        .next()
+        .is_some_and(|program| program.contains("%{"))
+}
+
+/// Render a command for a diagnostic, keeping an empty one visible.
+fn quoted(command: &str) -> String {
+    let command = command.trim();
+    if command.is_empty() {
+        "an empty command".to_string()
+    } else {
+        format!("`{command}`")
     }
 }
 

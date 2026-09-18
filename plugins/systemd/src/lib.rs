@@ -38,7 +38,7 @@ wit_bindgen::generate!({ path: "../../wit", world: "plugin" });
 
 use pm::plugin::{
     host::{Level, log},
-    types::{Capability, Hook, Permission},
+    types::{Capability, Hook, Permission, Symbol},
 };
 use unitfile::{Directive, absolute_path, is_templated, parse, undecorate, words};
 
@@ -87,6 +87,63 @@ const REFUSED: &[&str] = &[
     "systemd-mount",
     "systemd-nspawn",
     "systemd-run",
+];
+
+/// The install directories a package shipping systemd integration has to write into.
+///
+/// Every one of these is a constant a build file would otherwise hardcode, or dig out
+/// of `pkg-config --variable=systemdsystemunitdir systemd` - which needs pkg-config and
+/// systemd's development files present inside the build jail to answer. A build file
+/// can write `%{systemd:unitdir}` instead and get the same answer with neither.
+///
+/// They are upstream systemd's own defaults, under `/usr/lib` rather than `/lib`: a
+/// package stages into `DESTDIR` and a distribution that disagrees is patching the
+/// prefix anyway.
+const SYMBOLS: &[(&str, &str, &str)] = &[
+    ("unitdir", "/usr/lib/systemd/system", "system unit files"),
+    ("userunitdir", "/usr/lib/systemd/user", "user unit files"),
+    (
+        "presetdir",
+        "/usr/lib/systemd/system-preset",
+        "system preset policy",
+    ),
+    (
+        "userpresetdir",
+        "/usr/lib/systemd/user-preset",
+        "user preset policy",
+    ),
+    (
+        "sysusersdir",
+        "/usr/lib/sysusers.d",
+        "systemd-sysusers definitions",
+    ),
+    (
+        "tmpfilesdir",
+        "/usr/lib/tmpfiles.d",
+        "systemd-tmpfiles definitions",
+    ),
+    (
+        "modulesloaddir",
+        "/usr/lib/modules-load.d",
+        "modules to load at boot",
+    ),
+    ("sysctldir", "/usr/lib/sysctl.d", "sysctl settings"),
+    ("udevrulesdir", "/usr/lib/udev/rules.d", "udev rules"),
+    (
+        "udevhwdbdir",
+        "/usr/lib/udev/hwdb.d",
+        "udev hardware database entries",
+    ),
+    (
+        "catalogdir",
+        "/usr/lib/systemd/catalog",
+        "journal message catalogs",
+    ),
+    (
+        "generatordir",
+        "/usr/lib/systemd/system-generators",
+        "unit generators",
+    ),
 ];
 
 /// Unit types whose files this plugin reads, as file extensions.
@@ -186,6 +243,14 @@ impl Guest for Systemd {
             // more. A verdict from this plugin can never grant the network.
             grants_at_most: vec![Capability::Coreutils],
             source_extensions: UNIT_EXTENSIONS.iter().map(|&e| e.into()).collect(),
+            symbols: SYMBOLS
+                .iter()
+                .map(|(name, value, summary)| Symbol {
+                    name: (*name).into(),
+                    value: (*value).into(),
+                    summary: (*summary).into(),
+                })
+                .collect(),
         }
     }
 

@@ -17,7 +17,7 @@ Regenerate them with:
 | `systemd.wasm`  | `plugins/systemd`           | classifies systemd tooling, reads unit files                 |
 | `sysupdate.wasm`| `plugins/sysupdate`         | classifies systemd-sysupdate, reads transfer definitions     |
 | `sysext.wasm`   | `plugins/sysext`            | classifies the image toolchain; declares one hook only       |
-| `greedy.wasm`   | `plugins/fixtures/greedy`   | returns capabilities outside the ceiling it published        |
+| `greedy.wasm`   | `plugins/fixtures/greedy`   | exceeds its ceiling; publishes a symbol that would add args  |
 | `runaway.wasm`  | `plugins/fixtures/runaway`  | never returns; must be cut off by the fuel budget            |
 | `nameless.wasm` | `plugins/fixtures/nameless` | has no usable name; must be refused at load                  |
 | `scanner.wasm`  | `plugins/fixtures/scanner`  | contributes run-time grants from a file type pm cannot parse |

@@ -33,6 +33,7 @@ impl Guest for Scanner {
             hooks: vec![Hook::ScanSource],
             grants_at_most: Vec::new(),
             source_extensions: vec!["toy".into()],
+            symbols: Vec::new(),
         }
     }
 

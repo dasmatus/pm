@@ -76,6 +76,7 @@ impl Guest for Zig {
             hooks: vec![Hook::ClassifyCommand, Hook::ScanSource],
             grants_at_most: FETCHING.to_vec(),
             source_extensions: vec!["zig".into()],
+            symbols: Vec::new(),
         }
     }
 

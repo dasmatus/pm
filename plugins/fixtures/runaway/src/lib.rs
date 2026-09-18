@@ -19,6 +19,7 @@ impl Guest for Runaway {
             hooks: vec![Hook::ClassifyCommand, Hook::ScanSource],
             grants_at_most: Vec::new(),
             source_extensions: vec!["runaway".into()],
+            symbols: Vec::new(),
         }
     }
 

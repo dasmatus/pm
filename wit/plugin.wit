@@ -97,6 +97,33 @@ interface types {
         contents: string,
     }
 
+    /// A named constant a build file may substitute into a step command.
+    ///
+    /// The point is the things a build file would otherwise have to hardcode and get
+    /// wrong - where a distribution puts unit files, where a sysext image goes. A
+    /// plugin knows its own ecosystem's answer; the build file should not have to.
+    ///
+    /// These are **constants**, not computed values. A plugin has no filesystem, no
+    /// environment and no clock, so there is nothing for it to compute one *from*; the
+    /// whole list is fixed in the component and pm reads it once, at load. That is also
+    /// what makes it reviewable: `pm plugins` prints every symbol a plugin offers, and
+    /// the list cannot change afterwards depending on what it was asked.
+    record symbol {
+        /// How a build file refers to it, after the plugin's own name:
+        /// `%{<plugin>:<name>}`. Must be 1-32 characters of `[a-z0-9]`, `-` and `_`.
+        name: string,
+        /// What it expands to.
+        ///
+        /// **Must be a single word.** A step command is split on whitespace with no
+        /// shell involved, so a value containing any would not land in the command as
+        /// one argument - it would add arguments to it. pm drops a value holding
+        /// whitespace, a control character or a NUL rather than letting a plugin
+        /// lengthen an argument list a build file already wrote out.
+        value: string,
+        /// One line saying what it is, for `pm plugins`.
+        summary: string,
+    }
+
     /// A hook a plugin implements.
     ///
     /// pm calls a hook only if the manifest lists it. The exports are all
@@ -133,6 +160,11 @@ interface types {
         /// File extensions, without the dot, that `scan-source` wants to see.
         /// Ignored when `scan-source` is not among the hooks.
         source-extensions: list<string>,
+        /// Named constants build files may substitute into step commands.
+        ///
+        /// Not gated on a hook: nothing calls back into the plugin to read them, they
+        /// are data pm takes once and keeps. A plugin offering none is the normal case.
+        symbols: list<symbol>,
     }
 }
 

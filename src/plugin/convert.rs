@@ -12,13 +12,16 @@
 //! to stop a package from building, because a plugin that can fail a build at will is a
 //! plugin that can hold a build hostage.
 
-use std::{collections::BTreeSet, path::PathBuf};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    path::PathBuf,
+};
 
 use tracing::warn;
 
 use super::{
-    Hook, Manifest,
-    wit::{WitCapability, WitGrant, WitHook, WitManifest, WitPermission, WitVerdict},
+    Hook, Manifest, Symbol,
+    wit::{WitCapability, WitGrant, WitHook, WitManifest, WitPermission, WitSymbol, WitVerdict},
 };
 use crate::{
     perms::{Grant, Permission, Provenance},
@@ -48,6 +51,18 @@ const EVIDENCE_MAX: usize = 200;
 
 /// Longest a path in a plugin's grant may be.
 const PATH_MAX: usize = 4096;
+
+/// Longest the value of a symbol may be.
+///
+/// Generously more than any path a build file would name, and short enough that a
+/// plugin cannot bury a command line under one substitution.
+const SYMBOL_VALUE_MAX: usize = 1024;
+
+/// How many symbols one plugin may publish.
+///
+/// `pm plugins` prints every one of them, and a list nobody reads is a list nobody is
+/// holding the plugin to.
+const SYMBOLS_MAX: usize = 64;
 
 /// How many grants one `scan-source` call may contribute.
 ///
@@ -108,6 +123,8 @@ pub(super) fn manifest(from: WitManifest, file: &str) -> Result<Manifest, String
         BTreeSet::new()
     };
 
+    let symbols = symbols(from.symbols, &name);
+
     Ok(Manifest {
         name,
         version: clip(from.version, VERSION_MAX),
@@ -115,7 +132,95 @@ pub(super) fn manifest(from: WitManifest, file: &str) -> Result<Manifest, String
         hooks,
         grants_at_most,
         source_extensions,
+        symbols,
     })
+}
+
+/// Read the named constants a plugin publishes, dropping the ones pm will not
+/// substitute into a command.
+///
+/// Two rules, and the second is the one that matters:
+///
+/// * **the name has to be usable**, because a build file refers to the symbol by it and
+///   a diagnostic has to be able to name it back;
+/// * **the value has to be a single word.** A step command is split on whitespace and
+///   handed straight to `execve` with no shell in between, so a value holding
+///   whitespace would not be substituted *into* an argument - it would add arguments.
+///   `install -Dm644 foo %{p:dir}/foo` with `dir` = `/tmp --strip-all /etc/shadow` is a
+///   different command from the one the build file's author wrote and signed. Control
+///   characters and NULs go for the same reason: nothing legitimate puts them in a path,
+///   and both are how an argument stops meaning what it looks like it means.
+///
+/// A dropped symbol is logged and then simply does not exist, so a build file naming it
+/// fails with "no plugin offers this symbol" rather than quietly running something else.
+fn symbols(from: Vec<WitSymbol>, plugin: &str) -> BTreeMap<String, Symbol> {
+    let offered = from.len();
+    let kept: BTreeMap<String, Symbol> = from
+        .into_iter()
+        .filter_map(|raw| {
+            let Some(name) = symbol_name(&raw.name) else {
+                warn!(
+                    plugin,
+                    symbol = %raw.name,
+                    "not a usable symbol name; ignoring it"
+                );
+                return None;
+            };
+            if !is_one_word(&raw.value) {
+                warn!(
+                    plugin,
+                    symbol = %name,
+                    bytes = raw.value.len(),
+                    "the value is empty, over-long, or holds whitespace, a control \
+                     character or a NUL; a step command is split on whitespace, so \
+                     substituting it would add arguments rather than fill one in. \
+                     Ignoring the symbol."
+                );
+                return None;
+            }
+            Some((
+                name.clone(),
+                Symbol {
+                    name,
+                    value: raw.value,
+                    summary: clip(raw.summary, SUMMARY_MAX),
+                },
+            ))
+        })
+        .take(SYMBOLS_MAX)
+        .collect();
+
+    if offered > SYMBOLS_MAX {
+        warn!(
+            plugin,
+            offered,
+            kept = kept.len(),
+            "publishes more symbols than pm records; the rest were dropped"
+        );
+    }
+    kept
+}
+
+/// A symbol name, if `raw` is one.
+///
+/// As [`name`], plus `_`: these read as identifiers rather than as command words, and
+/// `unit_dir` is a spelling somebody will reach for.
+fn symbol_name(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    let usable = !trimmed.is_empty()
+        && trimmed.len() <= NAME_MAX
+        && trimmed.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-' || byte == b'_'
+        })
+        && trimmed.bytes().any(|byte| byte.is_ascii_alphanumeric());
+    usable.then(|| trimmed.to_owned())
+}
+
+/// Whether `value` is something pm will substitute into one argument of a command.
+fn is_one_word(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= SYMBOL_VALUE_MAX
+        && !value.chars().any(|c| c.is_whitespace() || c.is_control())
 }
 
 /// Read a classification verdict, holding the plugin to the ceiling it declared.

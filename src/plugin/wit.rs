@@ -24,7 +24,7 @@ pub(super) use self::{
         types::{
             Capability as WitCapability, Grant as WitGrant, Hook as WitHook, Host as TypesHost,
             Manifest as WitManifest, Permission as WitPermission, SourceFile as WitSourceFile,
-            Verdict as WitVerdict,
+            Symbol as WitSymbol, Verdict as WitVerdict,
         },
     },
 };

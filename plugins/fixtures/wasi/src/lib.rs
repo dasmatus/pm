@@ -32,6 +32,7 @@ impl Guest for Wasi {
             hooks: vec![Hook::ClassifyCommand],
             grants_at_most: Vec::new(),
             source_extensions: Vec::new(),
+            symbols: Vec::new(),
         }
     }
 

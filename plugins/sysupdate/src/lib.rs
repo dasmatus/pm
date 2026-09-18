@@ -22,7 +22,7 @@ wit_bindgen::generate!({ path: "../../wit", world: "plugin" });
 
 use pm::plugin::{
     host::{Level, log},
-    types::{Capability, Hook, Permission},
+    types::{Capability, Hook, Permission, Symbol},
 };
 use unitfile::{Directive, absolute_path, has_section, parse};
 
@@ -30,6 +30,23 @@ struct SysUpdate;
 
 /// The section that identifies a transfer definition.
 const GATE: &str = "Transfer";
+
+/// Where a package ships the transfer definitions it wants systemd-sysupdate to read.
+///
+/// `sysupdate.d` is the host's own set; `sysupdate.<component>.d` is a component's. A
+/// build file installing into the first can write `%{sysupdate:transferdir}`.
+const SYMBOLS: &[(&str, &str, &str)] = &[
+    (
+        "transferdir",
+        "/usr/lib/sysupdate.d",
+        "transfer definitions for the host itself",
+    ),
+    (
+        "featuredir",
+        "/usr/lib/sysupdate.d",
+        "optional feature definitions, read from the same directory",
+    ),
+];
 
 /// `[Source] Type=` values that name a URL rather than a path.
 const REMOTE_TYPES: &[&str] = &["url-file", "url-tar"];
@@ -53,6 +70,14 @@ impl Guest for SysUpdate {
                 Capability::Archive,
             ],
             source_extensions: vec!["conf".into(), "transfer".into()],
+            symbols: SYMBOLS
+                .iter()
+                .map(|(name, value, summary)| Symbol {
+                    name: (*name).into(),
+                    value: (*value).into(),
+                    summary: (*summary).into(),
+                })
+                .collect(),
         }
     }
 

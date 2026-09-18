@@ -65,7 +65,9 @@ impl Graph {
     /// checks signatures all the way down, an unverified one never starts.
     /// Each node's sandbox policy is derived here too, so a dependency whose
     /// commands match no fingerprint is reported before the packages ahead of
-    /// it in the queue have built anything.
+    /// it in the queue have built anything. Plugin symbols are substituted
+    /// immediately before that, so a policy always describes the commands that
+    /// will run - see [`BuildFile::expand`].
     ///
     /// # Errors
     ///
@@ -325,11 +327,18 @@ impl Resolver<'_> {
     fn visit(
         &mut self,
         key: PathBuf,
-        build: BuildFile,
+        mut build: BuildFile,
         stack: &mut Vec<PathBuf>,
     ) -> miette::Result<usize> {
         self.state.insert(key.clone(), State::Visiting);
         stack.push(key.clone());
+
+        // Before the policy, not after: the jail has to be derived from the commands
+        // that will actually run. Every package in the graph is expanded with the plugin
+        // set the root was resolved under, for the same reason it is classified with it.
+        build
+            .expand(self.plugins)
+            .wrap_err_with(|| format!("cannot expand the plugin symbols in {}", build.name()))?;
 
         let policy = BuildPolicy::derive_with(&build, self.permissive, self.plugins)
             .wrap_err_with(|| {
