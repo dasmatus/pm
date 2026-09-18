@@ -349,7 +349,12 @@ impl PackageRunner {
     /// A profile that cannot be parsed is reported and treated as absent rather
     /// than failing the run - but then `--enforce` has nothing to apply and
     /// errors, so a broken profile can never quietly become a permissive one.
-    pub fn run_with<C, T>(&self, bin: Option<String>, choose: C, tracer: T) -> miette::Result<ExitStatus>
+    pub fn run_with<C, T>(
+        &self,
+        bin: Option<String>,
+        choose: C,
+        tracer: T,
+    ) -> miette::Result<ExitStatus>
     where
         C: FnOnce(&[&str]) -> miette::Result<String>,
         T: Fn(&Path, &[String], &TraceOptions) -> miette::Result<TraceReport>,
@@ -920,9 +925,11 @@ impl PackageRunner {
     /// configured or spawned, or when `tar` exits unsuccessfully - in which
     /// case its exit status and captured stderr are reported.
     fn extract_jailed(&self, dest: &Path) -> miette::Result<()> {
-        let archive = self.path.canonicalize().into_diagnostic().wrap_err_with(|| {
-            format!("cannot resolve {} to extract it", self.path.display())
-        })?;
+        let archive = self
+            .path
+            .canonicalize()
+            .into_diagnostic()
+            .wrap_err_with(|| format!("cannot resolve {} to extract it", self.path.display()))?;
         let archive_str = archive.to_str().ok_or_else(|| {
             miette!(
                 "archive path {} is not valid UTF-8 and cannot be mounted into the extraction jail",
@@ -937,7 +944,10 @@ impl PackageRunner {
         })?;
         let tar = locate_tar()?;
         let tar_str = tar.to_str().ok_or_else(|| {
-            miette!("`tar` resolved to {}, which is not valid UTF-8", tar.display())
+            miette!(
+                "`tar` resolved to {}, which is not valid UTF-8",
+                tar.display()
+            )
         })?;
 
         let mut container = Container::new();
@@ -952,7 +962,12 @@ impl PackageRunner {
             .into_diagnostic()
             .wrap_err("cannot mirror the host system directories into the extraction jail")?
             .devfsmount("/dev")
-            .mount(archive_str, EXTRACT_ARCHIVE_MOUNT, "", package_mount_flags())
+            .mount(
+                archive_str,
+                EXTRACT_ARCHIVE_MOUNT,
+                "",
+                package_mount_flags(),
+            )
             .mount(dest_str, EXTRACT_DEST_MOUNT, "", extraction_dest_flags())
             .runctl(Runctl::MountFallback)
             .unshare(Namespace::Network);
