@@ -8,6 +8,7 @@
 
 use std::io::Cursor;
 
+use miette::Report;
 use pm::wire::{
     frame::{MAX_FRAME, read_frame, write_frame},
     types::{CallerContext, Diagnostic, JobRow, LogLine, Observation, PackageOutcome, ProgressNode},
@@ -143,4 +144,42 @@ fn reading_past_a_truncated_frame_is_an_error_not_a_panic() {
     let result = read_frame(&mut reader);
 
     assert!(result.is_err(), "a short read must be an error, not a hang or a panic");
+}
+
+#[test]
+fn diagnostic_from_a_deep_error_chain_stays_within_the_64kib_budget() {
+    // 200 layers is far past anything this crate's own `wrap_err` call
+    // sites produce today - the point is a caller that adds a lot more of
+    // them later, not anything reachable from a build file right now.
+    let mut report = Report::msg(
+        "innermost failure, padded out to a realistic build-output length so the maths in this test means something",
+    );
+    for layer in 0..200 {
+        report = report.wrap_err(format!(
+            "layer {layer} failed while wrapping the step below it with a decently long context string"
+        ));
+    }
+
+    let diagnostic = Diagnostic::from(&report);
+
+    let total: usize = diagnostic.message.len()
+        + diagnostic.help.len()
+        + diagnostic.causes.iter().map(String::len).sum::<usize>();
+    assert!(
+        total <= 64 * 1024,
+        "message + help + causes must stay within the spec's 64 KiB Diagnostic budget: got {total} bytes"
+    );
+    assert!(
+        diagnostic.causes.len() <= 20,
+        "causes must be bounded in count as well as in bytes, not just truncated per entry: got {} entries",
+        diagnostic.causes.len()
+    );
+    assert!(
+        diagnostic
+            .causes
+            .last()
+            .is_some_and(|last| last.contains("dropped")),
+        "dropping causes from a 200-layer chain must be visible, not silent: {:?}",
+        diagnostic.causes.last()
+    );
 }
