@@ -146,11 +146,21 @@ fn reading_past_a_truncated_frame_is_an_error_not_a_panic() {
     assert!(result.is_err(), "a short read must be an error, not a hang or a panic");
 }
 
+/// The combined content size a `Diagnostic` is allowed: `message`, `help`
+/// and every `causes` entry together, per the design spec's 64 KiB budget.
+/// `name` is deliberately excluded, matching the spec's own wording.
+fn diagnostic_content_bytes(diagnostic: &Diagnostic) -> usize {
+    diagnostic.message.len() + diagnostic.help.len() + diagnostic.causes.iter().map(String::len).sum::<usize>()
+}
+
 #[test]
-fn diagnostic_from_a_deep_error_chain_stays_within_the_64kib_budget() {
+fn a_long_chain_of_small_causes_is_capped_by_count_not_bytes() {
     // 200 layers is far past anything this crate's own `wrap_err` call
     // sites produce today - the point is a caller that adds a lot more of
-    // them later, not anything reachable from a build file right now.
+    // them later, not anything reachable from a build file right now. Each
+    // layer here is short, so this exercises the MAX_CAUSES count cap and
+    // the drop marker's visibility, not the byte budget - see the sibling
+    // tests below for that.
     let mut report = Report::msg(
         "innermost failure, padded out to a realistic build-output length so the maths in this test means something",
     );
@@ -162,16 +172,14 @@ fn diagnostic_from_a_deep_error_chain_stays_within_the_64kib_budget() {
 
     let diagnostic = Diagnostic::from(&report);
 
-    let total: usize = diagnostic.message.len()
-        + diagnostic.help.len()
-        + diagnostic.causes.iter().map(String::len).sum::<usize>();
     assert!(
-        total <= 64 * 1024,
-        "message + help + causes must stay within the spec's 64 KiB Diagnostic budget: got {total} bytes"
+        diagnostic_content_bytes(&diagnostic) <= 64 * 1024,
+        "message + help + causes must stay within the spec's 64 KiB Diagnostic budget: got {} bytes",
+        diagnostic_content_bytes(&diagnostic)
     );
     assert!(
         diagnostic.causes.len() <= 20,
-        "causes must be bounded in count as well as in bytes, not just truncated per entry: got {} entries",
+        "causes must be bounded in count, not just truncated per entry: got {} entries",
         diagnostic.causes.len()
     );
     assert!(
@@ -180,6 +188,81 @@ fn diagnostic_from_a_deep_error_chain_stays_within_the_64kib_budget() {
             .last()
             .is_some_and(|last| last.contains("dropped")),
         "dropping causes from a 200-layer chain must be visible, not silent: {:?}",
+        diagnostic.causes.last()
+    );
+}
+
+#[test]
+fn large_causes_are_trimmed_by_the_byte_budget_even_under_the_count_cap() {
+    // 16 wraps, each already at CAUSE_CAP, plus a small innermost message:
+    // 17 layers total, which is AT the MAX_CAUSES count cap once the
+    // outermost becomes `message` - so nothing here is excluded by count.
+    // Yet 16 * 4096 bytes alone is the whole 64 KiB budget, before `help`,
+    // the marker, or the small innermost cause get a single byte, so the
+    // byte ceiling has to do real trimming on its own.
+    let mut report = Report::msg("root cause");
+    for _ in 0..16 {
+        report = report.wrap_err("x".repeat(4096));
+    }
+
+    let diagnostic = Diagnostic::from(&report);
+
+    assert!(
+        diagnostic_content_bytes(&diagnostic) <= 64 * 1024,
+        "message + help + causes must stay within the spec's 64 KiB Diagnostic budget: got {} bytes",
+        diagnostic_content_bytes(&diagnostic)
+    );
+    assert!(
+        diagnostic
+            .causes
+            .last()
+            .is_some_and(|last| last.contains("dropped")),
+        "large causes must be visibly trimmed by the byte budget, not silently dropped: {:?}",
+        diagnostic.causes.last()
+    );
+}
+
+#[test]
+fn sixteen_full_causes_plus_overflow_stays_within_the_64kib_budget() {
+    // The exact boundary a prior version of this conversion got wrong: an
+    // empty message and help (so nothing is "spent" before causes), 16
+    // causes of EXACTLY CAUSE_CAP (4096) ASCII bytes each - which
+    // `sanitise` therefore returns untouched, no ellipsis, no shortening -
+    // plus at least one more cause past MAX_CAUSES. 16 * 4096 is already
+    // the full 64 KiB budget on its own; the dropped-cause marker then has
+    // to fit INSIDE that budget rather than being appended on top of it.
+    let mut report = Report::msg("root cause");
+    for _ in 0..17 {
+        report = report.wrap_err("x".repeat(4096));
+    }
+    // Empty message and help: sanitise("") is "", and nothing in this
+    // chain carries a `#[diagnostic(help(...))]`, so `help` is "" already.
+    report = report.wrap_err(String::new());
+
+    let diagnostic = Diagnostic::from(&report);
+
+    assert_eq!(diagnostic.message, "", "the empty head must sanitise to empty, not add bytes of its own");
+    assert_eq!(diagnostic.help, "");
+    assert!(
+        diagnostic_content_bytes(&diagnostic) <= 64 * 1024,
+        "16 full-cap causes plus a marker must still fit the 64 KiB budget: got {} bytes",
+        diagnostic_content_bytes(&diagnostic)
+    );
+    // `causes.len()` alone cannot show this: dropping one full-size cause
+    // and then appending one marker leaves the same COUNT. What proves the
+    // budget actually trimmed something is that fewer than all 16 original
+    // full-size (4096-byte) causes survive.
+    let full_size_causes = diagnostic.causes.iter().filter(|cause| cause.len() == 4096).count();
+    assert!(
+        full_size_causes < 16,
+        "fitting the marker inside the budget must cost at least one full-size cause: kept {full_size_causes} of the original 16"
+    );
+    assert!(
+        diagnostic
+            .causes
+            .last()
+            .is_some_and(|last| last.contains("dropped")),
+        "the boundary case must still report that causes were dropped: {:?}",
         diagnostic.causes.last()
     );
 }

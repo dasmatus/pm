@@ -70,7 +70,8 @@ impl From<&Report> for Diagnostic {
     /// [`MAX_CAUSES`] once every entry has already been sanitised and capped
     /// on its own: when either bound is the reason an entry is missing, a
     /// trailing marker says so, so a truncated chain is never mistaken for a
-    /// short one.
+    /// short one. That marker is charged against [`TOTAL_BUDGET`] like any
+    /// other byte - it lives INSIDE the budget, never appended on top of it.
     fn from(report: &Report) -> Self {
         let name = report.code().map_or_else(
             || FAILED.to_owned(),
@@ -92,23 +93,37 @@ impl From<&Report> for Diagnostic {
             .take(MAX_CAUSES)
             .map(|cause| sanitise(&cause.to_string(), CAUSE_CAP))
             .collect();
-        let mut dropped = rest.count();
+        let overflow = rest.count();
 
-        let mut spent = message.len() + help.len();
+        // The marker's own length depends on the dropped count, which is
+        // not known until the retain below decides what fits - and what
+        // fits depends on how much room the marker leaves. Resolved by
+        // reserving for the WORST case first: every remaining candidate
+        // also getting rejected by the budget, on top of `overflow`
+        // already excluded by count. The real marker, built afterwards,
+        // reports a dropped count that can only be smaller or equal, so
+        // it can only be shorter or equal in bytes - it fits in the space
+        // reserved for it by construction, never over it.
+        let spent = message.len() + help.len();
+        let worst_case_dropped = overflow + causes.len();
+        let reserved = drop_marker(worst_case_dropped).map_or(0, |marker| marker.len());
+        let mut remaining = TOTAL_BUDGET
+            .saturating_sub(spent)
+            .saturating_sub(reserved);
+
+        let mut dropped = overflow;
         causes.retain(|cause| {
-            let fits = spent + cause.len() <= TOTAL_BUDGET;
+            let fits = cause.len() <= remaining;
             if fits {
-                spent += cause.len();
+                remaining -= cause.len();
             } else {
                 dropped += 1;
             }
             fits
         });
 
-        if dropped > 0 {
-            causes.push(format!(
-                "…{dropped} more cause(s) dropped to stay within the {TOTAL_BUDGET}-byte Diagnostic budget"
-            ));
+        if let Some(marker) = drop_marker(dropped) {
+            causes.push(marker);
         }
 
         Self {
@@ -118,4 +133,22 @@ impl From<&Report> for Diagnostic {
             causes,
         }
     }
+}
+
+/// The visible marker appended to `causes` when [`MAX_CAUSES`] or
+/// [`TOTAL_BUDGET`] dropped one or more entries. `None` when nothing was
+/// dropped, so a chain that fit needs no marker at all.
+///
+/// Factored out so [`From<&Report>`]'s budget accounting can render this
+/// twice: once for a worst-case `dropped` count, to reserve its bytes ahead
+/// of time, and once for real afterwards. Digit count only grows with the
+/// number it represents, so the real marker - built from a `dropped` that
+/// can only be smaller or equal to the worst case - is never longer than
+/// what was reserved for it.
+fn drop_marker(dropped: usize) -> Option<String> {
+    (dropped > 0).then(|| {
+        format!(
+            "…{dropped} more cause(s) dropped to stay within the {TOTAL_BUDGET}-byte Diagnostic budget"
+        )
+    })
 }
