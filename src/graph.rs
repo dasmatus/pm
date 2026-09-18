@@ -62,15 +62,16 @@ struct Node {
 /// What every worker in one [`Graph::build_with`] call needs, and does not
 /// change while the schedule runs.
 ///
-/// Bundled into one value instead of four parameters on [`Graph::work`]: it is
-/// exactly the set of things every worker shares unchanged for the whole
+/// Bundled into one value instead of three parameters on [`Graph::work`]: it
+/// is exactly the set of things every worker shares unchanged for the whole
 /// build, as distinct from `schedule`, `wakeup` and `summary`, which are the
-/// scheduler's own mutable state.
+/// scheduler's own mutable state. `cancel` itself is not here: cancellation is
+/// checked as `Schedule::cancelled`, under the same lock a worker already
+/// holds while deciding whether to park - see `Graph::build_with`.
 struct BuildRun<'a> {
     ctx: &'a BuildContext,
     options: BuildOptions,
     progress: &'a Progress,
-    cancel: &'a Cancel,
 }
 
 impl Graph {
@@ -201,7 +202,9 @@ impl Graph {
     ///
     /// # Errors
     ///
-    /// As [`Graph::build_in`].
+    /// As [`Graph::build_in`], and also when the schedule this call built is
+    /// somehow still shared once every worker has joined - see the comment
+    /// where it is unwrapped below. That should be unreachable.
     pub fn build_with(
         &self,
         ctx: &BuildContext,
@@ -217,19 +220,36 @@ impl Graph {
         info!(packages = self.len(), jobs, "building the dependency graph");
 
         let summary = progress.task(format!("{} packages", self.len()));
-        let schedule = Mutex::new(Schedule::new(self));
-        // Wrapped in an `Arc` so `cancel` can hold a reference to the very
-        // condvar workers park on below: a plain `AtomicBool` flag is
-        // invisible to a thread already asleep in `Condvar::wait`, so a
-        // parked worker needs the condvar itself notified to wake before its
-        // next natural wakeup, which could be an arbitrarily long time away.
+        // `Arc`-wrapped so the closure registered with `cancel` below can hold
+        // its own clone, outliving this function if a caller keeps `cancel`
+        // around after the build returns - `clear_wakeup` drops that clone
+        // again once every worker has joined, before `schedule` is unwrapped.
+        let schedule = Arc::new(Mutex::new(Schedule::new(self)));
         let wakeup = Arc::new(Condvar::new());
-        cancel.register_wakeup(Arc::clone(&wakeup));
+
+        // `cancel.cancel()` runs this closure in addition to setting its own
+        // flag. It locks `schedule` - the exact mutex `claim`'s check-then-park
+        // sequence holds throughout - sets `Schedule::cancelled` while holding
+        // it, and notifies `wakeup` before releasing it. That ordering is
+        // what a condvar needs: a plain flag set outside this lock, followed
+        // by a separately locked `notify_all`, leaves a window where a worker
+        // can see the flag still clear, decide to park, and only reach
+        // `Condvar::wait` after the notification already fired - a condvar
+        // remembers nothing, so that wakeup is simply lost, and the worker
+        // would sleep until an unrelated package happened to settle and
+        // notify for its own reasons, possibly the rest of that package's
+        // build time later.
+        let bridge_schedule = Arc::clone(&schedule);
+        let bridge_wakeup = Arc::clone(&wakeup);
+        cancel.register_wakeup(move || {
+            lock(&bridge_schedule).cancelled = true;
+            bridge_wakeup.notify_all();
+        });
+
         let run = BuildRun {
             ctx,
             options,
             progress,
-            cancel,
         };
 
         scope(|threads| {
@@ -238,7 +258,16 @@ impl Graph {
             }
         });
 
-        // Every worker has joined, so nothing else holds the lock.
+        // Every worker has joined, so the closure above will never run again
+        // for this build. Drop it before reclaiming `schedule`, or the `Arc`
+        // below would still be shared and `try_unwrap` would fail.
+        cancel.clear_wakeup();
+
+        let schedule = Arc::try_unwrap(schedule).map_err(|_| {
+            miette!(
+                "the build's schedule was still shared after every worker had joined; this is a bug"
+            )
+        })?;
         schedule
             .into_inner()
             .unwrap_or_else(PoisonError::into_inner)
@@ -247,7 +276,7 @@ impl Graph {
 
     /// One worker: take a ready package, build it, release what it unblocks.
     fn work(&self, run: &BuildRun, schedule: &Mutex<Schedule>, wakeup: &Condvar, summary: &Task) {
-        while let Some((index, archives)) = self.claim(schedule, wakeup, summary, run.cancel) {
+        while let Some((index, archives)) = self.claim(schedule, wakeup, summary) {
             let node = &self.nodes[index];
             // Built outside the lock: this is the part that takes minutes.
             //
@@ -280,23 +309,29 @@ impl Graph {
     }
 
     /// Wait for a package to become ready and claim it, with its dependencies'
-    /// archives. `None` means there is no work left for anybody, or that
-    /// `cancel` has been tripped.
+    /// archives. `None` means there is no work left for anybody, or that the
+    /// build has been cancelled.
+    ///
+    /// `cancelled` lives on `Schedule` itself rather than being read off a
+    /// [`Cancel`] token directly: this loop's check and its `wakeup.wait`
+    /// below both run under `schedule`'s lock, and `Cancel::register_wakeup`
+    /// (see `Graph::build_with`) sets this same field under that same lock,
+    /// which is what makes a tripped cancellation impossible to miss between
+    /// the check and the park.
     fn claim(
         &self,
         schedule: &Mutex<Schedule>,
         wakeup: &Condvar,
         summary: &Task,
-        cancel: &Cancel,
     ) -> Option<(usize, Vec<PathBuf>)> {
         let mut state = lock(schedule);
 
         loop {
             // Checked before anything else, on every pass through this loop -
-            // including the one right after a spurious or cancel-driven
-            // wakeup - so a package that becomes ready only after `cancel()`
-            // was called is never handed out either.
-            if cancel.is_cancelled() {
+            // including the one right after this worker parks and is woken
+            // again - so a package that becomes ready only after cancellation
+            // is never handed out either.
+            if state.cancelled {
                 return None;
             }
 
@@ -546,6 +581,10 @@ struct Schedule {
     running: usize,
     /// Packages built successfully, for the summary line.
     done: usize,
+    /// Set under this struct's own lock by the closure `Graph::build_with`
+    /// registers with a [`Cancel`] token, so [`Graph::claim`]'s
+    /// check-then-park sequence can never miss it: see the comment there.
+    cancelled: bool,
 }
 
 impl Schedule {
@@ -578,6 +617,7 @@ impl Schedule {
             unsettled: graph.len(),
             running: 0,
             done: 0,
+            cancelled: false,
         }
     }
 
