@@ -689,68 +689,95 @@ fn an_absolute_entrypoint_does_not_escape_the_package() {
 
 #[test]
 #[ignore = "requires unprivileged user namespaces; run with `cargo test --test sandbox -- --ignored`"]
-fn a_hostile_tar_member_never_escapes_the_extraction_jail() {
-    // This is the attack `PackageRunner::extract_jailed` exists for: not a
-    // hostile ENTRYPOINT NAME (the tests above cover that layer), but a
-    // hostile MEMBER inside an otherwise-legitimate, correctly signed
-    // archive - the case `--unsigned` and a compromised build both leave
-    // open, since the signature says nothing about what `tar` does with the
-    // bytes it verifies.
-    let work = tempdir().expect("work directory");
-    let root = honest_tree(work.path());
-    write_metadata(&root, "hostile", &["usr/bin/hello"]);
+fn a_hostile_tar_cannot_write_outside_the_extraction_destination() {
+    // The three hostile member shapes named in the task brief - a `../`
+    // traversal, an absolute path, a symlink written through - all turn out
+    // to be refused by this host's own `tar` (GNU tar 1.35) before the jail's
+    // mount layout is ever exercised: a `..` component is a hard error, a
+    // leading `/` is silently rewritten to land under the destination, and
+    // writing through a symlink to an existing directory is refused as "is
+    // not a directory". None of them discriminate a jailed extraction from
+    // an unjailed one on THIS system - the real `tar` never gets far enough
+    // to test the mount boundary at all, whichever member shape is used.
+    //
+    // So this test does not trust the real `tar`. `extract_jailed` finds
+    // `tar` with its own PATH search (`locate_tar`), so a fake `tar` placed
+    // first on `PATH` stands in for exactly the kind of compromised or
+    // misconfigured build environment that seam exists to be robust against.
+    // Unlike a hostile member, this fake `tar` does not need `tar` itself to
+    // cooperate: it ignores every argument and tries to write straight
+    // through the container's mount layout, at a HOST path that indisputably
+    // exists and is writable by this test process, but is mounted nowhere
+    // inside the jail. If that write ever lands, the two-mount claim in
+    // `extract_jailed`'s doc comment - the archive read-only, the
+    // destination writable, nothing else reachable - is false.
+    let (work, archive) = package_with_a_runnable_binary("shimescape");
 
-    // A tar member whose own path is a `../` traversal - the classic case
-    // named for this jail. Ten `..` components bottom out at `/` from any
-    // destination this shallow, then the marker's real path is reattached -
-    // the same technique `payload`'s traversal path uses, aimed at an
-    // archive member's name instead of an entrypoint string.
     let marker = work.path().join("escaped-marker");
+    let fakebin = work.path().join("fakebin");
+    std::fs::create_dir_all(&fakebin).expect("create the fake PATH directory");
+    let shim = fakebin.join("tar");
     write(
-        root.join("payload-to-relocate"),
-        b"if this landed outside the extraction destination, the jail failed",
+        &shim,
+        format!(
+            "#!/bin/sh\nif echo pwned > '{}'; then\n  echo 'ESCAPED: wrote outside the extraction jail' >&2\n  exit 1\nfi\necho 'confined: could not write outside the extraction jail' >&2\nexit 0\n",
+            marker.display()
+        ),
     )
-    .expect("stage the payload to relocate");
-    let traversal = format!(
-        "{}{}",
-        "../".repeat(10),
-        marker.display().to_string().trim_start_matches('/')
-    );
-
-    let archive = work.path().join("hostile.cpkg");
-    let status = Command::new("tar")
-        .arg("-cJf")
-        .arg(&archive)
-        .arg(format!(
-            "--transform=s,^\\./payload-to-relocate$,{traversal},"
-        ))
-        .arg("-C")
-        .arg(&root)
-        .arg(".")
+    .expect("write the fake tar shim");
+    Command::new("chmod")
+        .arg("755")
+        .arg(&shim)
         .status()
-        .expect("run tar");
-    assert!(
-        status.success(),
-        "building the hostile archive must succeed"
-    );
-    sign(&archive, work.path());
+        .expect("chmod the fake tar shim");
 
-    // Whatever `run` ends up deciding about an archive with a member like
-    // this - and a `tar` that refuses to extract at all, which GNU tar does
-    // by default, is exactly what an untrusted-input parser should do - the
-    // marker must never appear on the host. `extract_jailed`'s two mounts
-    // (the archive read-only, the destination writable, nothing else
-    // reachable) are what guarantee that even if `tar` itself did not
-    // refuse.
-    let _ = PackageRunner::new(archive)
-        .trust_dir(trust_dir(work.path()))
-        .run(Some("usr/bin/hello".into()));
+    // `locate_tar` does its own manual `PATH` search (`src/run.rs`), so
+    // putting `fakebin` first is enough for `PackageRunner::run` to resolve
+    // this shim instead of the real system `tar`. The real `PATH` stays
+    // appended so nothing else the run needs stops resolving.
+    let real_path = std::env::var_os("PATH").unwrap_or_default();
+    let path = std::env::join_paths(
+        std::iter::once(fakebin.clone()).chain(std::env::split_paths(&real_path)),
+    )
+    .expect("join the fake bin directory onto PATH");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_pm"))
+        .arg("run")
+        .arg(&archive)
+        .arg("--bin")
+        .arg("usr/bin/hello")
+        .env("XDG_CONFIG_HOME", config_dir(work.path()))
+        .env("PATH", &path)
+        .stdin(Stdio::null())
+        .output()
+        .expect("run the pm binary");
 
     assert!(
         !marker.exists(),
-        "a `../`-traversal tar member must never land outside the extraction destination, but \
-         found {}",
+        "the fake tar escaped the extraction jail and wrote outside the destination: found {}",
         marker.display()
+    );
+
+    // `extract_jailed` only surfaces the shim's own stderr when the shim
+    // exits non-zero; a clean exit (the confined case, which is what should
+    // happen here) discards it, exactly as the unjailed path already did
+    // before this test existed. So the shim's own "confined"/"ESCAPED" lines
+    // are not always visible from here - but a run that reaches THIS
+    // specific downstream error only does so if extraction reported success,
+    // which only happens if the shim actually ran to completion and exited
+    // 0. An unreachable shim (the container never starting `tar` at all)
+    // fails differently, and an escaping shim's exit-1 diagnostic would
+    // mention "ESCAPED" right here instead.
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("ESCAPED"),
+        "the shim reported an escape, got: {stderr}"
+    );
+    assert!(
+        stderr.contains("has no `metadata` member"),
+        "the shim must actually have run to completion for this test to mean anything - an \
+         extraction that never gets this far never gave the shim a chance to attempt the escape \
+         at all; got: {stderr}"
     );
 }
 
