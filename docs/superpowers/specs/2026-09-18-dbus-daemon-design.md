@@ -345,7 +345,7 @@ invariant 5.
 | `LogLine { seq: u64, stream: u8, text: String }` | `(tys)` | `stream` is 0 stdout, 1 stderr, 2 log |
 | `JobRow { path: OwnedObjectPath, id, kind, state, subject: String, created_usec, finished_usec: i64, exit_code: i32 }` | `(ossssxxi)` | eight fields, eight type letters: `o` path, `s` id, `s` kind, `s` state, `s` subject, `x` created_usec, `x` finished_usec, `i` exit_code |
 | `Observation { syscall, pid: i32, permission, label, path: String, resolved, succeeded: bool, evidence: String }` | `(sisssbbs)` | `syscall` is an owned `String`; monitor.rs:319's `&'static str` into `TABLE` cannot cross a process boundary |
-| `PackageOutcome { name, outcome, archive, error: String }` | `(ssss)` | `outcome` is one of `built`, `failed`, `skipped` |
+| `PackageOutcome { name, outcome, archive, error: String }` | `(ssss)` | `outcome` is one of `built`, `failed`, `skipped`, `unknown`. `unknown` means the worker could not prove the archive it found was written by this run, which it reports rather than guessing `built`; see section 6 |
 
 `Resources` rides as `a{sv}` rather than a fixed-signature struct:
 `cpu-user-usec t`, `cpu-system-usec t`, `max-rss-kib t`, `vm-hwm-kib t`,
