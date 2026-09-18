@@ -1,0 +1,204 @@
+name: ci
+
+on:
+  push:
+    # This repository's default branch is master, not main.
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+# ── What this gates, and what it deliberately does not ─────────────────────
+#
+# Three jobs: rustfmt + clippy, the default test suite, and the confined tests
+# the default suite skips.
+#
+# `lint` and `test` are separate jobs rather than one. They do not share build
+# artifacts — clippy type-checks and emits .rmeta while `cargo test` needs
+# linked test binaries — so folding them together compiles this crate and its
+# dependency graph twice in sequence instead of once each, in parallel. ring,
+# rustls and six tree-sitter grammars make that a real difference.
+#
+# Only first-party actions are used (checkout, cache). Nothing here needs a
+# marketplace action: rustup ships in the runner image, and the cache is four
+# paths and a key.
+#
+# `examples/demo.sh` is NOT run here and stays a local gate. It builds the whole
+# example chain and then builds pm with pm, which means cargo resolving and
+# downloading a dependency graph from inside the build jail. That is the most
+# valuable end-to-end check this repository has and also the one with the most
+# ways to fail for reasons that are not this crate's fault; it wants running by
+# hand, watched:
+#   bash examples/demo.sh
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # Nothing reuses incremental state between runs, so producing it costs time
+  # and inflates what the cache below has to carry.
+  CARGO_INCREMENTAL: 0
+  RUST_BACKTRACE: 1
+
+jobs:
+  lint:
+    name: "rustfmt + clippy"
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      # rustup comes with the runner image, so no toolchain action is needed.
+      # `rustup update stable` rather than trusting whatever the image pinned:
+      # Cargo.toml sets edition = "2024", which an older stable cannot parse,
+      # and the failure for that is a manifest error rather than anything that
+      # points at the toolchain.
+      - id: toolchain
+        run: |
+          set -euo pipefail
+          rustup update --no-self-update stable
+          rustup default stable
+          rustup component add clippy rustfmt
+          rustc -vV
+          echo "ver=$(rustc -V | tr -d ' ()' )" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache@v4
+        with:
+          # registry/src is left out on purpose: cargo re-extracts it from
+          # registry/cache, so carrying both stores the same crates twice.
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          # Keyed on the toolchain as well as Cargo.lock. A rustc bump
+          # invalidates every artifact in target/, and a cache restored across
+          # one produces link errors that read like source bugs.
+          key: cargo-lint-${{ steps.toolchain.outputs.ver }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-lint-${{ steps.toolchain.outputs.ver }}-
+      # Formatting first: it costs a second and fails before the long build, so
+      # a whitespace-only mistake does not cost a full clippy compile to learn.
+      - run: cargo fmt --all --check
+      # --all-targets so the benches, the examples and src/bin/pm-fuzz.rs are
+      # linted too. Without it clippy checks the lib and the main binary only,
+      # and divan benches with `harness = false` are exactly the kind of target
+      # that rots unnoticed.
+      - run: cargo clippy --all-targets --all-features -- -D warnings
+
+  test:
+    name: "test suite"
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - id: toolchain
+        run: |
+          set -euo pipefail
+          rustup update --no-self-update stable
+          rustup default stable
+          rustc -vV
+          echo "ver=$(rustc -V | tr -d ' ()' )" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          # A separate key from the lint job's. clippy and cargo test leave
+          # different artifacts in target/, so sharing one entry would have each
+          # job evicting the other's work every run.
+          key: cargo-test-${{ steps.toolchain.outputs.ver }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-test-${{ steps.toolchain.outputs.ver }}-
+      # The suite shells out to tar, make, cc, chmod, /bin/sh and /usr/bin/ls,
+      # all of which the runner image already has — this step is a check, not a
+      # build, so a future image that drops one says so here rather than inside
+      # a test failure that looks like a logic bug.
+      - name: assert the tools the suite shells out to
+        run: |
+          set -euo pipefail
+          for t in tar make cc chmod sh ls; do
+            command -v "$t" >/dev/null || { echo "::error::the suite needs $t and this image has none"; exit 1; }
+          done
+          echo "tar make cc chmod sh ls all present"
+      # No --all-targets: that would build the benches as test targets for
+      # nothing. The `--ignored` tests are handled by the sandbox job below.
+      # Nothing here reaches the network — tests/download.rs runs against a
+      # TestServer on a local socket, not a real host.
+      - run: cargo test --all-features
+
+  sandbox:
+    name: "confined tests (userns + landlock)"
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # The seven tests the default suite skips. tests/sandbox.rs marks four of
+    # its twenty-one `#[ignore]` because "the sandboxed tests need unprivileged
+    # user namespaces, which plenty of CI images do not grant", and
+    # tests/landlock.rs does the same for three of its six. Ignoring them keeps
+    # `cargo test` green
+    # anywhere — but this is a tool whose entire job is confining builds and the
+    # programs they produce, so leaving its two confinement layers ungated would
+    # mean the suite never checks the feature it exists for.
+    #
+    # This job therefore makes the runner grant what those tests need, and FAILS
+    # if it cannot. That is on purpose: a preflight that skipped quietly would
+    # report green while testing nothing, which for a sandbox is the worst
+    # outcome available — tests/landlock.rs pairs every denial with a matching
+    # grant for the same reason, so that a sandbox which denies everything,
+    # including a broken one, cannot pass. If a future runner image makes this
+    # genuinely impossible, pin `runs-on: ubuntu-24.04` or add
+    # `continue-on-error: true` here — but do it deliberately, not by letting a
+    # skip hide it.
+    steps:
+      - uses: actions/checkout@v4
+      - id: toolchain
+        run: |
+          set -euo pipefail
+          rustup update --no-self-update stable
+          rustup default stable
+          rustc -vV
+          echo "ver=$(rustc -V | tr -d ' ()' )" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          # Shares the test job's artifacts: both build the same test binaries,
+          # and this job only changes which of their tests run.
+          key: cargo-test-${{ steps.toolchain.outputs.ver }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-test-${{ steps.toolchain.outputs.ver }}-
+      - name: grant unprivileged user namespaces
+        run: |
+          set -euo pipefail
+          uname -sr
+          # Ubuntu 24.04 ships kernel.apparmor_restrict_unprivileged_userns=1,
+          # which denies unprivileged CLONE_NEWUSER to unconfined processes and
+          # so stops hakoniwa building a jail at all. The knob does not exist on
+          # every kernel, hence the test before the write.
+          if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          else
+            echo "no apparmor_restrict_unprivileged_userns on this kernel; nothing to lift"
+          fi
+          # Informational, and not a gate: securityfs is not mounted everywhere,
+          # and the landlock tests themselves are a better probe than this file.
+          cat /sys/kernel/security/lsm 2>/dev/null || echo "lsm list unreadable"
+          # This IS a gate, and it is the exact condition tests/sandbox.rs names.
+          # Failing here rather than inside a test distinguishes "the runner
+          # cannot do this" from "the sandbox is broken".
+          unshare --user --map-root-user true || {
+            echo "::error::unprivileged user namespaces are unavailable, so the confined tests cannot run — see the comment on this job before making it non-blocking"
+            exit 1
+          }
+          echo "unprivileged user namespaces available"
+      # Run the two suites separately so a failure names which layer broke: the
+      # build jail (hakoniwa, tests/sandbox.rs) or the run jail (landlock,
+      # tests/landlock.rs).
+      - name: "build jail: hakoniwa"
+        run: cargo test --all-features --test sandbox -- --ignored
+      - name: "run jail: landlock"
+        run: cargo test --all-features --test landlock -- --ignored
