@@ -1,5 +1,8 @@
 /// Build-file parsing, building and packaging.
 pub mod bf;
+/// The daemon side of `pm`: the one-job-per-process worker today, and the
+/// `org.pm1` D-Bus service once a later task adds it.
+pub mod daemon;
 /// Fetching a build file's sources over HTTP, hashing them as they land.
 pub mod download;
 /// Resolving a build file's dependency graph, and building it.
