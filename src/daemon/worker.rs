@@ -165,6 +165,15 @@ pub struct WorkerRequest {
 /// [`WorkerEvent::Progress`] snapshots interleaved with the build, then one
 /// [`WorkerEvent::PackageOutcome`] per package in the graph, then exactly
 /// one terminal [`WorkerEvent::Completed`] and nothing after it.
+///
+/// `Completed` carries its two outcomes as flat, mutually-exclusive
+/// `Option` fields rather than a nested `enum` - `serde_yaml` (this
+/// module's chosen encoding; see [`WorkerRequest`]'s docs) refuses to
+/// serialise one enum's variant holding another enum directly, with the
+/// error `"serializing nested enums in YAML is not supported yet"`.
+/// [`Outcome`] stays a normal Rust enum for ergonomic matching inside this
+/// module; [`Outcome::into_event`] is the one place it gets flattened
+/// before it ever reaches [`write_frame`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum WorkerEvent {
     /// A snapshot of the whole progress tree, coalesced onto [`TICK`]
@@ -187,26 +196,52 @@ pub enum WorkerEvent {
     /// type the brief specifies instead, since nothing pins the enum's own
     /// name.
     PackageOutcome(PackageOutcome),
-    /// The job's terminal result. Nothing follows this frame.
-    Completed(WorkerOutcome),
+    /// The job's terminal result. Nothing follows this frame. Exactly one
+    /// of `archive` and `diagnostic` is ever populated - see this type's
+    /// own docs for why that is two `Option` fields and not one `enum`.
+    Completed {
+        /// Path to the produced archive, on success.
+        archive: Option<String>,
+        /// Why the job failed, on failure.
+        ///
+        /// Never how a panic is reported: a panic unwinds out of the
+        /// worker's `main` instead, and the PROCESS exits without ever
+        /// sending a `Completed` frame at all - which is exactly what lets
+        /// a future supervisor tell "failed" and "crashed" apart (design
+        /// section 6, "panic isolation"; section 7, invariant 7).
+        diagnostic: Option<Diagnostic>,
+    },
 }
 
-/// The terminal payload of [`WorkerEvent::Completed`].
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum WorkerOutcome {
+/// [`run_build`]'s own return type for the job's terminal result.
+///
+/// A plain Rust enum, not part of the wire format - see [`WorkerEvent`]'s
+/// docs for why an enum nested inside `Completed` cannot be serialised, and
+/// [`Outcome::into_event`] for the one place this gets flattened before it
+/// crosses the socket.
+enum Outcome {
     /// The build succeeded, leaving an archive at this path.
-    Succeeded {
-        /// Path to the produced archive.
-        archive: String,
-    },
+    Succeeded(PathBuf),
     /// The build failed for a reason `diagnostic` describes.
-    ///
-    /// Never how a panic is reported: a panic unwinds out of the worker's
-    /// `main` instead, and the PROCESS exits without ever sending a
-    /// `Completed` frame at all - which is exactly what lets a future
-    /// supervisor tell "failed" and "crashed" apart (design section 6,
-    /// "panic isolation"; section 7, invariant 7).
     Failed(Diagnostic),
+}
+
+impl Outcome {
+    /// Flattens this into the [`WorkerEvent::Completed`] frame that reports
+    /// it, sanitising the archive path the same way every other
+    /// build-controlled string on this wire is sanitised.
+    fn into_event(self) -> WorkerEvent {
+        match self {
+            Self::Succeeded(archive) => WorkerEvent::Completed {
+                archive: Some(sanitise(&archive.display().to_string(), ARCHIVE_CAP)),
+                diagnostic: None,
+            },
+            Self::Failed(diagnostic) => WorkerEvent::Completed {
+                archive: None,
+                diagnostic: Some(diagnostic),
+            },
+        }
+    }
 }
 
 /// Run the one job described by the first frame read from `fd`, then return.
@@ -222,7 +257,7 @@ pub enum WorkerOutcome {
 /// Returns an error only for a failure in the worker's OWN plumbing: the
 /// request frame could not be read or parsed, or [`CallerContext`] could
 /// not be applied. A failure of the BUILD ITSELF is not an error here - it
-/// is reported as a `Completed(WorkerOutcome::Failed(..))` frame and this
+/// is reported as a `Completed { diagnostic: Some(..), .. }` frame and this
 /// function still returns `Ok(())`, because the job was handled correctly
 /// even though it did not succeed. `pmd.rs`'s `main` turns an `Err` here
 /// into a non-zero exit with no `Completed` frame ever sent, which is
@@ -277,7 +312,7 @@ pub fn run(fd: RawFd) -> miette::Result<()> {
         // nothing; the same reasoning applies to every event here.
         let _ = tx.send(WorkerEvent::PackageOutcome(outcome));
     }
-    let _ = tx.send(WorkerEvent::Completed(outcome));
+    let _ = tx.send(outcome.into_event());
     drop(tx);
 
     match writer.join() {
@@ -414,11 +449,11 @@ fn drain_events(mut sink: UnixStream, events: mpsc::Receiver<WorkerEvent>) -> mi
 /// return value are the only public seam this task can build
 /// [`PackageOutcome`] from at all. See [`package_outcome`] for exactly what
 /// that costs.
-fn run_build(request: &WorkerRequest, progress: &Progress) -> (Vec<PackageOutcome>, WorkerOutcome) {
+fn run_build(request: &WorkerRequest, progress: &Progress) -> (Vec<PackageOutcome>, Outcome) {
     let target = Path::new(&request.target);
     let build_file = match BuildFile::load(target) {
         Ok(build_file) => build_file,
-        Err(report) => return (Vec::new(), WorkerOutcome::Failed(Diagnostic::from(&report))),
+        Err(report) => return (Vec::new(), Outcome::Failed(Diagnostic::from(&report))),
     };
 
     let options = BuildOptions {
@@ -429,7 +464,7 @@ fn run_build(request: &WorkerRequest, progress: &Progress) -> (Vec<PackageOutcom
 
     let graph = match Graph::resolve(&build_file, options) {
         Ok(graph) => graph,
-        Err(report) => return (Vec::new(), WorkerOutcome::Failed(Diagnostic::from(&report))),
+        Err(report) => return (Vec::new(), Outcome::Failed(Diagnostic::from(&report))),
     };
     let names: Vec<String> = graph.order().map(str::to_owned).collect();
     let root_name = build_file.name().to_owned();
@@ -445,12 +480,7 @@ fn run_build(request: &WorkerRequest, progress: &Progress) -> (Vec<PackageOutcom
                 .iter()
                 .map(|name| package_outcome(name, &root_name, Some(&archive), cwd.as_deref(), None))
                 .collect();
-            (
-                outcomes,
-                WorkerOutcome::Succeeded {
-                    archive: sanitise(&archive.display().to_string(), ARCHIVE_CAP),
-                },
-            )
+            (outcomes, Outcome::Succeeded(archive))
         }
         Err(report) => {
             let diagnostic = Diagnostic::from(&report);
@@ -466,7 +496,7 @@ fn run_build(request: &WorkerRequest, progress: &Progress) -> (Vec<PackageOutcom
                     )
                 })
                 .collect();
-            (outcomes, WorkerOutcome::Failed(diagnostic))
+            (outcomes, Outcome::Failed(diagnostic))
         }
     }
 }
