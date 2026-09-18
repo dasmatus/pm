@@ -125,10 +125,8 @@ pub enum JobKind {
 /// `zbus::zvariant::Type` and are pinned by `tests/wire.rs` against a
 /// D-Bus signature this struct has no reason to carry, because it never
 /// crosses D-Bus. It only ever crosses the worker's own socketpair, framed
-/// by [`crate::wire::frame`]. Design section 6 calls the payload "JSON";
-/// this crate serialises it with `serde_yaml` instead, which was already a
-/// dependency, rather than adding `serde_json` for a private, untested
-/// encoding that never leaves this one socketpair.
+/// by [`crate::wire::frame`] and serialised as JSON via `serde_json`,
+/// matching design section 6's "the worker to daemon protocol" verbatim.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkerRequest {
     /// What kind of job this is.
@@ -167,13 +165,17 @@ pub struct WorkerRequest {
 /// one terminal [`WorkerEvent::Completed`] and nothing after it.
 ///
 /// `Completed` carries its two outcomes as flat, mutually-exclusive
-/// `Option` fields rather than a nested `enum` - `serde_yaml` (this
-/// module's chosen encoding; see [`WorkerRequest`]'s docs) refuses to
-/// serialise one enum's variant holding another enum directly, with the
-/// error `"serializing nested enums in YAML is not supported yet"`.
-/// [`Outcome`] stays a normal Rust enum for ergonomic matching inside this
-/// module; [`Outcome::into_event`] is the one place it gets flattened
-/// before it ever reaches [`write_frame`].
+/// `Option` fields rather than a nested `enum`. That shape is deliberate,
+/// not a codec workaround: design section 6 itself writes this frame as
+/// `Completed { status, result }`, a flat struct, not a tagged union, so
+/// `archive`/`diagnostic` here matches the spec's own wire shape rather
+/// than introducing a Rust-only abstraction the protocol never asked for.
+/// It also leaves room to add a third, independent outcome later - a
+/// timeout or a cancellation marker, say - as one more `Option` field,
+/// without having to decide where it fits inside an existing enum.
+/// [`Outcome`] stays a normal Rust enum purely for ergonomic matching
+/// inside this module; [`Outcome::into_event`] is the one place it gets
+/// flattened before it ever reaches [`write_frame`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum WorkerEvent {
     /// A snapshot of the whole progress tree, coalesced onto [`TICK`]
@@ -216,9 +218,12 @@ pub enum WorkerEvent {
 /// [`run_build`]'s own return type for the job's terminal result.
 ///
 /// A plain Rust enum, not part of the wire format - see [`WorkerEvent`]'s
-/// docs for why an enum nested inside `Completed` cannot be serialised, and
-/// [`Outcome::into_event`] for the one place this gets flattened before it
-/// crosses the socket.
+/// docs for why `Completed` is a flat struct rather than one of these
+/// nested directly, and [`Outcome::into_event`] for the one place this
+/// gets flattened before it crosses the socket. Kept as an enum here
+/// purely because `Succeeded`/`Failed` are mutually exclusive and matching
+/// on them inside this module reads better than juggling two `Option`s by
+/// hand.
 enum Outcome {
     /// The build succeeded, leaving an archive at this path.
     Succeeded(PathBuf),
@@ -272,9 +277,9 @@ pub fn run(fd: RawFd) -> miette::Result<()> {
 
     let request_bytes =
         read_frame(&mut control).wrap_err("failed to read the worker's job request")?;
-    let request: WorkerRequest = serde_yaml::from_slice(&request_bytes)
+    let request: WorkerRequest = serde_json::from_slice(&request_bytes)
         .into_diagnostic()
-        .wrap_err("the worker's job request frame was not valid")?;
+        .wrap_err("the worker's job request frame was not valid JSON")?;
 
     install_tracing(&request.log_filter);
     apply_caller_context(&request.context)?;
@@ -428,10 +433,9 @@ fn spawn_ticker(
 /// frame to the socket fails.
 fn drain_events(mut sink: UnixStream, events: mpsc::Receiver<WorkerEvent>) -> miette::Result<()> {
     for event in events {
-        let payload = serde_yaml::to_string(&event)
+        let payload = serde_json::to_vec(&event)
             .into_diagnostic()
-            .wrap_err("cannot serialise a worker event")?
-            .into_bytes();
+            .wrap_err("cannot serialise a worker event")?;
         write_frame(&mut sink, &payload).wrap_err("cannot write a worker event frame")?;
     }
     Ok(())

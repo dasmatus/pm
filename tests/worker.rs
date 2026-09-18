@@ -131,9 +131,7 @@ fn spawn_worker(request: &WorkerRequest) -> (Child, UnixStream) {
     let mut writer = parent_end
         .try_clone()
         .expect("clone the control socket for writing the request");
-    let payload = serde_yaml::to_string(request)
-        .expect("serialise the worker request")
-        .into_bytes();
+    let payload = serde_json::to_vec(request).expect("serialise the worker request");
     write_frame(&mut writer, &payload).expect("send the worker request frame");
 
     (child, parent_end)
@@ -157,7 +155,7 @@ fn read_events(stream: &mut UnixStream) -> Vec<(Vec<u8>, WorkerEvent)> {
             break;
         };
         let event: WorkerEvent =
-            serde_yaml::from_slice(&payload).expect("decode a worker event frame");
+            serde_json::from_slice(&payload).expect("decode a worker event frame");
         let terminal = matches!(event, WorkerEvent::Completed { .. });
         events.push((payload, event));
         if terminal {
@@ -165,6 +163,72 @@ fn read_events(stream: &mut UnixStream) -> Vec<(Vec<u8>, WorkerEvent)> {
         }
     }
     events
+}
+
+/// Asserts the worker exited cleanly AND actually sent its own terminal
+/// frame, rather than exiting 0 having silently dropped it.
+///
+/// This module once had exactly that bug: an earlier version of the frame
+/// codec refused to serialise `WorkerEvent::Completed` wrapping a nested
+/// enum, the write failure was swallowed by a `warn!`-and-continue branch,
+/// and the worker exited 0 having sent every frame EXCEPT `Completed`.
+/// `status.success()` alone cannot tell that apart from a real success -
+/// only checking that the LAST frame received actually is `Completed` can,
+/// which is why every test that runs a real build calls this instead of
+/// asserting on `status` by itself.
+fn assert_worker_completed(status: &std::process::ExitStatus, events: &[(Vec<u8>, WorkerEvent)]) {
+    assert!(
+        status.success(),
+        "the worker process itself must exit cleanly, got {status:?}"
+    );
+    assert!(
+        matches!(events.last(), Some((_, WorkerEvent::Completed { .. }))),
+        "the worker exited 0 but its last frame was {:?}, not Completed - it exited having \
+         silently dropped its own terminal frame",
+        events.last().map(|(_, event)| event.clone())
+    );
+}
+
+/// Guards the codec choice itself, independent of whatever
+/// [`WorkerEvent`]'s own frames happen to look like today.
+///
+/// This is the exact shape that broke this module's original codec
+/// (`serde_yaml`): an enum variant whose payload is itself another enum.
+/// That codec refused it with `"serializing nested enums in YAML is not
+/// supported yet"`, and the failure was easy to miss because nothing about
+/// the WRITE call itself panicked - only a later "the terminal frame never
+/// arrived" symptom gave it away (see [`assert_worker_completed`]).
+/// `WorkerEvent::Completed` no longer has this shape - it is a flat struct
+/// on purpose, matching design section 6's own `Completed { status,
+/// result }` wording, not a codec workaround - so this test pins the
+/// CODEC's own capability directly instead: whatever a future task's new
+/// frame variants look like, a nested enum travelling through
+/// `write_frame`/`read_frame` via `serde_json` must survive the round trip.
+#[test]
+fn a_frame_carrying_a_nested_enum_round_trips() {
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    enum Inner {
+        A,
+        B(String),
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    enum Outer {
+        Wraps(Inner),
+    }
+
+    let (mut a, mut b) = UnixStream::pair().expect("create a socketpair");
+    let sent = Outer::Wraps(Inner::B("nested".to_owned()));
+    let payload = serde_json::to_vec(&sent).expect("serialise a nested enum");
+    write_frame(&mut a, &payload).expect("write a frame carrying a nested enum");
+
+    let received = read_frame(&mut b).expect("read the frame back");
+    let decoded: Outer =
+        serde_json::from_slice(&received).expect("decode a nested enum frame");
+    assert_eq!(
+        decoded, sent,
+        "a nested enum must round-trip through this protocol's codec"
+    );
 }
 
 #[test]
@@ -190,10 +254,7 @@ fn successful_build_reports_progress_a_package_outcome_and_an_archive() {
     let (mut child, mut control) = spawn_worker(&request);
     let events = read_events(&mut control);
     let status = child.wait().expect("wait for the worker process");
-    assert!(
-        status.success(),
-        "the worker process itself must exit cleanly on a successful build"
-    );
+    assert_worker_completed(&status, &events);
 
     // Check 1: at least one progress snapshot arrived while the 300ms step
     // (well over one 80ms tick) ran.
@@ -272,10 +333,7 @@ fn a_high_volume_step_coalesces_progress_and_sanitises_control_bytes() {
     let events = read_events(&mut control);
     let elapsed = started.elapsed();
     let status = child.wait().expect("wait for the worker process");
-    assert!(
-        status.success(),
-        "the worker process itself must exit cleanly on a successful build"
-    );
+    assert_worker_completed(&status, &events);
 
     // Check 3: no frame's raw bytes ever carry an ESC byte, proving
     // sanitisation held on this untrusted build output all the way to the
@@ -346,11 +404,9 @@ fn a_failing_step_yields_a_diagnostic_not_a_panic_or_a_silent_success() {
     // A panic would unwind out of the worker's `main` and exit 101 (or die
     // by signal); a controlled build failure exits cleanly and reports
     // itself over the socket instead. This is the "not a panic" half of
-    // check 6.
-    assert!(
-        status.success(),
-        "the worker process must exit cleanly even though the BUILD failed, got {status:?}"
-    );
+    // check 6 - `assert_worker_completed` also confirms the worker did not
+    // exit 0 while quietly dropping its own terminal frame.
+    assert_worker_completed(&status, &events);
 
     // The "not a silent success" half: the terminal frame must be a
     // Diagnostic, not a Succeeded.
