@@ -201,6 +201,12 @@ pub enum WorkerEvent {
     /// The job's terminal result. Nothing follows this frame. Exactly one
     /// of `archive` and `diagnostic` is ever populated - see this type's
     /// own docs for why that is two `Option` fields and not one `enum`.
+    ///
+    /// Provisional: the field names here (`archive`/`diagnostic`) are not
+    /// the spec's own spelling. Design section 6 writes this frame as
+    /// `Completed { status, result }`; the shape (a flat struct) matches,
+    /// the names do not. Renaming is free whenever that stops being close
+    /// enough.
     Completed {
         /// Path to the produced archive, on success.
         archive: Option<String>,
@@ -386,6 +392,12 @@ fn apply_caller_context(ctx: &CallerContext) -> miette::Result<()> {
 /// carried explicitly in [`WorkerRequest::log_filter`] instead. An
 /// unparseable filter falls back to `"info"` rather than failing the job
 /// over a cosmetic setting.
+///
+/// Provisional: this uses `with_max_level`, a single global level, rather
+/// than the spec's own `with_env_filter`, because this crate does not
+/// enable `tracing-subscriber`'s `env-filter` feature. Turning that
+/// feature on would let [`WorkerRequest::log_filter`] carry a real
+/// per-target directive string instead of just a level name.
 fn install_tracing(filter: &str) {
     let level = filter.parse::<Level>().unwrap_or(Level::INFO);
     fmt().without_time().with_max_level(level).init();
@@ -509,16 +521,31 @@ fn run_build(request: &WorkerRequest, progress: &Progress) -> (Vec<PackageOutcom
 ///
 /// `Graph`'s public API (see [`run_build`]'s docs) exposes no per-package
 /// result - only names, via [`Graph::order`], and the ROOT's own archive
-/// path, returned by [`Graph::build`] on success. For `name == root`, this
-/// is therefore exact. For any other name it is a best-effort
-/// reconstruction: every package's archive is named `<name>-<version>.cpkg`
-/// and lands beside the root's, in the same [`current_dir`]
-/// (`bf.rs::build_alone`), so [`find_archive`] looks for one. A
-/// whole-graph failure with no such file present is reported as `"failed"`
-/// even for a package that was merely skipped, because `Graph` gives this
-/// function no way to tell the two apart. Exposing `Progression` (or an
-/// equivalent) from `graph.rs` would let a future task report this
-/// exactly instead.
+/// path, returned by [`Graph::build`] on success. For `name == root`, that
+/// path is exact - handed to this function directly, never guessed at - so
+/// the root keeps reporting `"built"`/`"failed"` precisely.
+///
+/// For any other name, this function has nothing but a NAME to go on, and
+/// [`find_archive`] globs the working directory for `<name>-*.cpkg` by
+/// `bf.rs::archive_name`'s convention. That glob is unsafe to report as
+/// `"built"`: the worker `chdir`s into the caller's own directory and
+/// nothing clears it between jobs, so a STALE archive left by an earlier,
+/// unrelated build of this same package is indistinguishable from one this
+/// run actually produced. Rebuild a two-package graph after touching only
+/// dependency `b`; if `a` is skipped this run, `a`'s archive from last time
+/// is still sitting right there, and a glob alone would happily report it
+/// `"built"` - a package manager claiming it built something it never
+/// touched. So a non-root match is reported `"unknown"` instead: honest
+/// about there being a candidate file, dishonest about nothing. A missing
+/// file is safe to call `"failed"` in either case, because
+/// `Workspace::persist`'s rename is atomic - a package that failed
+/// mid-build never leaves a partial archive behind - but that still
+/// conflates "failed" with "skipped" (a dependency of this package failed,
+/// so it was never attempted), because `Graph` gives this function no way
+/// to tell those two apart either. Exposing `Progression` (or an
+/// equivalent) from `graph.rs` - task 8's supervisor, not this one - would
+/// let a future task report both distinctions exactly instead of `Graph`'s
+/// public surface being all this function has.
 fn package_outcome(
     name: &str,
     root: &str,
@@ -526,16 +553,30 @@ fn package_outcome(
     cwd: Option<&Path>,
     error: Option<&str>,
 ) -> PackageOutcome {
-    let found = if name == root {
-        root_archive.map(Path::to_path_buf)
-    } else {
-        cwd.and_then(|dir| find_archive(dir, name))
-    };
+    if name == root {
+        return match root_archive {
+            Some(archive) => PackageOutcome {
+                name: sanitise(name, NAME_CAP),
+                outcome: "built".to_owned(),
+                archive: sanitise(&archive.display().to_string(), ARCHIVE_CAP),
+                error: String::new(),
+            },
+            None => PackageOutcome {
+                name: sanitise(name, NAME_CAP),
+                outcome: "failed".to_owned(),
+                archive: String::new(),
+                error: sanitise(error.unwrap_or_default(), ERROR_CAP),
+            },
+        };
+    }
 
-    match found {
+    match cwd.and_then(|dir| find_archive(dir, name)) {
+        // Found by globbing, not by being handed the path: see this
+        // function's docs for why that can be a stale file from an earlier
+        // run rather than proof this run built anything.
         Some(archive) => PackageOutcome {
             name: sanitise(name, NAME_CAP),
-            outcome: "built".to_owned(),
+            outcome: "unknown".to_owned(),
             archive: sanitise(&archive.display().to_string(), ARCHIVE_CAP),
             error: String::new(),
         },
@@ -550,8 +591,11 @@ fn package_outcome(
 
 /// Best-effort lookup of the `.cpkg` a package named `name` would have
 /// produced in `dir`, by the naming convention `bf.rs::archive_name` uses:
-/// `<name>-<version>.cpkg`. See [`package_outcome`] for why this reads the
-/// directory itself instead of asking `Graph`.
+/// `<name>-<version>.cpkg`.
+///
+/// A MATCH here is a candidate, not proof: nothing about a filename says
+/// which build run wrote it, so [`package_outcome`] never reports one of
+/// these as `"built"`. See that function's docs for why.
 fn find_archive(dir: &Path, name: &str) -> Option<PathBuf> {
     let prefix = format!("{name}-");
     read_dir(dir)

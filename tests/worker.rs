@@ -43,12 +43,23 @@ fn home_dir(work: &Path) -> std::path::PathBuf {
     work.join("home")
 }
 
-/// Writes `yaml` as a build file under `work`, signs it with a throwaway key,
-/// and trusts that key under [`home_dir`]'s config directory - the same
+/// Writes `yaml` as `work/build.yaml`, signs it with a throwaway key, and
+/// trusts that key - see [`write_signed_build_file_named`], which this
+/// just fixes the file name for.
+fn write_signed_build_file(work: &Path, yaml: &str) -> std::path::PathBuf {
+    write_signed_build_file_named(work, "build.yaml", yaml)
+}
+
+/// Writes `yaml` as `work/<name>`, signs it with a throwaway key, and
+/// trusts that key under [`home_dir`]'s config directory - the same
 /// layout `crate::signing::default_trust_dir` expects once the worker has
 /// set `HOME` to it.
-fn write_signed_build_file(work: &Path, yaml: &str) -> std::path::PathBuf {
-    let path = work.join("build.yaml");
+///
+/// A distinct name from [`write_signed_build_file`]'s fixed `build.yaml`
+/// matters once a test needs more than one build file in the same
+/// directory - a root and a dependency it names by path, say.
+fn write_signed_build_file_named(work: &Path, name: &str, yaml: &str) -> std::path::PathBuf {
+    let path = work.join(name);
     std::fs::write(&path, yaml).expect("write the build file");
 
     let config = home_dir(work).join(".config").join("pm");
@@ -454,4 +465,111 @@ fn read_frame_on_a_truncated_stream_errors_rather_than_hangs() {
 
     writer_thread.join().expect("the writer thread panicked");
     reader_thread.join().expect("the reader thread panicked");
+}
+
+#[test]
+fn a_stale_archive_from_an_earlier_run_is_never_reported_built() {
+    // The exact false positive a reviewer found in `package_outcome`: the
+    // worker chdirs into the caller's own directory and nothing cleans it
+    // between jobs, so a non-root package's archive from an EARLIER,
+    // unrelated run is still sitting there when this run's `find_archive`
+    // globs for one. Reproduced here with a two-package graph, `top`
+    // depending on `dep`: the first run builds both and leaves `dep-1.cpkg`
+    // behind; the second run breaks `dep`'s own step so `dep` fails (and
+    // `top`, whose dependency failed, is never attempted either), but
+    // `dep-1.cpkg` from the first run is untouched on disk. Before the fix,
+    // globbing for it reported `dep` "built" - a package manager claiming
+    // it built something this run never touched. After the fix it is
+    // "unknown": a candidate file exists, but nothing proves this run
+    // wrote it.
+    let work = tempdir().expect("work dir");
+    let home = home_dir(work.path());
+
+    write_signed_build_file_named(
+        work.path(),
+        "top.yaml",
+        "name: top\nversion:\n- '1'\ndependencies:\n- dep.yaml\nsteps:\n- stage: Build\n  \
+         dl_urls: null\n  name: noop\n  run:\n  - true\n",
+    );
+    write_signed_build_file_named(
+        work.path(),
+        "dep.yaml",
+        "name: dep\nversion:\n- '1'\ndependencies: []\nsteps:\n- stage: Build\n  dl_urls: \
+         null\n  name: noop\n  run:\n  - true\n",
+    );
+    let top_path = work.path().join("top.yaml");
+
+    let request = |target: &Path| WorkerRequest {
+        kind: JobKind::Build,
+        target: target.display().to_string(),
+        context: caller_context(work.path(), &home),
+        permissive: true,
+        unsandboxed: false,
+        jobs: None,
+        log_filter: "warn".to_owned(),
+    };
+
+    // First run: both packages build, and both archives land in `work`.
+    let (mut child, mut control) = spawn_worker(&request(&top_path));
+    let events = read_events(&mut control);
+    let status = child.wait().expect("wait for the worker process");
+    assert_worker_completed(&status, &events);
+    assert!(
+        work.path().join("dep-1.cpkg").is_file(),
+        "the first run must leave dep's archive behind for the second run to find stale"
+    );
+
+    // Second run: `dep`'s own step now fails, so `dep` never reaches
+    // packaging and `top` (whose only dependency just failed) is never
+    // attempted either. `dep`'s signature has to be redone: the content
+    // changed, and `BuildFile::load` verifies signatures before parsing.
+    write_signed_build_file_named(
+        work.path(),
+        "dep.yaml",
+        "name: dep\nversion:\n- '1'\ndependencies: []\nsteps:\n- stage: Build\n  dl_urls: \
+         null\n  name: noop\n  run:\n  - false\n",
+    );
+    let (mut child, mut control) = spawn_worker(&request(&top_path));
+    let events = read_events(&mut control);
+    let status = child.wait().expect("wait for the worker process");
+    assert_worker_completed(&status, &events);
+
+    let outcomes: Vec<&PackageOutcome> = events
+        .iter()
+        .filter_map(|(_, event)| match event {
+            WorkerEvent::PackageOutcome(outcome) => Some(outcome),
+            _ => None,
+        })
+        .collect();
+    let dep_outcome = outcomes
+        .iter()
+        .find(|outcome| outcome.name == "dep")
+        .unwrap_or_else(|| panic!("no PackageOutcome named \"dep\" in {outcomes:?}"));
+
+    assert_eq!(
+        dep_outcome.outcome, "unknown",
+        "dep's stale archive from the FIRST run must not be reported \"built\" for a run in \
+         which dep actually failed: got {dep_outcome:?}"
+    );
+    assert!(
+        !dep_outcome.archive.is_empty(),
+        "an \"unknown\" outcome still names the candidate file it found: {dep_outcome:?}"
+    );
+
+    // The root's own outcome is unaffected by any of this: it is handed
+    // `Graph::build`'s exact return value, never guessed at by globbing,
+    // so a real failure still reports "failed", not "unknown".
+    let top_outcome = outcomes
+        .iter()
+        .find(|outcome| outcome.name == "top")
+        .unwrap_or_else(|| panic!("no PackageOutcome named \"top\" in {outcomes:?}"));
+    assert_eq!(top_outcome.outcome, "failed");
+
+    match events.last().map(|(_, event)| event.clone()) {
+        Some(WorkerEvent::Completed {
+            archive: None,
+            diagnostic: Some(_),
+        }) => {}
+        other => panic!("expected the second run to fail overall, got {other:?}"),
+    }
 }
