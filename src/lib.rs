@@ -21,5 +21,8 @@ pub mod sandbox;
 pub mod signing;
 /// Individual build steps and their stages.
 pub mod step;
+/// Types and framing that cross the boundary between the daemon and its
+/// clients or its own worker.
+pub mod wire;
 /// RAII guards that auto-close build workspaces and sandboxed child processes.
 pub mod workspace;
