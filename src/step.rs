@@ -148,7 +148,13 @@ impl Step {
     /// file keeps its natural basename without ever colliding.
     fn download_dest(workdir: &Path, url: &Url) -> miette::Result<PathBuf> {
         let relative = Self::download_path(url)?;
-        let dir = workdir.join(Self::url_digest(url));
+        let dest = workdir.join(&relative);
+        let dir = dest.parent().ok_or_else(|| {
+            miette!(
+                "Cannot derive a download directory from destination `{}` for `{url}`",
+                dest.display()
+            )
+        })?;
         create_dir_all(&dir).map_err(|e| {
             miette!(
                 "Failed to create download directory `{}` for `{url}`: {e}",
@@ -156,7 +162,6 @@ impl Step {
             )
         })?;
 
-        let dest = workdir.join(relative);
         debug!(%url, dest = %dest.display(), "Download destination");
         Ok(dest)
     }
