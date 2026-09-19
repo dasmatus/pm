@@ -415,6 +415,18 @@ fn two_downloads_sharing_a_basename_both_land() {
         .execute(&host_sandbox(work.path(), dest.path()), work.path())
         .expect("both downloads must succeed");
 
+    for (path, payload) in [
+        ("/one/source.tar.gz", "first payload"),
+        ("/two/source.tar.gz", "second payload"),
+    ] {
+        let relative = Step::download_path(&server.url(path)).expect("public source path");
+        assert!(relative.is_relative());
+        assert_eq!(
+            read_to_string(work.path().join(relative)).expect("download at the advertised path"),
+            payload
+        );
+    }
+
     let landed: Vec<String> = read_dir(work.path())
         .expect("read the work directory")
         .filter_map(|entry| {
@@ -429,6 +441,19 @@ fn two_downloads_sharing_a_basename_both_land() {
         2,
         "both downloads must survive; one overwrote the other"
     );
+}
+
+#[test]
+fn download_paths_are_pure_and_account_for_the_whole_url() {
+    let first = Url::parse("https://example.com/source.tar.gz?version=1").unwrap();
+    let second = Url::parse("https://example.com/source.tar.gz?version=2").unwrap();
+    let path = Step::download_path(&first).unwrap();
+    assert_eq!(path.file_name().unwrap(), "source.tar.gz");
+    assert_eq!(path, Step::download_path(&first).unwrap());
+    assert_ne!(path, Step::download_path(&second).unwrap());
+    assert_eq!(path.components().count(), 2);
+    assert!(Step::download_path(&Url::parse("https://example.com/").unwrap()).is_err());
+    assert!(Step::download_path(&Url::parse("mailto:user@example.com").unwrap()).is_err());
 }
 
 #[test]

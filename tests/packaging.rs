@@ -62,9 +62,13 @@ struct Built {
 
 /// Builds a package named `name` in a private directory and extracts it.
 fn build_and_extract(name: &str) -> Built {
+    build_and_extract_with_script(name, STAGE_SCRIPT)
+}
+
+fn build_and_extract_with_script(name: &str, script_contents: &str) -> Built {
     let work = tempdir().expect("work directory");
     let script = work.path().join("stage.sh");
-    write(&script, STAGE_SCRIPT).expect("write the staging script");
+    write(&script, script_contents).expect("write the staging script");
     let stage = format!("/bin/sh {}", script.display());
     let build_file = write_build_file(
         work.path().join("build.yaml"),
@@ -187,6 +191,53 @@ fn the_metadata_describes_the_package_it_was_built_from() {
     assert_eq!(
         entrypoint_of(&metadata, "usr/bin/mytool"),
         Some(&Type::Binary)
+    );
+    assert_eq!(
+        entrypoint_of(&metadata, "usr/lib/libfoo.so"),
+        Some(&Type::Library(LibraryType::Dynamic))
+    );
+    assert_eq!(
+        entrypoint_of(&metadata, "usr/lib/libbar.a"),
+        Some(&Type::Library(LibraryType::Static))
+    );
+}
+
+#[test]
+fn non_executable_assets_are_retained_but_not_entrypoints() {
+    let assets = [
+        "usr/share/applications/mytool.desktop",
+        "usr/lib/systemd/system/mytool.service",
+        "usr/share/icons/mytool.png",
+        "etc/mytool.conf",
+        "usr/include/mytool.h",
+        "usr/share/mytool/LICENSE",
+    ];
+    let mut script = STAGE_SCRIPT.to_owned();
+    for asset in assets {
+        let parent = Path::new(asset).parent().expect("asset directory");
+        script.push_str(&format!(
+            "mkdir -p \"$DESTDIR/{}\"\nprintf 'asset payload\\n' > \"$DESTDIR/{asset}\"\nchmod 644 \"$DESTDIR/{asset}\"\n",
+            parent.display()
+        ));
+    }
+    let built = build_and_extract_with_script("assetcheck", &script);
+    let root = built.dest.path();
+    let metadata: Metadata =
+        from_str(&read_to_string(root.join("metadata")).expect("read metadata"))
+            .expect("metadata must be valid YAML");
+
+    for asset in assets {
+        assert_eq!(
+            read_to_string(root.join(asset)).expect("asset must remain in archive"),
+            "asset payload\n",
+            "{asset}"
+        );
+        assert_eq!(entrypoint_of(&metadata, asset), None, "{asset}");
+    }
+    assert_eq!(metadata.entrypoints().len(), 3);
+    assert_eq!(
+        metadata.binaries().collect::<Vec<_>>(),
+        [Path::new("usr/bin/mytool")]
     );
     assert_eq!(
         entrypoint_of(&metadata, "usr/lib/libfoo.so"),
