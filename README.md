@@ -124,3 +124,8 @@ Sandbox-specific ignored tests:
 cargo test --all-features --test sandbox -- --ignored
 cargo test --all-features --test landlock -- --ignored
 ```
+
+These are Linux-only confinement checks and require kernel support for Landlock
+plus unprivileged user namespaces; on environments without that support, use the
+default test suite as the baseline and run these where those features are
+available.
