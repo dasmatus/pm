@@ -147,6 +147,7 @@ impl Step {
     /// therefore gets its own subdirectory, named from a digest of the full URL, so the
     /// file keeps its natural basename without ever colliding.
     fn download_dest(workdir: &Path, url: &Url) -> miette::Result<PathBuf> {
+        let relative = Self::download_path(url)?;
         let dir = workdir.join(Self::url_digest(url));
         create_dir_all(&dir).map_err(|e| {
             miette!(
@@ -155,9 +156,24 @@ impl Step {
             )
         })?;
 
-        let dest = dir.join(Self::download_file_name(url)?);
+        let dest = workdir.join(relative);
         debug!(%url, dest = %dest.display(), "Download destination");
         Ok(dest)
+    }
+
+    /// The path of a verified download, relative to the build working directory.
+    ///
+    /// This is the same path used by [`Self::execute`], without downloading anything
+    /// or creating directories. Recipe generators should query it rather than
+    /// reproduce pm's URL hashing algorithm. Inside the build jail, join it onto
+    /// [`crate::sandbox::CONTAINER_WORKDIR`]; for an unconfined build, join it onto
+    /// that build's host working directory.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the URL has no usable file name.
+    pub fn download_path(url: &Url) -> miette::Result<PathBuf> {
+        Ok(PathBuf::from(Self::url_digest(url)).join(Self::download_file_name(url)?))
     }
 
     /// A short, stable hex digest of a URL string.

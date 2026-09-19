@@ -2,7 +2,8 @@
 //! the YAML representation that ends up inside every archive.
 
 use std::collections::HashMap;
-use std::fs::{create_dir, write};
+use std::fs::{Permissions as FsPermissions, create_dir, set_permissions, write};
+use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
 
 use pm::metadata::{LibraryType, Metadata, Type};
@@ -10,12 +11,12 @@ use pm::perms::{Enforcement, Grant, Permission, Permissions, Provenance};
 use serde_yaml::{from_str, to_string};
 use tempfile::{TempDir, tempdir};
 
-/// Creates a real regular file with the given name and returns it together with
-/// the directory guard that owns it.
+/// Creates a non-executable regular file and returns it with its directory guard.
 fn file_named(name: &str) -> (TempDir, PathBuf) {
     let dir = tempdir().expect("temporary directory");
     let path = dir.path().join(name);
     write(&path, b"\x7fELF not really, but a real regular file").expect("write the file");
+    set_permissions(&path, FsPermissions::from_mode(0o644)).expect("set file permissions");
     (dir, path)
 }
 
@@ -62,26 +63,90 @@ fn classify_recognises_a_static_library() {
 }
 
 #[test]
-fn classify_of_an_extensionless_file_is_a_binary() {
+fn classify_of_an_extensionless_executable_is_a_binary() {
     // This is the case that used to panic on `extension().unwrap()`.
     let (_dir, path) = file_named("mytool");
 
+    for mode in [0o100, 0o010, 0o001, 0o755] {
+        set_permissions(&path, FsPermissions::from_mode(mode)).expect("set execute bits");
+        assert_eq!(Metadata::classify(&path), Some(Type::Binary), "{mode:o}");
+    }
+}
+
+#[test]
+fn classify_of_a_non_executable_extensionless_file_is_none() {
+    let (_dir, path) = file_named("mytool");
+
+    assert_eq!(Metadata::classify(&path), None);
+}
+
+#[test]
+fn classify_of_non_executable_assets_is_none() {
+    for name in [
+        "app.desktop",
+        "app.service",
+        "icon.png",
+        "data.conf",
+        "api.h",
+    ] {
+        let (_dir, path) = file_named(name);
+        assert_eq!(Metadata::classify(&path), None, "{name}");
+    }
+}
+
+#[test]
+fn classify_of_a_script_requires_execute_bits() {
+    let (_dir, path) = file_named("run.sh");
+    write(&path, "#!/bin/sh\nexit 0\n").expect("write script");
+    assert_eq!(Metadata::classify(&path), None);
+
+    set_permissions(&path, FsPermissions::from_mode(0o755)).expect("make script executable");
     assert_eq!(Metadata::classify(&path), Some(Type::Binary));
 }
 
 #[test]
-fn classify_of_a_file_with_an_unrelated_extension_is_a_binary() {
-    let (_dir, path) = file_named("data.conf");
-
-    assert_eq!(Metadata::classify(&path), Some(Type::Binary));
-}
-
-#[test]
-fn classify_of_a_dotfile_is_a_binary() {
+fn classify_of_a_non_executable_dotfile_is_none() {
     // A leading dot is not an extension, and must not be mistaken for one.
     let (_dir, path) = file_named(".keep");
 
-    assert_eq!(Metadata::classify(&path), Some(Type::Binary));
+    assert_eq!(Metadata::classify(&path), None);
+}
+
+#[test]
+fn classify_follows_symlink_target_permissions() {
+    let (dir, target) = file_named("mytool");
+    let link = dir.path().join("alias");
+    symlink("mytool", &link).expect("create symlink");
+
+    assert_eq!(Metadata::classify(&link), None);
+    set_permissions(&target, FsPermissions::from_mode(0o755)).expect("make target executable");
+    assert_eq!(Metadata::classify(&link), Some(Type::Binary));
+    set_permissions(&target, FsPermissions::from_mode(0o644)).expect("remove execute bits");
+    assert_eq!(Metadata::classify(&link), None);
+}
+
+#[test]
+fn classify_of_a_library_symlink_uses_its_name_without_execute_bits() {
+    let (dir, _target) = file_named("payload");
+    for (name, kind) in [
+        ("libfoo.so", LibraryType::Dynamic),
+        ("libfoo.so.1.2", LibraryType::Dynamic),
+        ("libfoo.a", LibraryType::Static),
+    ] {
+        let link = dir.path().join(name);
+        symlink("payload", &link).expect("create library symlink");
+        assert_eq!(Metadata::classify(&link), Some(Type::Library(kind)));
+    }
+}
+
+#[test]
+fn classify_of_dangling_and_directory_symlinks_is_none() {
+    let dir = tempdir().expect("temporary directory");
+    for (name, target) in [("libmissing.so", "missing"), ("libdir.a", ".")] {
+        let link = dir.path().join(name);
+        symlink(target, &link).expect("create symlink");
+        assert_eq!(Metadata::classify(&link), None, "{name}");
+    }
 }
 
 #[test]

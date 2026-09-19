@@ -7,6 +7,7 @@
 
 use std::{
     collections::HashMap,
+    os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     sync::LazyLock,
 };
@@ -197,13 +198,15 @@ impl Metadata {
     ///
     /// Returns [`None`] for anything that is not a regular file, which includes
     /// directories and symlinks pointing at directories, as well as paths that
-    /// cannot be stat'ed at all (dangling symlinks, missing files).
+    /// cannot be stat'ed at all (dangling symlinks, missing files). Symlinks are
+    /// followed for file type and permissions; classification uses the link's name.
     ///
     /// A regular file is a [`LibraryType::Dynamic`] library if its name ends in
     /// `.so` or carries a versioned soname suffix such as `.so.1.2.3`, a
-    /// [`LibraryType::Static`] library if it ends in `.a`, and a [`Type::Binary`]
-    /// otherwise. A file with no extension at all — the usual shape of `bin/mytool`
-    /// — is a binary.
+    /// [`LibraryType::Static`] library if it ends in `.a`, regardless of permissions.
+    /// Other regular files, including extensionless files and scripts, are
+    /// [`Type::Binary`] only when at least one Unix execute bit is set. Otherwise
+    /// they are payload, not entrypoints, and return [`None`].
     pub fn classify(path: &Path) -> Option<Type> {
         let metadata = match std::fs::metadata(path) {
             Ok(metadata) => metadata,
@@ -222,11 +225,15 @@ impl Metadata {
         // neither of those can be a regular file, so this is unreachable in practice
         // — but it stays a `?` rather than an unwrap.
         let name = path.file_name()?.to_string_lossy();
-        Some(classify_name(&name))
+        let kind = classify_name(&name);
+        if kind == Type::Binary && metadata.permissions().mode() & 0o111 == 0 {
+            return None;
+        }
+        Some(kind)
     }
 }
 
-/// Classify a file by name alone, once it is known to be a regular file.
+/// Recognise libraries by name; other regular files still need an execute-bit check.
 ///
 /// Split out from [`Metadata::classify`] because [`Path::extension`] is the wrong
 /// tool here: for `libfoo.so.1.2.3` it answers `"3"`.

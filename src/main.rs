@@ -5,15 +5,18 @@ use pm::{
     metadata::Metadata,
     perms::Enforcement,
     plugin::{Loader, Registry, Trust, default_plugin_dir},
-    policy::{BuildPolicy, UNMATCHED},
+    policy::{BuildPolicy, Capability, UNMATCHED},
     progress::Progress,
     run::PackageRunner,
+    sandbox::CONTAINER_WORKDIR,
     signing::{
         Signature, SigningKey, TrustStore, default_key_path, default_trust_dir, sign_file,
         verify_file,
     },
+    step::Step,
     workspace::Workspace,
 };
+use serde::Serialize;
 use serde_yaml::{Value, from_str, to_string, to_value};
 use std::{
     ffi::OsString,
@@ -25,6 +28,7 @@ use std::{
 };
 use tracing::{info, warn};
 use tracing_subscriber::fmt;
+use url::Url;
 
 /// Width the labels of the key/value blocks are padded to, so their values
 /// line up under each other.
@@ -136,6 +140,12 @@ impl PluginArgs {
     }
 }
 
+#[derive(clap::ValueEnum, Clone, Copy, PartialEq, Eq)]
+enum ExplainFormat {
+    Text,
+    Yaml,
+}
+
 #[derive(Subcommand)]
 enum Commands {
     /// Build and package the project described by a build file.
@@ -179,6 +189,17 @@ enum Commands {
         /// The table is printed in full and the exit status is still non-zero.
         #[arg(long)]
         permissive: bool,
+        /// Output format; YAML is a versioned interface for automated policy gates.
+        #[arg(long, value_enum, default_value_t = ExplainFormat::Text)]
+        format: ExplainFormat,
+    },
+    /// Print where a source URL will be downloaded, without fetching it.
+    SourcePath {
+        /// The same URL as the recipe's dl_urls key.
+        url: Url,
+        /// Print a path relative to the build working directory instead of /build.
+        #[arg(long)]
+        relative: bool,
     },
     /// Write an example build file to the given path.
     Generate {
@@ -384,8 +405,21 @@ fn main() -> miette::Result<()> {
             &plugin_args.load()?,
             &progress,
         )?,
-        Commands::Explain { file, permissive } => {
-            explain(&file, permissive, &plugin_args.load()?)?;
+        Commands::Explain {
+            file,
+            permissive,
+            format,
+        } => {
+            explain(&file, permissive, format, &plugin_args.load()?)?;
+        }
+        Commands::SourcePath { url, relative } => {
+            let path = Step::download_path(&url)?;
+            let path = if relative {
+                path
+            } else {
+                Path::new(CONTAINER_WORKDIR).join(path)
+            };
+            println!("{}", path.display());
         }
         Commands::Plugins { digests } => list_plugins(&plugin_args.load()?, digests)?,
         Commands::Generate { file, force } => generate(&file, force)?,
@@ -694,7 +728,12 @@ fn run_build(
 /// Fails if the build file is missing or unparseable, and - after printing the
 /// whole table - if any command matched no fingerprint, so that the subcommand
 /// works as a lint.
-fn explain(file: &Path, permissive: bool, plugins: &Registry) -> miette::Result<()> {
+fn explain(
+    file: &Path,
+    permissive: bool,
+    format: ExplainFormat,
+    plugins: &Registry,
+) -> miette::Result<()> {
     if !file.exists() {
         return Err(miette!("The path {} does not exist.", file.display()));
     }
@@ -712,6 +751,44 @@ fn explain(file: &Path, permissive: bool, plugins: &Registry) -> miette::Result<
             )
         })?;
 
+    if format == ExplainFormat::Yaml {
+        explain_yaml(&build_file, &policy, &symbols, plugins)?;
+    } else {
+        explain_text(file, &build_file, &policy, &symbols, plugins);
+    }
+
+    let unmatched = policy
+        .matches()
+        .iter()
+        .filter(|(_, fingerprint)| *fingerprint == UNMATCHED)
+        .count();
+    if unmatched > 0 {
+        return Err(miette!(
+            help = "A command needs a fingerprint before the sandbox can grant it \
+                    anything. Rewrite it to use a program the table knows, or run \
+                    `pm build --permissive` and accept that those commands get no \
+                    capabilities at all.",
+            "{unmatched} {} in {} {} no built-in fingerprint.",
+            if unmatched == 1 {
+                "command"
+            } else {
+                "commands"
+            },
+            file.display(),
+            if unmatched == 1 { "matches" } else { "match" }
+        ));
+    }
+
+    Ok(())
+}
+
+fn explain_text(
+    file: &Path,
+    build_file: &BuildFile,
+    policy: &BuildPolicy,
+    symbols: &std::collections::BTreeSet<String>,
+    plugins: &Registry,
+) {
     let capabilities = if policy.capabilities().is_empty() {
         "none".to_owned()
     } else {
@@ -750,7 +827,7 @@ fn explain(file: &Path, permissive: bool, plugins: &Registry) -> miette::Result<
     if !symbols.is_empty() {
         println!();
         println!("{:<SYMBOL_WIDTH$}VALUE", "SYMBOL");
-        for reference in &symbols {
+        for reference in symbols {
             // Every reference in the set resolved, or `expand` would have failed, so a
             // plugin that no longer offers one is not a case that can arrive here.
             let value = reference
@@ -764,7 +841,7 @@ fn explain(file: &Path, permissive: bool, plugins: &Registry) -> miette::Result<
 
     if policy.matches().is_empty() {
         println!("This build file runs no commands.");
-        return Ok(());
+        return;
     }
 
     // Fold rather than `max()` so there is no `Option` to unwrap, and start
@@ -782,29 +859,110 @@ fn explain(file: &Path, permissive: bool, plugins: &Registry) -> miette::Result<
         println!("{command:<width$}  {fingerprint}");
     }
 
-    let unmatched = policy
-        .matches()
-        .iter()
-        .filter(|(_, fingerprint)| *fingerprint == UNMATCHED)
-        .count();
-    if unmatched > 0 {
+    if policy.matches().iter().any(|(_, name)| *name == UNMATCHED) {
         println!();
-        return Err(miette!(
-            help = "A command needs a fingerprint before the sandbox can grant it \
-                    anything. Rewrite it to use a program the table knows, or run \
-                    `pm build --permissive` and accept that those commands get no \
-                    capabilities at all.",
-            "{unmatched} {} in {} {} no built-in fingerprint.",
-            if unmatched == 1 {
-                "command"
-            } else {
-                "commands"
-            },
-            file.display(),
-            if unmatched == 1 { "matches" } else { "match" }
-        ));
     }
+}
 
+/// Versioned, deterministic data for recipe generators and policy gates. Do not
+/// serialise private implementation structs: their layout is not a CLI contract.
+#[derive(Serialize)]
+struct ExplainReport<'a> {
+    schema_version: u32,
+    name: &'a str,
+    version: &'a [String],
+    dependencies: Vec<&'a Path>,
+    fingerprint: &'a str,
+    capabilities: &'a [Capability],
+    commands: Vec<ExplainedCommand<'a>>,
+    plugins: Vec<ExplainedPlugin<'a>>,
+    symbols: std::collections::BTreeMap<&'a str, &'a str>,
+    downloads: Vec<ExplainedDownload<'a>>,
+}
+
+#[derive(Serialize)]
+struct ExplainedCommand<'a> {
+    command: &'a str,
+    fingerprint: &'a str,
+    matched: bool,
+}
+
+#[derive(Serialize)]
+struct ExplainedPlugin<'a> {
+    name: &'a str,
+    version: &'a str,
+    sha256: &'a str,
+    trust: String,
+}
+
+#[derive(Serialize)]
+struct ExplainedDownload<'a> {
+    step: &'a str,
+    url: &'a Url,
+    sha256: &'a str,
+    path: PathBuf,
+}
+
+fn explain_yaml(
+    build_file: &BuildFile,
+    policy: &BuildPolicy,
+    symbols: &std::collections::BTreeSet<String>,
+    plugins: &Registry,
+) -> miette::Result<()> {
+    let mut downloads = Vec::new();
+    for step in build_file.steps() {
+        if let Some(urls) = &step.dl_urls {
+            let mut urls: Vec<_> = urls.iter().collect();
+            urls.sort_unstable_by(|(a, _), (b, _)| a.as_str().cmp(b.as_str()));
+            for (url, sha256) in urls {
+                downloads.push(ExplainedDownload {
+                    step: &step.name,
+                    url,
+                    sha256,
+                    path: Path::new(CONTAINER_WORKDIR).join(Step::download_path(url)?),
+                });
+            }
+        }
+    }
+    let report = ExplainReport {
+        schema_version: 1,
+        name: build_file.name(),
+        version: build_file.version(),
+        dependencies: build_file.dependencies().collect(),
+        fingerprint: policy.fingerprint(),
+        capabilities: policy.capabilities(),
+        commands: policy
+            .matches()
+            .iter()
+            .map(|(command, fingerprint)| ExplainedCommand {
+                command,
+                fingerprint,
+                matched: *fingerprint != UNMATCHED,
+            })
+            .collect(),
+        plugins: plugins
+            .plugins()
+            .iter()
+            .map(|plugin| ExplainedPlugin {
+                name: &plugin.manifest().name,
+                version: &plugin.manifest().version,
+                sha256: plugin.sha256(),
+                trust: plugin.trust().to_string(),
+            })
+            .collect(),
+        symbols: symbols
+            .iter()
+            .filter_map(|reference| {
+                let (plugin, name) = reference.split_once(':')?;
+                Some((
+                    reference.as_str(),
+                    plugins.symbol(plugin, name)?.value.as_str(),
+                ))
+            })
+            .collect(),
+        downloads,
+    };
+    print!("{}", to_string(&report).into_diagnostic()?);
     Ok(())
 }
 
