@@ -17,6 +17,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::sync::{Mutex, MutexGuard};
 
+use miette::Context as _;
 use pm::bf::{BuildFile, BuildOptions};
 use pm::run::PackageRunner;
 use pm::signing::{SigningKey, TrustStore, sign_file};
@@ -181,7 +182,7 @@ struct BuildSpec {
 /// in a command string. The staging goes into a script file invoked as
 /// `/bin/sh <script>` - two plain words - and the shell interpreting the script
 /// expands `$DESTDIR` from the environment `Step` set for it.
-fn package_staging(name: &str, script: &str) -> (tempfile::TempDir, PathBuf) {
+fn package_staging(name: &str, script: &str) -> miette::Result<(tempfile::TempDir, PathBuf)> {
     let work = tempdir().expect("work directory");
     let stage = work.path().join("stage.sh");
     write(&stage, script).expect("write the staging script");
@@ -205,7 +206,7 @@ fn package_staging(name: &str, script: &str) -> (tempfile::TempDir, PathBuf) {
     )
     .expect("write the build file");
 
-    let build = BuildFile::load_unverified(&build_file).expect("load the build file");
+    let build = BuildFile::load_unverified(&build_file).context("load the build file")?;
     let archive = {
         let _cwd = CwdGuard::enter(work.path());
         let produced = build
@@ -216,7 +217,7 @@ fn package_staging(name: &str, script: &str) -> (tempfile::TempDir, PathBuf) {
                 unsandboxed: true,
                 ..BuildOptions::default()
             })
-            .expect("the build must succeed");
+            .context("the build must succeed")?;
         if produced.is_absolute() {
             produced
         } else {
@@ -225,7 +226,7 @@ fn package_staging(name: &str, script: &str) -> (tempfile::TempDir, PathBuf) {
     };
 
     sign(&archive, work.path());
-    (work, archive)
+    Ok((work, archive))
 }
 
 /// Config directory holding the signing key and the trust store for a test
@@ -257,7 +258,7 @@ fn sign(archive: &Path, work: &Path) {
 }
 
 /// Builds a package that stages a copy of `/bin/true` as `usr/bin/hello`.
-fn package_with_a_runnable_binary(name: &str) -> (tempfile::TempDir, PathBuf) {
+fn package_with_a_runnable_binary(name: &str) -> miette::Result<(tempfile::TempDir, PathBuf)> {
     package_staging(
         name,
         "set -eu\n\
@@ -269,7 +270,7 @@ chmod 755 \"$DESTDIR/usr/bin/hello\"\n",
 
 /// Builds a package exposing three binaries, deliberately named so that their
 /// creation order is not their sorted order.
-fn package_with_three_binaries(name: &str) -> (tempfile::TempDir, PathBuf) {
+fn package_with_three_binaries(name: &str) -> miette::Result<(tempfile::TempDir, PathBuf)> {
     package_staging(
         name,
         "set -eu\n\
@@ -284,7 +285,8 @@ chmod 755 \"$DESTDIR/usr/bin/zulu\" \"$DESTDIR/usr/bin/alpha\" \"$DESTDIR/usr/bi
 #[test]
 #[ignore = "requires unprivileged user namespaces; run with `cargo test --test sandbox -- --ignored`"]
 fn a_packaged_binary_runs_to_completion_inside_the_sandbox() {
-    let (_work, archive) = package_with_a_runnable_binary("sandboxrun");
+    let (_work, archive) =
+        package_with_a_runnable_binary("sandboxrun").expect("build the test package");
 
     let status = PackageRunner::new(archive)
         .trust_dir(trust_dir(_work.path()))
@@ -302,7 +304,8 @@ fn a_packaged_binary_runs_to_completion_inside_the_sandbox() {
 #[test]
 #[ignore = "requires unprivileged user namespaces; run with `cargo test --test sandbox -- --ignored`"]
 fn asking_for_a_binary_the_package_does_not_have_is_an_error() {
-    let (_work, archive) = package_with_a_runnable_binary("sandboxmissing");
+    let (_work, archive) =
+        package_with_a_runnable_binary("sandboxmissing").expect("build the test package");
 
     assert!(
         PackageRunner::new(archive)
@@ -350,7 +353,8 @@ fn a_package_with_no_binaries_says_so_instead_of_prompting() {
         "set -eu\n\
 mkdir -p \"$DESTDIR/usr/lib\"\n\
 printf 'stand-in for a shared object\\n' > \"$DESTDIR/usr/lib/libonly.so\"\n",
-    );
+    )
+    .expect("build the test package");
 
     let error = PackageRunner::new(archive)
         .trust_dir(trust_dir(_work.path()))
@@ -370,7 +374,8 @@ printf 'stand-in for a shared object\\n' > \"$DESTDIR/usr/lib/libonly.so\"\n",
 
 #[test]
 fn an_unknown_bin_lists_the_available_binaries_in_sorted_order() {
-    let (_work, archive) = package_with_three_binaries("listing");
+    let (_work, archive) =
+        package_with_three_binaries("listing").expect("build the test package");
     let mut runner = PackageRunner::new(archive);
     runner.trust_dir(trust_dir(_work.path()));
 
@@ -404,7 +409,8 @@ fn an_unknown_bin_lists_the_available_binaries_in_sorted_order() {
 
 #[test]
 fn without_a_terminal_and_without_a_bin_the_cli_lists_what_it_could_have_run() {
-    let (_work, archive) = package_with_three_binaries("noprompt");
+    let (_work, archive) =
+        package_with_three_binaries("noprompt").expect("build the test package");
 
     // The library call would prompt when the test happens to be run from a
     // terminal, so this goes through the binary with stdin closed instead -
@@ -613,7 +619,8 @@ fn an_escaping_entrypoint_is_never_offered_in_the_listing() {
 
 #[test]
 fn an_unsigned_package_is_refused_before_it_is_extracted() {
-    let (work, archive) = package_with_a_runnable_binary("unsigned");
+    let (work, archive) =
+        package_with_a_runnable_binary("unsigned").expect("build the test package");
     let signature = PathBuf::from(format!("{}.sig", archive.display()));
     std::fs::remove_file(&signature).expect("drop the signature");
 
@@ -631,7 +638,8 @@ fn an_unsigned_package_is_refused_before_it_is_extracted() {
 
 #[test]
 fn a_package_signed_by_an_untrusted_key_is_refused() {
-    let (work, archive) = package_with_a_runnable_binary("untrusted");
+    let (work, archive) =
+        package_with_a_runnable_binary("untrusted").expect("build the test package");
     let empty = work.path().join("nobody-trusted");
 
     assert!(
@@ -646,7 +654,8 @@ fn a_package_signed_by_an_untrusted_key_is_refused() {
 #[test]
 #[ignore = "requires unprivileged user namespaces; run with `cargo test --test sandbox -- --ignored`"]
 fn allow_unsigned_is_the_documented_escape_hatch() {
-    let (work, archive) = package_with_a_runnable_binary("optout");
+    let (work, archive) =
+        package_with_a_runnable_binary("optout").expect("build the test package");
     let signature = PathBuf::from(format!("{}.sig", archive.display()));
     std::fs::remove_file(&signature).expect("drop the signature");
 

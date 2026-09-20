@@ -328,7 +328,12 @@ fn a_build_whose_step_fails_does_not_leave_an_archive_behind() {
 
     let _cwd = CwdGuard::enter(work.path());
     assert!(
-        build.run().is_err(),
+        build
+            .run_with(BuildOptions {
+                unsandboxed: true,
+                ..BuildOptions::default()
+            })
+            .is_err(),
         "a failing build step must fail the build"
     );
     assert!(
@@ -620,7 +625,7 @@ fn a_build_reporting_into_a_region_still_produces_its_archive() {
     let build = BuildFile::load_unverified(&build_file).expect("the build file must load");
 
     // A region that renders for real, into nothing. This is the whole stack:
-    // a package line, a jailed command under it whose stdout is captured and
+    // a package line, a build command under it whose stdout is captured and
     // streamed into that line, and the archive at the end of it.
     let progress = Progress::to_writer(Box::new(std::io::sink()), 100);
 
