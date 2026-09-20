@@ -374,8 +374,7 @@ printf 'stand-in for a shared object\\n' > \"$DESTDIR/usr/lib/libonly.so\"\n",
 
 #[test]
 fn an_unknown_bin_lists_the_available_binaries_in_sorted_order() {
-    let (_work, archive) =
-        package_with_three_binaries("listing").expect("build the test package");
+    let (_work, archive) = package_with_three_binaries("listing").expect("build the test package");
     let mut runner = PackageRunner::new(archive);
     runner.trust_dir(trust_dir(_work.path()));
 
@@ -409,8 +408,7 @@ fn an_unknown_bin_lists_the_available_binaries_in_sorted_order() {
 
 #[test]
 fn without_a_terminal_and_without_a_bin_the_cli_lists_what_it_could_have_run() {
-    let (_work, archive) =
-        package_with_three_binaries("noprompt").expect("build the test package");
+    let (_work, archive) = package_with_three_binaries("noprompt").expect("build the test package");
 
     // The library call would prompt when the test happens to be run from a
     // terminal, so this goes through the binary with stdin closed instead -
@@ -654,8 +652,7 @@ fn a_package_signed_by_an_untrusted_key_is_refused() {
 #[test]
 #[ignore = "requires unprivileged user namespaces; run with `cargo test --test sandbox -- --ignored`"]
 fn allow_unsigned_is_the_documented_escape_hatch() {
-    let (work, archive) =
-        package_with_a_runnable_binary("optout").expect("build the test package");
+    let (work, archive) = package_with_a_runnable_binary("optout").expect("build the test package");
     let signature = PathBuf::from(format!("{}.sig", archive.display()));
     std::fs::remove_file(&signature).expect("drop the signature");
 
