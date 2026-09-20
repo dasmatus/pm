@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::sync::{Mutex, MutexGuard};
 
-use pm::bf::BuildFile;
+use pm::bf::{BuildFile, BuildOptions};
 use pm::run::PackageRunner;
 use pm::signing::{SigningKey, TrustStore, sign_file};
 use pm::workspace::Workspace;
@@ -208,7 +208,15 @@ fn package_staging(name: &str, script: &str) -> (tempfile::TempDir, PathBuf) {
     let build = BuildFile::load_unverified(&build_file).expect("load the build file");
     let archive = {
         let _cwd = CwdGuard::enter(work.path());
-        let produced = build.run().expect("the build must succeed");
+        let produced = build
+            .run_with(BuildOptions {
+                // These tests exercise package signing, entrypoint selection and
+                // run-time sandboxing. The package build itself need not depend
+                // on the build jail starting successfully.
+                unsandboxed: true,
+                ..BuildOptions::default()
+            })
+            .expect("the build must succeed");
         if produced.is_absolute() {
             produced
         } else {
