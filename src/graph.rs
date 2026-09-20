@@ -7,37 +7,44 @@
 //! are questions about the *shape* of the graph, asked from inside the walk
 //! that is still discovering it.
 //!
-//! So the shape is settled first. [`Graph::resolve`] reads every build file
+//! So the shape is settled first. [`Graph::resolve`] reads every dependency
 //! reachable from the root, keyed by canonical path, and rejects a cycle, a
-//! missing build file, an unclassifiable command or two packages fighting over
-//! one archive name **before a single build step runs** - the same order
-//! [`crate::bf::BuildFile`] already used when it derived a policy before
-//! walking dependencies. A diamond becomes one node by construction, so the
-//! "build it once" rule stops being something the walk has to remember.
+//! missing build file or package archive, an unclassifiable command or two
+//! packages fighting over one archive name **before a single build step
+//! runs** - the same order [`crate::bf::BuildFile`] already used when it
+//! derived a policy before walking dependencies. A diamond becomes one node by
+//! construction, so the "build it once" rule stops being something the walk
+//! has to remember.
 
 use std::{
     any::Any,
     collections::HashMap,
+    fs::read_to_string,
     num::NonZeroUsize,
     panic::{AssertUnwindSafe, catch_unwind},
     path::{Path, PathBuf},
+    process::Command,
     sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError},
     thread::{available_parallelism, scope},
 };
 
 use miette::{IntoDiagnostic, WrapErr, miette};
+use serde_yaml::from_str;
 use tracing::{debug, info, warn};
 
 use crate::{
     bf::{BuildFile, BuildOptions, Verification},
     cancel::Cancel,
     context::BuildContext,
+    metadata::Metadata,
     plugin::Registry,
     policy::BuildPolicy,
     progress::{Progress, Task},
+    signing::{TrustStore, verify_file},
+    workspace::Workspace,
 };
 
-/// Every build file reachable from a root, resolved and checked.
+/// Every dependency reachable from a root, resolved and checked.
 ///
 /// Holding one of these is the statement that the graph is buildable: the
 /// checks that could reject it have already run.
@@ -51,13 +58,33 @@ pub struct Graph {
 
 /// One package in the graph.
 struct Node {
-    /// Canonical path of the build file. Two build files at one path are one
-    /// package, which is what makes a diamond a single node.
+    /// Canonical path of the thing this node came from: a build file or a
+    /// pre-built package archive. Two dependency declarations naming one path
+    /// are one node, which is what makes a diamond a single node.
     key: PathBuf,
-    build: BuildFile,
-    policy: BuildPolicy,
+    package: Package,
     /// Indices into [`Graph::nodes`].
     dependencies: Vec<usize>,
+}
+
+enum Package {
+    Build {
+        build: BuildFile,
+        policy: BuildPolicy,
+    },
+    Prebuilt {
+        archive: PathBuf,
+        metadata: Metadata,
+    },
+}
+
+impl Package {
+    fn name(&self) -> &str {
+        match self {
+            Self::Build { build, .. } => build.name(),
+            Self::Prebuilt { metadata, .. } => metadata.name(),
+        }
+    }
 }
 
 /// What every worker in one [`Graph::build_with`] call needs, and does not
@@ -89,10 +116,11 @@ impl Graph {
     /// # Errors
     ///
     /// Returns a diagnostic when a dependency path is not a build file or
-    /// cannot be canonicalised, when a build file cannot be loaded or
-    /// verified, when the dependencies close a cycle, when a build file's
-    /// commands cannot be classified, or when two packages in the graph would
-    /// be packaged to the same archive name.
+    /// package archive, or cannot be canonicalised; when a build file or
+    /// package archive cannot be loaded or verified; when the dependencies
+    /// close a cycle; when a build file's commands cannot be classified; or
+    /// when two build files in the graph would be packaged to the same archive
+    /// name.
     pub fn resolve(root: &BuildFile, options: BuildOptions<'_>) -> miette::Result<Self> {
         Self::resolve_in(&BuildContext::from_env()?, root, options)
     }
@@ -159,7 +187,7 @@ impl Graph {
     pub fn order(&self) -> impl Iterator<Item = &str> {
         self.order
             .iter()
-            .map(|index| self.nodes[*index].build.name())
+            .map(|index| self.nodes[*index].package.name())
     }
 
     /// Build every package in the graph, returning the root's archive.
@@ -307,19 +335,21 @@ impl Graph {
             // condvar nobody can notify, and `scope` would block joining them:
             // a hang instead of a failure. Sequentially a panic simply
             // propagated; making the walk concurrent is what introduced this.
-            let attempt = catch_unwind(AssertUnwindSafe(|| {
-                node.build
-                    .build_alone(run.ctx, run.options, &node.policy, run.progress, &archives)
+            let attempt = catch_unwind(AssertUnwindSafe(|| match &node.package {
+                Package::Build { build, policy } => {
+                    build.build_alone(run.ctx, run.options, policy, run.progress, &archives)
+                }
+                Package::Prebuilt { archive, .. } => Ok(archive.clone()),
             }));
             let result = attempt
                 .unwrap_or_else(|panic| {
                     Err(miette!(
                         "the build of {} panicked: {}",
-                        node.build.name(),
+                        node.package.name(),
                         describe_panic(&panic)
                     ))
                 })
-                .wrap_err_with(|| format!("package {} failed", node.build.name()));
+                .wrap_err_with(|| format!("package {} failed", node.package.name()));
 
             let mut state = lock(schedule);
             state.settle(self, index, result);
@@ -392,7 +422,10 @@ impl Graph {
         let mut claimed: HashMap<String, &Path> = HashMap::new();
 
         for node in &self.nodes {
-            let archive = archive_name(&node.build);
+            let Package::Build { build, .. } = &node.package else {
+                continue;
+            };
+            let archive = archive_name(build);
             if let Some(first) = claimed.insert(archive.clone(), &node.key) {
                 return Err(miette!(
                     "two build files in this graph both package to `{archive}`: {} and {}; \
@@ -413,15 +446,15 @@ impl std::fmt::Debug for Graph {
     /// about the graph, so this prints the edges rather than deriving.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let mut listing = f.debug_struct("Graph");
-        listing.field("root", &self.nodes[self.root].build.name());
+        listing.field("root", &self.nodes[self.root].package.name());
         for index in &self.order {
             let node = &self.nodes[*index];
             let needs: Vec<&str> = node
                 .dependencies
                 .iter()
-                .map(|dependency| self.nodes[*dependency].build.name())
+                .map(|dependency| self.nodes[*dependency].package.name())
                 .collect();
-            listing.field(node.build.name(), &needs);
+            listing.field(node.package.name(), &needs);
         }
         listing.finish()
     }
@@ -495,8 +528,7 @@ impl Resolver<'_> {
         let index = self.nodes.len();
         self.nodes.push(Node {
             key: key.clone(),
-            build,
-            policy,
+            package: Package::Build { build, policy },
             dependencies,
         });
         self.order.push(index);
@@ -522,7 +554,7 @@ impl Resolver<'_> {
 
         if !resolved.is_file() {
             return Err(miette!(
-                "dependency of {parent} is not a build file: {}",
+                "dependency of {parent} is not a build file or package archive: {}",
                 dependency.display()
             ));
         }
@@ -542,6 +574,23 @@ impl Resolver<'_> {
             None => {}
         }
 
+        if is_package_archive(&key) {
+            let metadata = load_dependency_archive(self.ctx, self.verification, &key)
+                .wrap_err_with(|| format!("dependency {} failed", key.display()))?;
+            let index = self.nodes.len();
+            self.nodes.push(Node {
+                key: key.clone(),
+                package: Package::Prebuilt {
+                    archive: key.clone(),
+                    metadata,
+                },
+                dependencies: Vec::new(),
+            });
+            self.order.push(index);
+            self.state.insert(key, State::Resolved(index));
+            return Ok(index);
+        }
+
         // A dependency is loaded exactly as strictly as the root was:
         // signatures are checked all the way down, or not at all.
         let build = match self.verification {
@@ -552,6 +601,68 @@ impl Resolver<'_> {
 
         self.visit(key, build, stack)
     }
+}
+
+fn is_package_archive(path: &Path) -> bool {
+    path.extension()
+        .is_some_and(|extension| extension == "cpkg")
+}
+
+fn load_dependency_archive(
+    ctx: &BuildContext,
+    verification: Verification,
+    archive: &Path,
+) -> miette::Result<Metadata> {
+    if verification == Verification::Signed {
+        verify_package_archive(archive, &ctx.trust_dir)?;
+    }
+
+    let workspace = Workspace::new_in(ctx.scratch_root.as_deref(), "dependency-metadata")?;
+    extract_archive(archive, workspace.path())?;
+    let metadata_path = workspace.path().join("metadata");
+    let text = read_to_string(&metadata_path)
+        .into_diagnostic()
+        .wrap_err_with(|| {
+            format!(
+                "{} has no `metadata` member; it is not a pm package",
+                archive.display()
+            )
+        })?;
+    from_str(&text)
+        .into_diagnostic()
+        .wrap_err_with(|| format!("cannot parse the metadata of {}", archive.display()))
+}
+
+fn verify_package_archive(archive: &Path, trust_dir: &Path) -> miette::Result<()> {
+    let trust = TrustStore::load(trust_dir)?;
+    verify_file(archive, &trust).wrap_err_with(|| {
+        format!(
+            "refusing to read the package dependency {}: its signature did not check out",
+            archive.display()
+        )
+    })
+}
+
+fn extract_archive(archive: &Path, dest: &Path) -> miette::Result<()> {
+    let output = Command::new("tar")
+        .arg("-xpf")
+        .arg(archive)
+        .arg("-C")
+        .arg(dest)
+        .output()
+        .into_diagnostic()
+        .wrap_err("cannot run tar")?;
+
+    if !output.status.success() {
+        return Err(miette!(
+            "tar failed to extract {} into {} ({}): {}",
+            archive.display(),
+            dest.display(),
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(())
 }
 
 /// Render the cycle `visiting` closes when `key` is entered again.
@@ -629,27 +740,52 @@ impl Schedule {
             }
         }
 
+        let progression: Vec<Progression> = graph
+            .nodes
+            .iter()
+            .map(|node| match &node.package {
+                Package::Build { .. } => Progression::Waiting,
+                Package::Prebuilt { archive, .. } => Progression::Built(archive.clone()),
+            })
+            .collect();
         let blocked_by: Vec<usize> = graph
             .nodes
             .iter()
-            .map(|node| node.dependencies.len())
+            .map(|node| {
+                node.dependencies
+                    .iter()
+                    .filter(|dependency| {
+                        !matches!(progression[**dependency], Progression::Built(_))
+                    })
+                    .count()
+            })
             .collect();
-        // A package with no dependencies can start immediately.
+        // Only packages that still need building become ready.
         let ready = blocked_by
             .iter()
             .enumerate()
-            .filter(|(_, blocking)| **blocking == 0)
+            .filter(|(index, blocking)| {
+                **blocking == 0 && matches!(progression[*index], Progression::Waiting)
+            })
             .map(|(index, _)| index)
             .collect();
+        let done = progression
+            .iter()
+            .filter(|progression| matches!(progression, Progression::Built(_)))
+            .count();
+        let unsettled = progression
+            .iter()
+            .filter(|progression| !matches!(progression, Progression::Built(_)))
+            .count();
 
         Self {
             blocked_by,
             ready,
             dependents,
-            progression: (0..graph.len()).map(|_| Progression::Waiting).collect(),
-            unsettled: graph.len(),
+            progression,
+            unsettled,
             running: 0,
-            done: 0,
+            done,
             cancelled: false,
         }
     }
@@ -693,10 +829,13 @@ impl Schedule {
                 // whoever is reading the log looking for casualties there
                 // aren't any of.
                 if skipped == 0 {
-                    warn!(package = graph.nodes[index].build.name(), "package failed");
+                    warn!(
+                        package = graph.nodes[index].package.name(),
+                        "package failed"
+                    );
                 } else {
                     warn!(
-                        package = graph.nodes[index].build.name(),
+                        package = graph.nodes[index].package.name(),
                         skipped, "package failed; skipping what depends on it"
                     );
                 }
@@ -750,7 +889,7 @@ impl Schedule {
         let mut skipped = Vec::new();
 
         for (index, progression) in self.progression.iter().enumerate() {
-            let name = graph.nodes[index].build.name();
+            let name = graph.nodes[index].package.name();
             match progression {
                 Progression::Failed(report) => failures.push((name, render(report))),
                 Progression::Skipped | Progression::Waiting => skipped.push(name),
@@ -765,7 +904,7 @@ impl Schedule {
                 // be a build reporting success without an archive.
                 _ => Err(miette!(
                     "the build finished without producing an archive for {}",
-                    graph.nodes[graph.root].build.name()
+                    graph.nodes[graph.root].package.name()
                 )),
             };
         }

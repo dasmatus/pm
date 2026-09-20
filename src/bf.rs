@@ -14,6 +14,7 @@
 
 use std::{
     collections::{BTreeSet, HashMap},
+    ffi::OsString,
     fs::{copy, create_dir_all, read_to_string, write},
     iter::once,
     num::NonZeroUsize,
@@ -209,7 +210,8 @@ impl BuildFile {
     /// For tests and for debugging a build file that has not been signed yet.
     /// It is not a smaller version of [`BuildFile::load`]: nothing here
     /// establishes who wrote the commands that are about to run, and the
-    /// dependencies this build file pulls in are loaded the same way. Prefer
+    /// dependencies this build file pulls in - other build files and any
+    /// pre-built `.cpkg` archives it names - are loaded the same way. Prefer
     /// signing the file with `pm sign` and using [`BuildFile::load`].
     ///
     /// # Errors
@@ -329,7 +331,7 @@ impl BuildFile {
         self.verification
     }
 
-    /// Paths of the build files this package depends on.
+    /// Paths of the build files or pre-built package archives this package depends on.
     #[must_use]
     pub fn dependencies(&self) -> impl ExactSizeIterator<Item = &Path> {
         self.dependencies.iter().map(PathBuf::as_path)
@@ -511,12 +513,22 @@ impl BuildFile {
         create_dir_all(&workdir).into_diagnostic()?;
         create_dir_all(&deps).into_diagnostic()?;
 
+        let mut staged_names: HashMap<OsString, &Path> = HashMap::new();
         let dependency_entries = dependency_archives
             .iter()
             .map(|source| {
                 let name = source.file_name().ok_or_else(|| {
                     miette!("dependency archive has no file name: {}", source.display())
                 })?;
+                if let Some(first) = staged_names.insert(name.to_os_string(), source.as_path()) {
+                    return Err(miette!(
+                        "two dependencies of {} would both stage as `{}`: {} and {}",
+                        self.name,
+                        Path::new(name).display(),
+                        first.display(),
+                        source.display()
+                    ));
+                }
                 copy(source, deps.join(name))
                     .into_diagnostic()
                     .wrap_err_with(|| format!("cannot stage dependency {}", source.display()))?;
