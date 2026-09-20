@@ -1,0 +1,30 @@
+# A workspace of its own, separate from pm's.
+#
+# These crates compile to `wasm32-unknown-unknown`, not to the host, and nothing in pm
+# depends on them: pm loads the *components* they are encoded into, at run time, from a
+# directory. Keeping them out of pm's own build means `cargo build` at the repository
+# root never drags a second target down, and `cargo test` never waits on one.
+[workspace]
+resolver = "3"
+members = ["encoder", "unitfile", "fixtures/*", "systemd", "sysext", "sysupdate", "zig"]
+# `fixtures/wasi` is built for wasm32-wasip2 rather than wasm32-unknown-unknown; see
+# build.sh. It is a member like the rest so `cargo check` covers it.
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[workspace.dependencies]
+wit-bindgen = { version = "0.51.0", default-features = false, features = ["macros", "realloc"] }
+unitfile = { path = "unitfile" }
+
+# Plugins are compiled by wasmtime on every pm invocation that consults them, so size is
+# latency. These four settings keep the reference plugin in the tens of kilobytes rather
+# than the hundreds; `opt-level = "z"` alone roughly halves it.
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

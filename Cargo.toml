@@ -47,7 +47,16 @@ tree-sitter-python = "0.25.0"
 tree-sitter-rust = "0.24.2"
 url = { version = "2.5.8", features = ["serde"] }
 walkdir = "2.5.0"
+<<<<<<< HEAD
 zbus = { version = "5.19", default-features = false, features = ["async-io", "blocking-api", "p2p"] }
+=======
+wasmtime = { version = "47.0.4", default-features = false, features = [
+    "component-model",
+    "cranelift",
+    "runtime",
+    "std",
+] }
+>>>>>>> origin/master
 
 [dev-dependencies]
 divan = "0.1.21"

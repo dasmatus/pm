@@ -52,9 +52,28 @@ printf 'stand-in for an archive\\n' > \"$DESTDIR/usr/lib/libbar.a\"\n";
 /// already is too - unlike the process cwd this used to move to, there is no
 /// relative result to resolve.
 fn run_in(build: &BuildFile, at: &Path) -> PathBuf {
+<<<<<<< HEAD
     build
         .run_with_progress_in(&ctx_at(at), BuildOptions::default(), &Progress::disabled())
         .expect("the build must succeed")
+=======
+    let _cwd = CwdGuard::enter(at);
+    let produced = build
+        .run_with(BuildOptions {
+            // These tests exercise packaging, metadata and dependency bundling.
+            // The dedicated sandbox suites cover namespace-backed confinement.
+            unsandboxed: true,
+            ..BuildOptions::default()
+        })
+        .expect("the build must succeed");
+    // Resolve relative results while the current directory is still the one
+    // `run()` wrote into.
+    if produced.is_absolute() {
+        produced
+    } else {
+        current_dir().expect("a current directory").join(produced)
+    }
+>>>>>>> origin/master
 }
 
 /// A finished build: the archive, the directory it was extracted into, and the
@@ -67,9 +86,13 @@ struct Built {
 
 /// Builds a package named `name` in a private directory and extracts it.
 fn build_and_extract(name: &str) -> Built {
+    build_and_extract_with_script(name, STAGE_SCRIPT)
+}
+
+fn build_and_extract_with_script(name: &str, script_contents: &str) -> Built {
     let work = tempdir().expect("work directory");
     let script = work.path().join("stage.sh");
-    write(&script, STAGE_SCRIPT).expect("write the staging script");
+    write(&script, script_contents).expect("write the staging script");
     let stage = format!("/bin/sh {}", script.display());
     let build_file = write_build_file(
         work.path().join("build.yaml"),
@@ -204,6 +227,53 @@ fn the_metadata_describes_the_package_it_was_built_from() {
 }
 
 #[test]
+fn non_executable_assets_are_retained_but_not_entrypoints() {
+    let assets = [
+        "usr/share/applications/mytool.desktop",
+        "usr/lib/systemd/system/mytool.service",
+        "usr/share/icons/mytool.png",
+        "etc/mytool.conf",
+        "usr/include/mytool.h",
+        "usr/share/mytool/LICENSE",
+    ];
+    let mut script = STAGE_SCRIPT.to_owned();
+    for asset in assets {
+        let parent = Path::new(asset).parent().expect("asset directory");
+        script.push_str(&format!(
+            "mkdir -p \"$DESTDIR/{}\"\nprintf 'asset payload\\n' > \"$DESTDIR/{asset}\"\nchmod 644 \"$DESTDIR/{asset}\"\n",
+            parent.display()
+        ));
+    }
+    let built = build_and_extract_with_script("assetcheck", &script);
+    let root = built.dest.path();
+    let metadata: Metadata =
+        from_str(&read_to_string(root.join("metadata")).expect("read metadata"))
+            .expect("metadata must be valid YAML");
+
+    for asset in assets {
+        assert_eq!(
+            read_to_string(root.join(asset)).expect("asset must remain in archive"),
+            "asset payload\n",
+            "{asset}"
+        );
+        assert_eq!(entrypoint_of(&metadata, asset), None, "{asset}");
+    }
+    assert_eq!(metadata.entrypoints().len(), 3);
+    assert_eq!(
+        metadata.binaries().collect::<Vec<_>>(),
+        [Path::new("usr/bin/mytool")]
+    );
+    assert_eq!(
+        entrypoint_of(&metadata, "usr/lib/libfoo.so"),
+        Some(&Type::Library(LibraryType::Dynamic))
+    );
+    assert_eq!(
+        entrypoint_of(&metadata, "usr/lib/libbar.a"),
+        Some(&Type::Library(LibraryType::Static))
+    );
+}
+
+#[test]
 fn every_entrypoint_path_is_relative_to_the_package_root() {
     let built = build_and_extract("relcheck");
     let metadata: Metadata =
@@ -275,11 +345,18 @@ fn a_build_whose_step_fails_does_not_leave_an_archive_behind() {
 
     assert!(
         build
+<<<<<<< HEAD
             .run_with_progress_in(
                 &ctx_at(work.path()),
                 BuildOptions::default(),
                 &Progress::disabled()
             )
+=======
+            .run_with(BuildOptions {
+                unsandboxed: true,
+                ..BuildOptions::default()
+            })
+>>>>>>> origin/master
             .is_err(),
         "a failing build step must fail the build"
     );
@@ -577,13 +654,33 @@ fn a_build_reporting_into_a_region_still_produces_its_archive() {
     let build = BuildFile::load_unverified(&build_file).expect("the build file must load");
 
     // A region that renders for real, into nothing. This is the whole stack:
-    // a package line, a jailed command under it whose stdout is captured and
+    // a package line, a build command under it whose stdout is captured and
     // streamed into that line, and the archive at the end of it.
     let progress = Progress::to_writer(Box::new(std::io::sink()), 100);
 
+<<<<<<< HEAD
     let archive = build
         .run_with_progress_in(&ctx_at(work.path()), BuildOptions::default(), &progress)
         .expect("the build must succeed with a region attached");
+=======
+    let archive = {
+        let _cwd = CwdGuard::enter(work.path());
+        let produced = build
+            .run_with_progress(
+                BuildOptions {
+                    unsandboxed: true,
+                    ..BuildOptions::default()
+                },
+                &progress,
+            )
+            .expect("the build must succeed with a region attached");
+        if produced.is_absolute() {
+            produced
+        } else {
+            current_dir().expect("a current directory").join(produced)
+        }
+    };
+>>>>>>> origin/master
 
     assert!(
         archive.is_file(),

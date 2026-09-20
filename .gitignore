@@ -8,3 +8,9 @@
 *.cpkg
 *.sig
 examples/.demo-config
+
+# Built plugin components and the wasm workspace target directory.
+# `plugins/build.sh` regenerates both; the checked-in copies live in
+# tests/fixtures/plugins/.
+/plugins/target
+/plugins/dist

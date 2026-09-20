@@ -4,15 +4,19 @@ use pm::{
     bf::{BuildFile, BuildOptions},
     metadata::Metadata,
     perms::Enforcement,
-    policy::{BuildPolicy, UNMATCHED},
+    plugin::{Loader, Registry, Trust, default_plugin_dir},
+    policy::{BuildPolicy, Capability, UNMATCHED},
     progress::Progress,
     run::PackageRunner,
+    sandbox::CONTAINER_WORKDIR,
     signing::{
         Signature, SigningKey, TrustStore, default_key_path, default_trust_dir, sign_file,
         verify_file,
     },
+    step::Step,
     workspace::Workspace,
 };
+use serde::Serialize;
 use serde_yaml::{Value, from_str, to_string, to_value};
 use std::{
     ffi::OsString,
@@ -24,6 +28,7 @@ use std::{
 };
 use tracing::{info, warn};
 use tracing_subscriber::fmt;
+use url::Url;
 
 /// Width the labels of the key/value blocks are padded to, so their values
 /// line up under each other.
@@ -31,6 +36,12 @@ const LABEL_WIDTH: usize = 12;
 
 /// Header of the command column `pm explain` prints.
 const COMMAND_HEADER: &str = "COMMAND";
+
+/// Width the symbol column of `pm explain` is padded to.
+///
+/// Wide enough for `%{plugin:name}` at the name lengths the plugin loader allows,
+/// without pushing the value column off a terminal.
+const SYMBOL_WIDTH: usize = 34;
 
 /// Widest the command column is padded to. A longer command is not truncated -
 /// the row simply runs past the column - because a build file is something the
@@ -67,6 +78,72 @@ struct Arge {
     /// reading a build rather than watching it.
     #[arg(short, long, global = true)]
     verbose: bool,
+
+    #[command(flatten)]
+    plugins: PluginArgs,
+}
+
+/// Where pm looks for plugins and how strictly it reads them.
+///
+/// Global, because the same three answers have to hold for `pm build`, `pm explain` and
+/// `pm plugins` alike: `explain` exists to show what `build` will do, and it cannot do
+/// that from a different plugin set.
+#[derive(clap::Args, Debug, Clone)]
+struct PluginArgs {
+    /// Do not load any plugins.
+    ///
+    /// pm then classifies commands and scans sources with nothing but its own
+    /// built-in tables, which is exactly what it did before there was a plugin
+    /// system. The honest way to find out whether a plugin is responsible for a
+    /// surprising policy.
+    #[arg(long, global = true)]
+    no_plugins: bool,
+
+    /// Load plugins from this directory instead of `<config>/pm/plugins`.
+    #[arg(long, global = true, value_name = "DIR")]
+    plugin_dir: Option<PathBuf>,
+
+    /// Load plugins WITHOUT verifying their signatures.
+    ///
+    /// A plugin runs inside pm, with your privileges, and helps decide what a
+    /// build jail allows. This is for developing one you have not signed yet, and
+    /// for nothing else.
+    #[arg(long, global = true)]
+    allow_unsigned_plugins: bool,
+}
+
+impl PluginArgs {
+    /// Load the plugins these arguments ask for.
+    ///
+    /// `--no-plugins` short-circuits to an empty registry without touching the
+    /// filesystem, so it is also the way out of a plugin directory that will not load
+    /// at all.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the plugin directory cannot be read, or if a plugin in it is not a
+    /// usable component, is not signed by a trusted key, or cannot describe itself. A
+    /// plugin that is installed but unusable is a configuration error the user has to
+    /// see: skipping it would silently change what pm decides about a build while they
+    /// believe the plugin they installed is in play.
+    fn load(&self) -> miette::Result<Registry> {
+        if self.no_plugins {
+            return Ok(Registry::empty());
+        }
+        let dir = match self.plugin_dir.clone() {
+            Some(dir) => dir,
+            None => default_plugin_dir()?,
+        };
+        Loader::new(dir)
+            .allow_unsigned(self.allow_unsigned_plugins)
+            .load()
+    }
+}
+
+#[derive(clap::ValueEnum, Clone, Copy, PartialEq, Eq)]
+enum ExplainFormat {
+    Text,
+    Yaml,
 }
 
 #[derive(Subcommand)]
@@ -112,6 +189,17 @@ enum Commands {
         /// The table is printed in full and the exit status is still non-zero.
         #[arg(long)]
         permissive: bool,
+        /// Output format; YAML is a versioned interface for automated policy gates.
+        #[arg(long, value_enum, default_value_t = ExplainFormat::Text)]
+        format: ExplainFormat,
+    },
+    /// Print where a source URL will be downloaded, without fetching it.
+    SourcePath {
+        /// The same URL as the recipe's dl_urls key.
+        url: Url,
+        /// Print a path relative to the build working directory instead of /build.
+        #[arg(long)]
+        relative: bool,
     },
     /// Write an example build file to the given path.
     Generate {
@@ -254,6 +342,22 @@ enum Commands {
         #[arg(long, value_name = "DIR")]
         trust_dir: Option<PathBuf>,
     },
+    /// List the installed plugins and what each of them may ask for.
+    ///
+    /// Plugins are WebAssembly components that answer what pm's built-in tables
+    /// cannot: what an unrecognised build command needs from the jail, and what a
+    /// source file in a language pm has no grammar for implies about the built
+    /// program. They run inside pm, so this is the review surface - every line of
+    /// it is a claim the plugin makes about itself, which pm then holds it to.
+    Plugins {
+        /// Also print the SHA-256 of each plugin file and the digest of the set.
+        ///
+        /// The set digest is what `pm explain` folds into a build policy's own, so
+        /// this is how to tell two policy digests apart when the build file has not
+        /// changed.
+        #[arg(long)]
+        digests: bool,
+    },
     /// Accept signatures made by a public key from now on.
     ///
     /// Takes the key as hex, or the path to a file holding it - either a `.pub`
@@ -279,16 +383,45 @@ fn main() -> miette::Result<()> {
     };
     fmt().without_time().with_writer(progress.log_sink()).init();
 
-    let args = Arge::parse();
+    // Destructured rather than matched through `args`, so the plugin flags stay
+    // reachable while the subcommand is moved out arm by arm.
+    let Arge {
+        command,
+        verbose: _,
+        plugins: plugin_args,
+    } = Arge::parse();
 
-    match args.command {
+    match command {
         Commands::Build {
             file,
             permissive,
             unsandboxed,
             jobs,
-        } => build(&file, permissive, unsandboxed, jobs, &progress)?,
-        Commands::Explain { file, permissive } => explain(&file, permissive)?,
+        } => build(
+            &file,
+            permissive,
+            unsandboxed,
+            jobs,
+            &plugin_args.load()?,
+            &progress,
+        )?,
+        Commands::Explain {
+            file,
+            permissive,
+            format,
+        } => {
+            explain(&file, permissive, format, &plugin_args.load()?)?;
+        }
+        Commands::SourcePath { url, relative } => {
+            let path = Step::download_path(&url)?;
+            let path = if relative {
+                path
+            } else {
+                Path::new(CONTAINER_WORKDIR).join(path)
+            };
+            println!("{}", path.display());
+        }
+        Commands::Plugins { digests } => list_plugins(&plugin_args.load()?, digests)?,
         Commands::Generate { file, force } => generate(&file, force)?,
         Commands::Run {
             package,
@@ -381,21 +514,26 @@ fn build(
     permissive: bool,
     unsandboxed: bool,
     jobs: Option<NonZeroUsize>,
+    plugins: &Registry,
     progress: &Progress,
 ) -> miette::Result<()> {
     if !file.exists() {
         return Err(miette!("The path {} does not exist.", file.display()));
     }
 
-    let build_file = BuildFile::load(file)?;
-    let policy = BuildPolicy::derive(&build_file, permissive).wrap_err_with(|| {
-        format!(
-            "cannot derive a sandbox policy for {}; run `pm explain {}` to see the whole \
+    let mut build_file = BuildFile::load(file)?;
+    // The graph expands every package again as it resolves it; this copy exists so the
+    // policy logged below is the one the top-level package will actually build under.
+    build_file.expand(plugins)?;
+    let policy =
+        BuildPolicy::derive_with(&build_file, permissive, plugins).wrap_err_with(|| {
+            format!(
+                "cannot derive a sandbox policy for {}; run `pm explain {}` to see the whole \
              build file, or pass --permissive to build it anyway",
-            file.display(),
-            file.display()
-        )
-    })?;
+                file.display(),
+                file.display()
+            )
+        })?;
     info!(
         fingerprint = policy.fingerprint(),
         capabilities = ?policy.capabilities(),
@@ -417,11 +555,131 @@ fn build(
             permissive,
             unsandboxed,
             jobs,
+            plugins,
         },
         progress,
     )?;
     info!(archive = %archive.display(), "packaged");
     Ok(())
+}
+
+/// Prints the installed plugins, one block each.
+///
+/// Everything printed is the plugin's own claim about itself, made once at load and
+/// held to from then on: the ceiling bounds what its verdicts may ask for, and the
+/// extensions decide which files it is shown. Reading this is meant to be a cheap
+/// substitute for reading the plugin - which is only worth anything because a plugin
+/// had to be signed by a trusted key to be loaded at all.
+///
+/// Goes to stdout because it is this subcommand's primary output, like `pm explain`'s
+/// table and `pm profile`'s report.
+///
+/// # Errors
+///
+/// Infallible today; the signature keeps `main`'s dispatch uniform and leaves room for
+/// a future `pm plugins` that has to go and look at something.
+fn list_plugins(plugins: &Registry, digests: bool) -> miette::Result<()> {
+    if plugins.is_empty() {
+        println!("No plugins are loaded.");
+        println!();
+        println!(
+            "pm looks for WebAssembly components in {}. See plugins/README.md for what \
+             one is and how to build it.",
+            default_plugin_dir().map_or_else(
+                |_| "<config>/pm/plugins".to_owned(),
+                |dir| dir.display().to_string()
+            )
+        );
+        return Ok(());
+    }
+
+    println!("{:<LABEL_WIDTH$}{}", "plugins:", plugins.len());
+    if digests {
+        println!("{:<LABEL_WIDTH$}{}", "set digest:", plugins.digest());
+    }
+
+    for plugin in plugins.plugins() {
+        let manifest = plugin.manifest();
+        println!();
+        println!(
+            "{} {} ({})",
+            manifest.name,
+            manifest.version,
+            plugin.trust()
+        );
+        if plugin.trust() == Trust::Unverified {
+            println!(
+                "{:<LABEL_WIDTH$}loaded without a signature check",
+                "WARNING:"
+            );
+        }
+        println!("{:<LABEL_WIDTH$}{}", "summary:", manifest.summary);
+        println!(
+            "{:<LABEL_WIDTH$}{}",
+            "hooks:",
+            join_or_none(manifest.hooks.iter().map(ToString::to_string))
+        );
+        // Only meaningful for the hook it bounds, and `Manifest` already empties it for
+        // a plugin that does not classify - so an empty ceiling here means "will never
+        // grant anything", which is worth saying out loud.
+        if manifest.hooks.contains(&pm::plugin::Hook::ClassifyCommand) {
+            println!(
+                "{:<LABEL_WIDTH$}{}",
+                "grants:",
+                join_or_none(
+                    manifest
+                        .grants_at_most
+                        .iter()
+                        .map(|capability| format!("{capability:?}"))
+                )
+            );
+        }
+        if manifest.hooks.contains(&pm::plugin::Hook::ScanSource) {
+            println!(
+                "{:<LABEL_WIDTH$}{}",
+                "scans:",
+                join_or_none(
+                    manifest
+                        .source_extensions
+                        .iter()
+                        .map(|ext| format!(".{ext}"))
+                )
+            );
+        }
+        if !manifest.symbols.is_empty() {
+            println!("{:<LABEL_WIDTH$}{}", "symbols:", manifest.symbols.len());
+            for symbol in manifest.symbols.values() {
+                let summary = if symbol.summary.is_empty() {
+                    String::new()
+                } else {
+                    format!("  ({})", symbol.summary)
+                };
+                println!(
+                    "  %{{{}:{}}} = {}{summary}",
+                    manifest.name, symbol.name, symbol.value
+                );
+            }
+        }
+        println!("{:<LABEL_WIDTH$}{}", "file:", plugin.path().display());
+        if digests {
+            println!("{:<LABEL_WIDTH$}{}", "sha256:", plugin.sha256());
+        }
+    }
+    Ok(())
+}
+
+/// Comma-join `items`, or `none` when there are none.
+///
+/// An empty list is printed rather than omitted for the same reason
+/// [`pm::perms::Permissions::report`] prints its empty groups: the absence of a grant is
+/// the interesting half of a review, and an omitted line reads as an oversight.
+fn join_or_none(items: impl Iterator<Item = String>) -> String {
+    let joined = items.collect::<Vec<_>>().join(", ");
+    if joined.is_empty() {
+        "none".to_owned()
+    } else {
+        joined
+    }
 }
 
 /// Whether the raw command line asks for verbose output.
@@ -454,7 +712,7 @@ fn raw_args_ask_for_verbose() -> bool {
 /// Propagates whatever the build fails with.
 fn run_build(
     build_file: &BuildFile,
-    options: BuildOptions,
+    options: BuildOptions<'_>,
     progress: &Progress,
 ) -> miette::Result<PathBuf> {
     build_file.run_with_progress(options, progress)
@@ -470,20 +728,67 @@ fn run_build(
 /// Fails if the build file is missing or unparseable, and - after printing the
 /// whole table - if any command matched no fingerprint, so that the subcommand
 /// works as a lint.
-fn explain(file: &Path, permissive: bool) -> miette::Result<()> {
+fn explain(
+    file: &Path,
+    permissive: bool,
+    format: ExplainFormat,
+    plugins: &Registry,
+) -> miette::Result<()> {
     if !file.exists() {
         return Err(miette!("The path {} does not exist.", file.display()));
     }
 
-    let build_file = BuildFile::load(file)?;
-    let policy = BuildPolicy::derive(&build_file, permissive).wrap_err_with(|| {
-        format!(
-            "cannot derive a sandbox policy for {}; pass --permissive to list every \
+    let mut build_file = BuildFile::load(file)?;
+    // Expanded first, so the table below prints the commands that would run rather than
+    // the ones the file was written with. Which symbols did that is printed too.
+    let symbols = build_file.expand(plugins)?;
+    let policy =
+        BuildPolicy::derive_with(&build_file, permissive, plugins).wrap_err_with(|| {
+            format!(
+                "cannot derive a sandbox policy for {}; pass --permissive to list every \
              command anyway",
-            file.display()
-        )
-    })?;
+                file.display()
+            )
+        })?;
 
+    if format == ExplainFormat::Yaml {
+        explain_yaml(&build_file, &policy, &symbols, plugins)?;
+    } else {
+        explain_text(file, &build_file, &policy, &symbols, plugins);
+    }
+
+    let unmatched = policy
+        .matches()
+        .iter()
+        .filter(|(_, fingerprint)| *fingerprint == UNMATCHED)
+        .count();
+    if unmatched > 0 {
+        return Err(miette!(
+            help = "A command needs a fingerprint before the sandbox can grant it \
+                    anything. Rewrite it to use a program the table knows, or run \
+                    `pm build --permissive` and accept that those commands get no \
+                    capabilities at all.",
+            "{unmatched} {} in {} {} no built-in fingerprint.",
+            if unmatched == 1 {
+                "command"
+            } else {
+                "commands"
+            },
+            file.display(),
+            if unmatched == 1 { "matches" } else { "match" }
+        ));
+    }
+
+    Ok(())
+}
+
+fn explain_text(
+    file: &Path,
+    build_file: &BuildFile,
+    policy: &BuildPolicy,
+    symbols: &std::collections::BTreeSet<String>,
+    plugins: &Registry,
+) {
     let capabilities = if policy.capabilities().is_empty() {
         "none".to_owned()
     } else {
@@ -504,11 +809,39 @@ fn explain(file: &Path, permissive: bool) -> miette::Result<()> {
     );
     println!("{:<LABEL_WIDTH$}{}", "digest:", policy.fingerprint());
     println!("{:<LABEL_WIDTH$}{capabilities}", "grants:");
+    // Only when there are any. The digest above is mixed with the plugin set exactly
+    // when it is non-empty, so printing "plugins: none" would invite the reading that
+    // the digest still depends on it.
+    if !plugins.is_empty() {
+        println!(
+            "{:<LABEL_WIDTH$}{}",
+            "plugins:",
+            plugins
+                .plugins()
+                .iter()
+                .map(|plugin| format!("{} {}", plugin.manifest().name, plugin.manifest().version))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    if !symbols.is_empty() {
+        println!();
+        println!("{:<SYMBOL_WIDTH$}VALUE", "SYMBOL");
+        for reference in symbols {
+            // Every reference in the set resolved, or `expand` would have failed, so a
+            // plugin that no longer offers one is not a case that can arrive here.
+            let value = reference
+                .split_once(':')
+                .and_then(|(plugin, name)| plugins.symbol(plugin, name))
+                .map_or("", |symbol| symbol.value.as_str());
+            println!("{reference:<SYMBOL_WIDTH$}{value}");
+        }
+    }
     println!();
 
     if policy.matches().is_empty() {
         println!("This build file runs no commands.");
-        return Ok(());
+        return;
     }
 
     // Fold rather than `max()` so there is no `Option` to unwrap, and start
@@ -526,29 +859,110 @@ fn explain(file: &Path, permissive: bool) -> miette::Result<()> {
         println!("{command:<width$}  {fingerprint}");
     }
 
-    let unmatched = policy
-        .matches()
-        .iter()
-        .filter(|(_, fingerprint)| *fingerprint == UNMATCHED)
-        .count();
-    if unmatched > 0 {
+    if policy.matches().iter().any(|(_, name)| *name == UNMATCHED) {
         println!();
-        return Err(miette!(
-            help = "A command needs a fingerprint before the sandbox can grant it \
-                    anything. Rewrite it to use a program the table knows, or run \
-                    `pm build --permissive` and accept that those commands get no \
-                    capabilities at all.",
-            "{unmatched} {} in {} {} no built-in fingerprint.",
-            if unmatched == 1 {
-                "command"
-            } else {
-                "commands"
-            },
-            file.display(),
-            if unmatched == 1 { "matches" } else { "match" }
-        ));
     }
+}
 
+/// Versioned, deterministic data for recipe generators and policy gates. Do not
+/// serialise private implementation structs: their layout is not a CLI contract.
+#[derive(Serialize)]
+struct ExplainReport<'a> {
+    schema_version: u32,
+    name: &'a str,
+    version: &'a [String],
+    dependencies: Vec<&'a Path>,
+    fingerprint: &'a str,
+    capabilities: &'a [Capability],
+    commands: Vec<ExplainedCommand<'a>>,
+    plugins: Vec<ExplainedPlugin<'a>>,
+    symbols: std::collections::BTreeMap<&'a str, &'a str>,
+    downloads: Vec<ExplainedDownload<'a>>,
+}
+
+#[derive(Serialize)]
+struct ExplainedCommand<'a> {
+    command: &'a str,
+    fingerprint: &'a str,
+    matched: bool,
+}
+
+#[derive(Serialize)]
+struct ExplainedPlugin<'a> {
+    name: &'a str,
+    version: &'a str,
+    sha256: &'a str,
+    trust: String,
+}
+
+#[derive(Serialize)]
+struct ExplainedDownload<'a> {
+    step: &'a str,
+    url: &'a Url,
+    sha256: &'a str,
+    path: PathBuf,
+}
+
+fn explain_yaml(
+    build_file: &BuildFile,
+    policy: &BuildPolicy,
+    symbols: &std::collections::BTreeSet<String>,
+    plugins: &Registry,
+) -> miette::Result<()> {
+    let mut downloads = Vec::new();
+    for step in build_file.steps() {
+        if let Some(urls) = &step.dl_urls {
+            let mut urls: Vec<_> = urls.iter().collect();
+            urls.sort_unstable_by(|(a, _), (b, _)| a.as_str().cmp(b.as_str()));
+            for (url, sha256) in urls {
+                downloads.push(ExplainedDownload {
+                    step: &step.name,
+                    url,
+                    sha256,
+                    path: Path::new(CONTAINER_WORKDIR).join(Step::download_path(url)?),
+                });
+            }
+        }
+    }
+    let report = ExplainReport {
+        schema_version: 1,
+        name: build_file.name(),
+        version: build_file.version(),
+        dependencies: build_file.dependencies().collect(),
+        fingerprint: policy.fingerprint(),
+        capabilities: policy.capabilities(),
+        commands: policy
+            .matches()
+            .iter()
+            .map(|(command, fingerprint)| ExplainedCommand {
+                command,
+                fingerprint,
+                matched: *fingerprint != UNMATCHED,
+            })
+            .collect(),
+        plugins: plugins
+            .plugins()
+            .iter()
+            .map(|plugin| ExplainedPlugin {
+                name: &plugin.manifest().name,
+                version: &plugin.manifest().version,
+                sha256: plugin.sha256(),
+                trust: plugin.trust().to_string(),
+            })
+            .collect(),
+        symbols: symbols
+            .iter()
+            .filter_map(|reference| {
+                let (plugin, name) = reference.split_once(':')?;
+                Some((
+                    reference.as_str(),
+                    plugins.symbol(plugin, name)?.value.as_str(),
+                ))
+            })
+            .collect(),
+        downloads,
+    };
+    print!("{}", to_string(&report).into_diagnostic()?);
     Ok(())
 }
 

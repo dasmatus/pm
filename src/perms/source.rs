@@ -56,7 +56,10 @@ use tracing::debug;
 use tree_sitter::{Language, Node, Parser, Query, QueryCursor, StreamingIterator as _, Tree};
 use walkdir::WalkDir;
 
-use crate::perms::{Grant, Permission, Permissions, Provenance};
+use crate::{
+    perms::{Grant, Permission, Permissions, Provenance},
+    plugin::Registry,
+};
 
 /// One tree-sitter query and the permissions a match implies.
 ///
@@ -121,13 +124,40 @@ pub struct LanguageRules {
 /// built-in queries fails to compile - both of which are bugs in this module rather than
 /// anything about `dir`.
 pub fn scan(dir: &Path) -> Result<Permissions> {
+    scan_with(dir, Registry::none())
+}
+
+/// As [`scan`], also offering each file to any [`crate::plugin`] component that claimed
+/// its extension.
+///
+/// One walk serves both: a file is read, size-checked, binary-sniffed and UTF-8-checked
+/// exactly once, and whatever wants it - a built-in grammar, a plugin, or both - gets
+/// the same text. A file with an extension *only* a plugin claimed is now collected
+/// where before it was skipped, which is the point; a file both understand contributes
+/// from both, and [`Permissions::merge`] unifies whatever they agree on.
+///
+/// Plugin grants carry [`Provenance::Plugin`] and an evidence line naming the plugin, so
+/// the profile says who asked for what. They are merged in exactly like the built-in
+/// ones and, exactly like the built-in ones, they are recorded in audit mode and deny
+/// nothing until a human promotes the profile.
+///
+/// # Errors
+///
+/// As [`scan`]. A plugin that traps or misbehaves costs its own grants and a `warn`
+/// line, never the scan.
+pub fn scan_with(dir: &Path, plugins: &Registry) -> Result<Permissions> {
     let languages = compiled()?;
-    let files = collect(dir, languages)?;
-    debug!(dir = %dir.display(), files = files.len(), "scanning sources");
+    let files = collect(dir, languages, plugins)?;
+    debug!(
+        dir = %dir.display(),
+        files = files.len(),
+        plugins = plugins.len(),
+        "scanning sources"
+    );
 
     let grants: Vec<Grant> = files
         .par_iter()
-        .flat_map_iter(|(path, language)| scan_file(dir, path, language))
+        .flat_map_iter(|(path, language)| scan_file(dir, path, *language, plugins))
         .collect();
 
     let permissions: Permissions = grants.into_iter().collect();
@@ -271,7 +301,11 @@ fn grammar(name: &str) -> Option<Language> {
 /// # Errors
 ///
 /// Diagnostic if a directory cannot be read.
-fn collect<'a>(dir: &Path, languages: &'a [Compiled]) -> Result<Vec<(PathBuf, &'a Compiled)>> {
+fn collect<'a>(
+    dir: &Path,
+    languages: &'a [Compiled],
+    plugins: &Registry,
+) -> Result<Vec<(PathBuf, Option<&'a Compiled>)>> {
     let mut files = Vec::new();
     let walk = WalkDir::new(dir)
         .follow_links(false)
@@ -293,12 +327,14 @@ fn collect<'a>(dir: &Path, languages: &'a [Compiled]) -> Result<Vec<(PathBuf, &'
         let Some(extension) = entry.path().extension().and_then(|e| e.to_str()) else {
             continue;
         };
-        let Some(language) = languages
+        let language = languages
             .iter()
-            .find(|language| language.rules.extensions.contains(&extension))
-        else {
+            .find(|language| language.rules.extensions.contains(&extension));
+        // A file no grammar knows is still worth collecting when a plugin asked for its
+        // extension; a file nothing at all wants is skipped as it always was.
+        if language.is_none() && !plugins.wants_extension(extension) {
             continue;
-        };
+        }
         match entry.metadata() {
             Ok(metadata) if metadata.len() > MAX_FILE_BYTES => {
                 let bytes = metadata.len();
@@ -314,12 +350,18 @@ fn collect<'a>(dir: &Path, languages: &'a [Compiled]) -> Result<Vec<(PathBuf, &'
     Ok(files)
 }
 
-/// Run every query of `language` over one file and turn the matches into grants.
+/// Run every query of `language`, and every interested plugin, over one file.
 ///
-/// Never fails: an unreadable, binary, non-UTF-8 or unparseable file yields no grants and
-/// a `debug` line. Source trees are full of such files and none of them is a reason to
-/// abandon the scan.
-fn scan_file(root: &Path, path: &Path, language: &Compiled) -> Vec<Grant> {
+/// The file is read and filtered once here, and `language` is `None` for a file that
+/// only a plugin asked for. Never fails: an unreadable, binary, non-UTF-8 or
+/// unparseable file yields no grants and a `debug` line. Source trees are full of such
+/// files and none of them is a reason to abandon the scan.
+fn scan_file(
+    root: &Path,
+    path: &Path,
+    language: Option<&Compiled>,
+    plugins: &Registry,
+) -> Vec<Grant> {
     let Ok(bytes) = fs::read(path) else {
         debug!(path = %path.display(), "skipping unreadable file");
         return Vec::new();
@@ -332,16 +374,21 @@ fn scan_file(root: &Path, path: &Path, language: &Compiled) -> Vec<Grant> {
         debug!(path = %path.display(), "skipping non-UTF-8 file");
         return Vec::new();
     };
-    let Some(tree) = parse(language, &source) else {
-        debug!(path = %path.display(), language = language.rules.name, "skipping unparseable file");
-        return Vec::new();
-    };
-
     let relative = path
         .strip_prefix(root)
         .unwrap_or(path)
         .display()
         .to_string();
+
+    let mut grants = plugins.scan_source(&relative, &source);
+    let Some(language) = language else {
+        return grants;
+    };
+    let Some(tree) = parse(language, &source) else {
+        debug!(path = %path.display(), language = language.rules.name, "skipping unparseable file");
+        return grants;
+    };
+
     let mut findings = Findings::default();
     for (query, rule) in language.queries.iter().zip(language.rules.queries) {
         let mut cursor = QueryCursor::new();
@@ -358,7 +405,8 @@ fn scan_file(root: &Path, path: &Path, language: &Compiled) -> Vec<Grant> {
             record(&mut findings, &captures, rule, &source, &relative);
         }
     }
-    findings.into_grants(&relative)
+    grants.extend(findings.into_grants(&relative));
+    grants
 }
 
 /// Parse `source` with this thread's parser for `language`.
