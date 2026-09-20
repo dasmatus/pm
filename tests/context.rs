@@ -168,6 +168,9 @@ fn a_path_supplied_through_the_context_resolves_a_steps_first_word() {
     // orthogonal to what this test proves: PATH resolution.
     let options = BuildOptions {
         permissive: true,
+        // This test is about PATH resolution from an explicit BuildContext, not
+        // the namespace-backed jail. The dedicated sandbox suites cover that.
+        unsandboxed: true,
         ..BuildOptions::default()
     };
 
@@ -260,6 +263,10 @@ fn a_cancelled_token_makes_a_parked_worker_return_instead_of_hang() {
     // nothing to do and parks on the very condvar `Cancel::cancel` below has
     // to reach - see the CRITICAL note on `Graph::claim`.
     let options = BuildOptions {
+        // This test exercises cancellation and wakeup behavior, not namespace
+        // confinement. Run it unsandboxed so the default suite does not depend
+        // on unprivileged user namespace support.
+        unsandboxed: true,
         jobs: NonZeroUsize::new(2),
         ..BuildOptions::default()
     };
