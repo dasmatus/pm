@@ -183,6 +183,29 @@ struct BuildSpec {
 /// `/bin/sh <script>` - two plain words - and the shell interpreting the script
 /// expands `$DESTDIR` from the environment `Step` set for it.
 fn package_staging(name: &str, script: &str) -> miette::Result<(tempfile::TempDir, PathBuf)> {
+    package_staging_with_options(name, script, BuildOptions::default())
+}
+
+/// Builds a package with staging performed outside the build jail.
+fn package_staging_unsandboxed(
+    name: &str,
+    script: &str,
+) -> miette::Result<(tempfile::TempDir, PathBuf)> {
+    package_staging_with_options(
+        name,
+        script,
+        BuildOptions {
+            unsandboxed: true,
+            ..BuildOptions::default()
+        },
+    )
+}
+
+fn package_staging_with_options(
+    name: &str,
+    script: &str,
+    options: BuildOptions,
+) -> miette::Result<(tempfile::TempDir, PathBuf)> {
     let work = tempdir().expect("work directory");
     let stage = work.path().join("stage.sh");
     write(&stage, script).expect("write the staging script");
@@ -209,15 +232,7 @@ fn package_staging(name: &str, script: &str) -> miette::Result<(tempfile::TempDi
     let build = BuildFile::load_unverified(&build_file).context("load the build file")?;
     let archive = {
         let _cwd = CwdGuard::enter(work.path());
-        let produced = build
-            .run_with(BuildOptions {
-                // These tests exercise package signing, entrypoint selection and
-                // run-time sandboxing. The package build itself need not depend
-                // on the build jail starting successfully.
-                unsandboxed: true,
-                ..BuildOptions::default()
-            })
-            .context("the build must succeed")?;
+        let produced = build.run_with(options).context("the build must succeed")?;
         if produced.is_absolute() {
             produced
         } else {
@@ -268,10 +283,24 @@ chmod 755 \"$DESTDIR/usr/bin/hello\"\n",
     )
 }
 
+/// Builds a package that stages a copy of `/bin/true` as `usr/bin/hello`
+/// outside the build jail.
+fn package_with_a_runnable_binary_unsandboxed(
+    name: &str,
+) -> miette::Result<(tempfile::TempDir, PathBuf)> {
+    package_staging_unsandboxed(
+        name,
+        "set -eu\n\
+mkdir -p \"$DESTDIR/usr/bin\"\n\
+cp /bin/true \"$DESTDIR/usr/bin/hello\"\n\
+chmod 755 \"$DESTDIR/usr/bin/hello\"\n",
+    )
+}
+
 /// Builds a package exposing three binaries, deliberately named so that their
 /// creation order is not their sorted order.
 fn package_with_three_binaries(name: &str) -> miette::Result<(tempfile::TempDir, PathBuf)> {
-    package_staging(
+    package_staging_unsandboxed(
         name,
         "set -eu\n\
 mkdir -p \"$DESTDIR/usr/bin\"\n\
@@ -348,7 +377,7 @@ fn a_package_with_no_binaries_says_so_instead_of_prompting() {
     // Only a library is staged, so there is nothing to offer and nothing to
     // run. This resolves the entrypoint and fails before the sandbox is ever
     // built, so it needs no user namespaces.
-    let (_work, archive) = package_staging(
+    let (_work, archive) = package_staging_unsandboxed(
         "nobinaries",
         "set -eu\n\
 mkdir -p \"$DESTDIR/usr/lib\"\n\
@@ -618,7 +647,7 @@ fn an_escaping_entrypoint_is_never_offered_in_the_listing() {
 #[test]
 fn an_unsigned_package_is_refused_before_it_is_extracted() {
     let (work, archive) =
-        package_with_a_runnable_binary("unsigned").expect("build the test package");
+        package_with_a_runnable_binary_unsandboxed("unsigned").expect("build the test package");
     let signature = PathBuf::from(format!("{}.sig", archive.display()));
     std::fs::remove_file(&signature).expect("drop the signature");
 
@@ -637,7 +666,7 @@ fn an_unsigned_package_is_refused_before_it_is_extracted() {
 #[test]
 fn a_package_signed_by_an_untrusted_key_is_refused() {
     let (work, archive) =
-        package_with_a_runnable_binary("untrusted").expect("build the test package");
+        package_with_a_runnable_binary_unsandboxed("untrusted").expect("build the test package");
     let empty = work.path().join("nobody-trusted");
 
     assert!(

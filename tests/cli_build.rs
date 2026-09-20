@@ -107,6 +107,7 @@ fn permissive_builds_a_command_that_matches_no_fingerprint() {
 }
 
 #[test]
+#[ignore = "requires unprivileged user namespaces; run with `cargo test --test cli_build -- --ignored`"]
 fn unsandboxed_runs_the_step_outside_the_jail() {
     let work = tempdir().expect("work dir");
     // The build file's own directory is mounted READ-ONLY inside the jail, so
