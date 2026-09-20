@@ -1,0 +1,60 @@
+name: automerge
+
+on:
+  workflow_run:
+    workflows: [ci]
+    types: [completed]
+
+permissions: {}
+
+jobs:
+  merge:
+    if: >-
+      github.event.workflow_run.event == 'pull_request' &&
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.head_repository.full_name == github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+      pull-requests: write
+      checks: read
+      statuses: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+      HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
+    steps:
+      # workflow_run uses the trusted default-branch workflow. Never check out
+      # PR code here: this job has a write token. Forks remain manual merges.
+      # Squash merging and write access for GITHUB_TOKEN must be allowed.
+      - name: Merge the tested revision after all checks pass
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Query by commit rather than relying on workflow_run.pull_requests,
+          # which can be empty. Revalidate each PR against its current head.
+          numbers=$(gh api --paginate "repos/$GH_REPO/commits/$HEAD_SHA/pulls" \
+            --jq '.[].number')
+          for number in $numbers; do
+            pr=$(gh api "repos/$GH_REPO/pulls/$number")
+            if ! jq -e \
+              --arg sha "$HEAD_SHA" \
+              --arg branch "$HEAD_BRANCH" \
+              --arg repo "$GH_REPO" \
+              '.state == "open" and .draft == false and
+               .base.ref == "master" and .base.repo.full_name == $repo and
+               .head.repo.full_name == $repo and .head.ref == $branch and
+               .head.sha == $sha' <<< "$pr" >/dev/null; then
+              echo "Skipping PR #$number: not an eligible PR at the tested revision."
+              continue
+            fi
+
+            # Wait for checks outside ci as well; failures or timeout prevent
+            # merging. GitHub still enforces required reviews and branch rules.
+            gh pr checks "$number" --repo "$GH_REPO" --watch --fail-fast
+            gh pr merge "$number" --repo "$GH_REPO" --squash \
+              --match-head-commit "$HEAD_SHA"
+          done
