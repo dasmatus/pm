@@ -107,6 +107,42 @@ fn build_and_extract_with_script(name: &str, script_contents: &str) -> Built {
     }
 }
 
+/// Writes a minimal pre-built package archive named `<name>-0.1.0.cpkg`.
+fn prebuilt_package(work: &Path, name: &str) -> PathBuf {
+    let root = work.join(format!("{name}-root"));
+    std::fs::create_dir_all(&root).expect("create the package root");
+    let metadata = Metadata::create(
+        name.into(),
+        vec!["0".into(), "1".into(), "0".into()],
+        Vec::new(),
+        Default::default(),
+        Default::default(),
+        pm::perms::Enforcement::Audit,
+    );
+    write(
+        root.join("metadata"),
+        serde_yaml::to_string(&metadata).expect("serialise metadata"),
+    )
+    .expect("write metadata");
+
+    let archive = work.join(format!("{name}-0.1.0.cpkg"));
+    let output = Command::new("tar")
+        .arg("-cJf")
+        .arg(&archive)
+        .arg("-C")
+        .arg(&root)
+        .arg(".")
+        .output()
+        .expect("run tar");
+    assert!(
+        output.status.success(),
+        "tar failed to create {}: {}",
+        archive.display(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    archive
+}
+
 /// Extracts `archive` into a fresh temporary directory.
 fn extract(archive: &Path) -> TempDir {
     let dest = tempdir().expect("extraction directory");
@@ -213,6 +249,32 @@ fn the_metadata_describes_the_package_it_was_built_from() {
     assert_eq!(
         entrypoint_of(&metadata, "usr/lib/libbar.a"),
         Some(&Type::Library(LibraryType::Static))
+    );
+}
+
+#[test]
+fn a_prebuilt_package_dependency_is_staged_and_recorded() {
+    let work = tempdir().expect("work directory");
+    let shared = prebuilt_package(work.path(), "shared");
+    let build_file = write_build_file(
+        work.path().join("build.yaml"),
+        &build_file_yaml("top", &["0", "1", "0"], &[&shared], &[]),
+    );
+
+    let build = BuildFile::load_unverified(&build_file).expect("the build file must load");
+    let archive = run_in(&build, work.path());
+    let dest = extract(&archive);
+    let metadata: Metadata =
+        from_str(&read_to_string(dest.path().join("metadata")).expect("read metadata"))
+            .expect("metadata must be valid YAML");
+
+    assert!(
+        dest.path().join("deps/shared-0.1.0.cpkg").is_file(),
+        "the pre-built dependency must be bundled under deps/"
+    );
+    assert_eq!(
+        metadata.dependencies().collect::<Vec<_>>(),
+        [Path::new("deps/shared-0.1.0.cpkg")]
     );
 }
 

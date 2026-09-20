@@ -6,15 +6,19 @@
 //! a cycle, a missing build file or two packages fighting over one archive name
 //! are all things you want to be told before a compiler starts.
 
-use std::fs::write;
+use std::fs::{create_dir_all, write};
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::time::{Duration, Instant};
 
 use pm::bf::{BuildFile, BuildOptions};
 use pm::context::BuildContext;
 use pm::graph::Graph;
+use pm::metadata::Metadata;
+use pm::perms::{Enforcement, Permissions};
 use pm::progress::Progress;
+use serde_yaml::to_string;
 use tempfile::{TempDir, tempdir};
 
 mod common;
@@ -26,6 +30,41 @@ fn package(dir: &TempDir, name: &str, deps: &[&Path]) -> PathBuf {
         dir.path().join(format!("{name}.yaml")),
         &build_file_yaml(name, &["1"], deps, &[]),
     )
+}
+
+/// Writes a minimal pre-built package archive named `<name>-1.cpkg`.
+fn prebuilt_package(dir: &TempDir, name: &str) -> PathBuf {
+    let root = dir.path().join(format!("{name}-root"));
+    create_dir_all(&root).expect("create the package root");
+    let metadata = Metadata::create(
+        name.into(),
+        vec!["1".into()],
+        Vec::new(),
+        Default::default(),
+        Permissions::default(),
+        Enforcement::Audit,
+    );
+    write(
+        root.join("metadata"),
+        to_string(&metadata).expect("serialise metadata"),
+    )
+    .expect("write metadata");
+
+    let archive = dir.path().join(format!("{name}-1.cpkg"));
+    let status = Command::new("tar")
+        .arg("-cJf")
+        .arg(&archive)
+        .arg("-C")
+        .arg(&root)
+        .arg(".")
+        .status()
+        .expect("run tar");
+    assert!(
+        status.success(),
+        "tar failed to create {}",
+        archive.display()
+    );
+    archive
 }
 
 /// Resolves the graph rooted at `path`.
@@ -86,6 +125,19 @@ fn dependencies_come_before_the_packages_that_need_them() {
     assert!(position("shared") < position("right"), "{order:?}");
     assert!(position("left") < position("top"), "{order:?}");
     assert!(position("right") < position("top"), "{order:?}");
+}
+
+#[test]
+fn a_prebuilt_package_dependency_resolves_as_part_of_the_graph() {
+    let dir = tempdir().expect("a temporary directory");
+    let shared = prebuilt_package(&dir, "shared");
+    let top = package(&dir, "top", &[&shared]);
+
+    let graph = resolve(&top).expect("a pre-built package dependency must resolve");
+    let order: Vec<&str> = graph.order().collect();
+
+    assert_eq!(graph.len(), 2, "{order:?}");
+    assert_eq!(order, ["shared", "top"]);
 }
 
 #[test]
