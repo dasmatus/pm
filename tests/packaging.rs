@@ -42,7 +42,14 @@ printf 'stand-in for an archive\\n' > \"$DESTDIR/usr/lib/libbar.a\"\n";
 /// path to whatever archive it produced.
 fn run_in(build: &BuildFile, at: &Path) -> PathBuf {
     let _cwd = CwdGuard::enter(at);
-    let produced = build.run().expect("the build must succeed");
+    let produced = build
+        .run_with(BuildOptions {
+            // These tests exercise packaging, metadata and dependency bundling.
+            // The dedicated sandbox suites cover namespace-backed confinement.
+            unsandboxed: true,
+            ..BuildOptions::default()
+        })
+        .expect("the build must succeed");
     // Resolve relative results while the current directory is still the one
     // `run()` wrote into.
     if produced.is_absolute() {
@@ -620,7 +627,13 @@ fn a_build_reporting_into_a_region_still_produces_its_archive() {
     let archive = {
         let _cwd = CwdGuard::enter(work.path());
         let produced = build
-            .run_with_progress(BuildOptions::default(), &progress)
+            .run_with_progress(
+                BuildOptions {
+                    unsandboxed: true,
+                    ..BuildOptions::default()
+                },
+                &progress,
+            )
             .expect("the build must succeed with a region attached");
         if produced.is_absolute() {
             produced
