@@ -592,11 +592,12 @@ fn find_archive(dir: &Path, name: &str) -> Option<PathBuf> {
         .ok()?
         .filter_map(Result::ok)
         .map(|entry| entry.path())
-        .find(|path| {
+        .filter(|path| {
             path.file_name()
                 .and_then(|file_name| file_name.to_str())
                 .is_some_and(|file_name| {
                     file_name.starts_with(&prefix) && file_name.ends_with(".cpkg")
                 })
         })
+        .min()
 }
