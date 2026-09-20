@@ -251,8 +251,12 @@ fn package_staging(name: &str, script: &str) -> (tempfile::TempDir, PathBuf) {
     let ctx = BuildContext::from_env()
         .expect("capture the ambient build context")
         .with_output_dir(work.path().to_path_buf());
+    let options = BuildOptions {
+        unsandboxed: true,
+        ..BuildOptions::default()
+    };
     let archive = build
-        .run_with_progress_in(&ctx, BuildOptions::default(), &Progress::disabled())
+        .run_with_progress_in(&ctx, options, &Progress::disabled())
         .expect("the build must succeed");
 
     sign(&archive, work.path());

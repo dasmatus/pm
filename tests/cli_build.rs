@@ -87,7 +87,10 @@ fn permissive_builds_a_command_that_matches_no_fingerprint() {
          succeeded:\n{stderr}"
     );
 
-    let permissive = pm_build(&["build", "--permissive", &path], work.path());
+    let permissive = pm_build(
+        &["build", "--permissive", "--unsandboxed", &path],
+        work.path(),
+    );
     assert!(
         permissive.status.success(),
         "--permissive must let the same build through, got:\n{}",

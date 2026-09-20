@@ -250,6 +250,7 @@ fn build_at(root: &Path, at: &Path, jobs: usize) -> miette::Result<PathBuf> {
 fn timed_build_at(root: &Path, at: &Path, jobs: usize) -> (miette::Result<PathBuf>, Duration) {
     let options = BuildOptions {
         jobs: NonZeroUsize::new(jobs),
+        unsandboxed: true,
         ..BuildOptions::default()
     };
     let build = BuildFile::load_unverified(root).expect("the root build file must load");

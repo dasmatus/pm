@@ -685,7 +685,7 @@ impl BuildFile {
         dependency_archives: &[PathBuf],
     ) -> miette::Result<BuildSandbox> {
         if env.options.unsandboxed {
-            return Ok(BuildSandbox::unsandboxed(workdir, staging));
+            return Ok(BuildSandbox::unsandboxed_in(env.ctx, workdir, staging));
         }
 
         let read_only = self.read_only_mounts(dependency_archives);

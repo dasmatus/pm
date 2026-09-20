@@ -86,6 +86,31 @@ const EXTRACT_ARCHIVE_MOUNT: &str = "/archive.cpkg";
 /// See [`PackageRunner::extract_jailed`].
 const EXTRACT_DEST_MOUNT: &str = "/dest";
 
+/// hakoniwa's own sentinel for "the container itself could not run the
+/// command at all" - `unshare`, a mount, `pivot_root` or landlock setup
+/// failed inside the freshly forked child, before it ever reached `execve`.
+///
+/// Not exported by `hakoniwa` (`ExitStatus::FAILURE` is `pub(crate)` there),
+/// so mirrored here. Safe to treat as unambiguous: `tar`'s own documented
+/// exit codes are 0, 1 and 2, never 125, so a `tar` that genuinely ran and
+/// failed can never be confused with a container that never started it.
+/// [`PackageRunner::extract_jailed`] is the ONLY place this constant may
+/// trigger a fallback to [`PackageRunner::extract_unjailed`] - a non-zero,
+/// non-125 status is `tar` itself failing, which must stay a hard error; see
+/// that function's doc comment for why the two must never be conflated.
+const CONTAINER_START_FAILURE: i32 = 125;
+
+/// The directories `Container::rootfs("/")` mirrors from the host.
+///
+/// Mirrors the constant of the same name in [`crate::sandbox`], kept in sync
+/// by hand with `hakoniwa::Container::rootfs_imp`, which hard-codes exactly
+/// this list. [`PackageRunner::extract_jailed`] needs its own copy: a `tar`
+/// that resolves to a directory NOT in this list has to be mounted in on its
+/// own, and mounting a path a SECOND time when it is already nested under one
+/// of these races hakoniwa's own unordered mount application and can
+/// silently shadow the more specific mount.
+const ROOTFS_ROOTS: [&str; 7] = ["/bin", "/etc", "/lib", "/lib32", "/lib64", "/sbin", "/usr"];
+
 /// Package-root file a profile may be recorded in, when it is not inside the
 /// `metadata` member.
 ///
@@ -386,8 +411,8 @@ impl PackageRunner {
                 )
             })?;
 
-        // Jailed by default - see `extract` and `extract_jailed`.
-        self.extract(&package_root, true)?;
+        // Jailed unless the container itself cannot start - see `extract`.
+        self.extract(&package_root)?;
 
         let metadata_path = package_root.join("metadata");
         let metadata_text = read_to_string(&metadata_path)
@@ -878,27 +903,42 @@ impl PackageRunner {
         Ok(())
     }
 
-    /// Extracts the archive into `dest`, jailed by default.
+    /// Extracts the archive into `dest`.
     ///
-    /// `jailed` is a parameter of this one call, not a setting on
-    /// [`PackageRunner`]: [`PackageRunner::run_with`] always passes `true`, and
-    /// there is deliberately no builder flag or environment variable that
-    /// could flip it for every extraction in a process at once. The only case
-    /// the unjailed path exists for is a host where the container itself
-    /// cannot even start - no unprivileged user namespaces, no landlock, a
-    /// kernel too old - and that is a decision a caller makes once, per call,
-    /// never a standing opt-out a hostile archive could rely on finding
-    /// already set.
+    /// Always tries the jail first. Falls back to
+    /// [`PackageRunner::extract_unjailed`] ONLY when the container itself
+    /// could not be started - no unprivileged user namespaces, no landlock, a
+    /// kernel too old - which is detected, not guessed: see
+    /// [`PackageRunner::extract_jailed`] for exactly how. There is
+    /// deliberately no builder flag or environment variable that could ask
+    /// for the unjailed path directly; the fallback is a property of the
+    /// host, decided fresh on every call, never a standing opt-out a hostile
+    /// archive could rely on finding already set.
+    ///
+    /// **A `tar` that runs and fails is never retried unjailed.** That is the
+    /// opposite case from the container not starting at all, and retrying it
+    /// without the jail would hand a hostile archive - the exact thing this
+    /// jail exists to contain - the one thing it was denied the first time:
+    /// this process's own privileges. See [`PackageRunner::extract_jailed`]'s
+    /// doc comment for how the two must never be conflated.
     ///
     /// # Errors
     ///
     /// See [`PackageRunner::extract_jailed`] and
     /// [`PackageRunner::extract_unjailed`].
-    fn extract(&self, dest: &Path, jailed: bool) -> miette::Result<()> {
-        if jailed {
-            self.extract_jailed(dest)
-        } else {
-            self.extract_unjailed(dest)
+    fn extract(&self, dest: &Path) -> miette::Result<()> {
+        match self.extract_jailed(dest)? {
+            Extraction::Done => Ok(()),
+            Extraction::ContainerUnavailable(reason) => {
+                warn!(
+                    reason = %reason,
+                    package = %self.path.display(),
+                    "the extraction jail could not start (no unprivileged user namespaces, no \
+                     landlock, or a kernel too old?); falling back to UNSANDBOXED extraction - a \
+                     hostile archive member now runs with this process's own privileges"
+                );
+                self.extract_unjailed(dest)
+            }
         }
     }
 
@@ -912,19 +952,41 @@ impl PackageRunner {
     /// `tar` has had real path-traversal bugs, and the signature says nothing
     /// about which version is installed. `tar` gets exactly two mounts here -
     /// the archive read-only at [`EXTRACT_ARCHIVE_MOUNT`], `dest` writable at
-    /// [`EXTRACT_DEST_MOUNT`] - plus the host's system directories so it can
-    /// actually run, and the network namespace is unshared unconditionally:
-    /// unlike [`PackageRunner::allow_network`], nothing about extracting an
-    /// archive ever needs a network. A `tar` that resolves a traversal member
-    /// can still only reach those two mounted paths.
+    /// [`EXTRACT_DEST_MOUNT`] - plus the host's system directories (and
+    /// `tar`'s own directory, if it lives somewhere else) so it can actually
+    /// run, and the network namespace is unshared unconditionally: unlike
+    /// [`PackageRunner::allow_network`], nothing about extracting an archive
+    /// ever needs a network. A `tar` that resolves a traversal member can
+    /// still only reach those two mounted paths.
+    ///
+    /// # Telling "the container would not start" from "`tar` failed inside it"
+    ///
+    /// This is the one distinction [`PackageRunner::extract`]'s fallback
+    /// depends on, and it is load-bearing enough to spell out in full.
+    /// hakoniwa runs the WHOLE setup - `unshare`, every mount, `pivot_root`,
+    /// the landlock ruleset, and finally `execve` - inside the freshly forked
+    /// child, and if ANY step of that fails, the child reports back an
+    /// [`hakoniwa::ExitStatus`] with `code` set to hakoniwa's own
+    /// [`CONTAINER_START_FAILURE`] sentinel (125) and `reason` describing
+    /// which step - **not** an `Err` from [`hakoniwa::Command::output`]. A
+    /// `tar` that actually ran, whether it exited cleanly or refused a
+    /// hostile member, reports its OWN exit code (0, 1 or 2 for GNU `tar`) or
+    /// a signal through the ordinary `process(...) exited/received ...`
+    /// reason - never 125. So: `code == CONTAINER_START_FAILURE` means `tar`
+    /// never ran at all, and is the ONLY case this function reports as
+    /// [`Extraction::ContainerUnavailable`]; every other non-zero code means
+    /// `tar` ran and failed, and is reported as a hard [`Err`] that
+    /// [`PackageRunner::extract`] will not retry.
     ///
     /// # Errors
     ///
     /// Returns a diagnostic when `tar` cannot be located on `PATH`, when the
-    /// archive or `dest` is not valid UTF-8, when the container cannot be
-    /// configured or spawned, or when `tar` exits unsuccessfully - in which
-    /// case its exit status and captured stderr are reported.
-    fn extract_jailed(&self, dest: &Path) -> miette::Result<()> {
+    /// archive, `dest` or `tar`'s own directory is not valid UTF-8, when the
+    /// container cannot be configured, or when `tar` ran and exited
+    /// unsuccessfully - in which case its exit status and captured stderr are
+    /// reported. Returns `Ok(`[`Extraction::ContainerUnavailable`]`)`, not an
+    /// error, when the container could not be started at all.
+    fn extract_jailed(&self, dest: &Path) -> miette::Result<Extraction> {
         let archive = self
             .path
             .canonicalize()
@@ -972,6 +1034,29 @@ impl PackageRunner {
             .runctl(Runctl::MountFallback)
             .unshare(Namespace::Network);
 
+        // `rootfs("/")` mirrors only `ROOTFS_ROOTS`. The real system `tar`
+        // usually lives under `/usr` and needs nothing more, but a `tar`
+        // resolved from anywhere else - a Nix profile, a test's own stand-in
+        // on `PATH` - is otherwise invisible inside the container and
+        // `execve` fails with ENOENT before it ever runs. Skip the mount when
+        // it is already covered: mounting a path a second time nested under
+        // an already-mirrored root can shadow the more specific mount,
+        // depending on the order hakoniwa happens to apply them in.
+        if let Some(tar_dir) = tar.parent()
+            && !ROOTFS_ROOTS
+                .iter()
+                .any(|root| tar_dir.starts_with(Path::new(root)))
+        {
+            let tar_dir_str = tar_dir.to_str().ok_or_else(|| {
+                miette!(
+                    "`tar`'s directory {} is not valid UTF-8 and cannot be mounted into the \
+                     extraction jail",
+                    tar_dir.display()
+                )
+            })?;
+            container.mount(tar_dir_str, tar_dir_str, "", package_mount_flags());
+        }
+
         // Same reasoning as the run jail: a Nix-provisioned `tar` and its
         // dynamic loader live under the store, not under `/usr`.
         if Path::new(NIX_STORE).is_dir() {
@@ -996,6 +1081,10 @@ impl PackageRunner {
                 )
             })?;
 
+        if output.status.code == CONTAINER_START_FAILURE {
+            return Ok(Extraction::ContainerUnavailable(output.status.reason));
+        }
+
         if !output.status.success() {
             return Err(miette!(
                 "tar failed to extract {} into {} ({}): {}",
@@ -1005,14 +1094,16 @@ impl PackageRunner {
                 String::from_utf8_lossy(&output.stderr).trim()
             ));
         }
-        Ok(())
+        Ok(Extraction::Done)
     }
 
     /// Extracts the archive with an unsandboxed `tar`, at this process's own
     /// privileges.
     ///
-    /// **Not the default** - see [`PackageRunner::extract`] for when this is
-    /// the right call instead of [`PackageRunner::extract_jailed`].
+    /// **Not the default.** [`PackageRunner::extract`] reaches this only when
+    /// [`PackageRunner::extract_jailed`] reports that the container itself
+    /// could not be started - never when `tar` ran and refused a hostile
+    /// member, which stays a hard failure.
     ///
     /// # Errors
     ///
@@ -1303,6 +1394,24 @@ impl PackageRunner {
 struct Entrypoint<'a> {
     declared: &'a Path,
     resolved: PathBuf,
+}
+
+/// What [`PackageRunner::extract_jailed`] managed to do.
+///
+/// Deliberately NOT a plain `bool`: `ContainerUnavailable` is the one outcome
+/// [`PackageRunner::extract`] is allowed to retry unjailed, and naming it
+/// forces every match on this type to say which case it is handling instead
+/// of trusting a `true`/`false` to still mean the same thing at the call
+/// site.
+enum Extraction {
+    /// `tar` ran inside the container and exited successfully.
+    Done,
+    /// The container itself never ran `tar` at all - see
+    /// [`PackageRunner::extract_jailed`]'s doc comment for exactly how this is
+    /// told apart from `tar` running and failing. Carries hakoniwa's own
+    /// description of what failed, for the warning [`PackageRunner::extract`]
+    /// logs before falling back.
+    ContainerUnavailable(String),
 }
 
 /// The run-time profile a package recorded: what it may do, and whether that is

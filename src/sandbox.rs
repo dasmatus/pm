@@ -74,7 +74,8 @@ pub const CONTAINER_DESTDIR: &str = "/dest";
 /// `pub(crate)` so [`crate::context::BuildContext::from_env`] can fall back to
 /// it when the process has no `PATH` at all - the same fallback `resolve`
 /// used to apply itself before it started taking `PATH` from a context.
-pub(crate) const CONTAINER_PATH: &str = "/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bin:/sbin";
+pub(crate) const CONTAINER_PATH: &str =
+    "/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bin:/sbin";
 
 /// The directories `Container::rootfs("/")` mirrors from the host.
 ///
@@ -142,10 +143,7 @@ pub struct BuildSandbox {
     /// caller that has no region to draw into.
     progress: Task,
     /// `PATH` used to resolve a step's first word, from the [`BuildContext`]
-    /// this sandbox was built with. Unused in [`Mode::Host`]: a command run
-    /// there goes through [`std::process::Command`] directly, which lets the
-    /// host's own `execvp` do its own `PATH` search over the *process's*
-    /// environment rather than this one.
+    /// this sandbox was built with.
     path: OsString,
 }
 
@@ -172,7 +170,13 @@ impl BuildSandbox {
         destdir: &Path,
         extra_ro: &[&Path],
     ) -> miette::Result<Self> {
-        Self::new_in(&BuildContext::from_env()?, policy, workdir, destdir, extra_ro)
+        Self::new_in(
+            &BuildContext::from_env()?,
+            policy,
+            workdir,
+            destdir,
+            extra_ro,
+        )
     }
 
     /// Build a jail for `policy`, staging into `workdir` and `destdir`.
@@ -276,12 +280,12 @@ impl BuildSandbox {
     /// An unsandboxed escape hatch for debugging: commands run unconfined on
     /// the host, as the calling user.
     ///
-    /// Unlike [`BuildSandbox::new_in`], this takes no [`BuildContext`]: a
-    /// command run this way goes through [`std::process::Command`] directly,
-    /// which searches the *process's* `PATH` itself rather than going through
-    /// [`BuildSandbox::resolve`].
+    /// Unlike [`BuildSandbox::new_in`], this does not build a jail: commands
+    /// run straight on the host. It still captures the caller's `PATH`,
+    /// because an unsandboxed build must not silently fall back to the
+    /// process's own environment either.
     #[must_use]
-    pub fn unsandboxed(workdir: &Path, destdir: &Path) -> Self {
+    pub fn unsandboxed_in(ctx: &BuildContext, workdir: &Path, destdir: &Path) -> Self {
         warn!(
             workdir = %workdir.display(),
             destdir = %destdir.display(),
@@ -295,9 +299,18 @@ impl BuildSandbox {
             destdir: destdir.to_path_buf(),
             visible: Vec::new(),
             progress: Task::detached(),
-            // Never read: `run_on_host` does not call `resolve`.
-            path: OsString::new(),
+            path: ctx.path.clone(),
         }
+    }
+
+    /// As [`BuildSandbox::unsandboxed_in`], reading `PATH` from the process.
+    #[must_use]
+    pub fn unsandboxed(workdir: &Path, destdir: &Path) -> Self {
+        Self::unsandboxed_in(
+            &BuildContext::from_env().expect("capture the ambient build context"),
+            workdir,
+            destdir,
+        )
     }
 
     /// Report this sandbox's commands under `task`, one nested line each.
@@ -449,7 +462,8 @@ impl BuildSandbox {
         );
 
         let task = self.progress.child(basename(program));
-        let mut host = HostCommand::new(program);
+        let program = self.resolve_host(program, step_name)?;
+        let mut host = HostCommand::new(&program);
         let host = host
             .args(args)
             .current_dir(&self.workdir)
@@ -475,7 +489,7 @@ impl BuildSandbox {
                 .spawn()
                 .into_diagnostic()
                 .wrap_err_with(failure)?;
-            let mut guard = HostChild::new(child, program.to_owned());
+            let mut guard = HostChild::new(child, program.to_string_lossy().into_owned());
             let (stdout, stderr) = guard.take_pipes();
             let out = pump(stdout, stderr, &task);
             let status = guard.wait().wrap_err_with(failure)?;
@@ -498,6 +512,34 @@ impl BuildSandbox {
             "Command `{command}` in step `{step_name}` failed with {}\n{}",
             status,
             out.describe()
+        ))
+    }
+
+    /// Turn the first word of an unsandboxed command into a real host path,
+    /// searching the caller's `PATH` rather than the process's.
+    fn resolve_host(&self, program: &str, step_name: &str) -> miette::Result<PathBuf> {
+        if program.contains('/') {
+            let path = PathBuf::from(program);
+            if is_executable(&path) {
+                return Ok(path);
+            }
+            return Err(miette!(
+                "Step `{step_name}` wants `{program}`, but that path does not name an executable file"
+            ));
+        }
+
+        for dir in env::split_paths(&self.path) {
+            if !dir.is_absolute() {
+                continue;
+            }
+            let candidate = dir.join(program);
+            if is_executable(&candidate) {
+                return Ok(candidate);
+            }
+        }
+
+        Err(miette!(
+            "Step `{step_name}` wants `{program}`, which is not on PATH"
         ))
     }
 

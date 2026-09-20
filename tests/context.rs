@@ -168,6 +168,7 @@ fn a_path_supplied_through_the_context_resolves_a_steps_first_word() {
     // orthogonal to what this test proves: PATH resolution.
     let options = BuildOptions {
         permissive: true,
+        unsandboxed: true,
         ..BuildOptions::default()
     };
 
@@ -213,6 +214,7 @@ fn a_cancelled_token_makes_a_parked_worker_return_instead_of_hang() {
     // to reach - see the CRITICAL note on `Graph::claim`.
     let options = BuildOptions {
         jobs: NonZeroUsize::new(2),
+        unsandboxed: true,
         ..BuildOptions::default()
     };
     let graph = Graph::resolve_in(&ctx, &build, options).expect("the graph must resolve");

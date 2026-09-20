@@ -31,6 +31,13 @@ fn ctx_at(dir: &Path) -> BuildContext {
         .with_output_dir(dir.to_path_buf())
 }
 
+fn unsandboxed_options() -> BuildOptions<'static> {
+    BuildOptions {
+        unsandboxed: true,
+        ..BuildOptions::default()
+    }
+}
+
 /// Stages a binary and two libraries into `DESTDIR`.
 ///
 /// `Step` splits commands on whitespace and execs directly - there is no shell,
@@ -53,7 +60,7 @@ printf 'stand-in for an archive\\n' > \"$DESTDIR/usr/lib/libbar.a\"\n";
 /// relative result to resolve.
 fn run_in(build: &BuildFile, at: &Path) -> PathBuf {
     build
-        .run_with_progress_in(&ctx_at(at), BuildOptions::default(), &Progress::disabled())
+        .run_with_progress_in(&ctx_at(at), unsandboxed_options(), &Progress::disabled())
         .expect("the build must succeed")
 }
 
@@ -328,7 +335,7 @@ fn a_build_whose_step_fails_does_not_leave_an_archive_behind() {
         build
             .run_with_progress_in(
                 &ctx_at(work.path()),
-                BuildOptions::default(),
+                unsandboxed_options(),
                 &Progress::disabled()
             )
             .is_err(),
@@ -394,7 +401,7 @@ fn a_dependency_that_does_not_exist_fails_the_build_and_names_the_path() {
     let error = build
         .run_with_progress_in(
             &ctx_at(work.path()),
-            BuildOptions::default(),
+            unsandboxed_options(),
             &Progress::disabled(),
         )
         .expect_err("a dependency that is not on disk must fail the build");
@@ -514,7 +521,7 @@ fn a_dependency_cycle_is_rejected_rather_than_recursing_forever() {
     spawn(move || {
         let outcome = BuildFile::load_unverified(&first)
             .and_then(|build| {
-                build.run_with_progress_in(&ctx, BuildOptions::default(), &Progress::disabled())
+                build.run_with_progress_in(&ctx, unsandboxed_options(), &Progress::disabled())
             })
             .map(|archive| archive.display().to_string())
             .map_err(|error| format!("{error}\n{error:?}"));
@@ -633,7 +640,7 @@ fn a_build_reporting_into_a_region_still_produces_its_archive() {
     let progress = Progress::to_writer(Box::new(std::io::sink()), 100);
 
     let archive = build
-        .run_with_progress_in(&ctx_at(work.path()), BuildOptions::default(), &progress)
+        .run_with_progress_in(&ctx_at(work.path()), unsandboxed_options(), &progress)
         .expect("the build must succeed with a region attached");
 
     assert!(
