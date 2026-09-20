@@ -57,17 +57,17 @@ use std::{
     },
     path::{Path, PathBuf},
     sync::{
+        Arc,
         atomic::{AtomicBool, Ordering},
         mpsc::{self, Sender},
-        Arc,
     },
     thread::{self, JoinHandle},
     time::Duration,
 };
 
-use miette::{miette, IntoDiagnostic, WrapErr};
+use miette::{IntoDiagnostic, WrapErr, miette};
 use serde::{Deserialize, Serialize};
-use tracing::{warn, Level};
+use tracing::{Level, warn};
 use tracing_subscriber::fmt;
 
 use crate::{
@@ -75,7 +75,7 @@ use crate::{
     context::BuildContext,
     graph::Graph,
     plugin::Registry,
-    progress::{sanitise, Progress},
+    progress::{Progress, sanitise},
     wire::{
         frame::{read_frame, write_frame},
         types::{CallerContext, Diagnostic, LogLine, PackageOutcome, ProgressNode},

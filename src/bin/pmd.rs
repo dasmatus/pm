@@ -90,9 +90,7 @@ fn die_with_parent_or_exit() -> Result<(), ExitCode> {
     }
     let after = getppid();
     if before != after {
-        eprintln!(
-            "pmd: parent process exited before PDEATHSIG could be armed against it; exiting"
-        );
+        eprintln!("pmd: parent process exited before PDEATHSIG could be armed against it; exiting");
         return Err(ExitCode::FAILURE);
     }
     Ok(())

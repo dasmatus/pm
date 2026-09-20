@@ -60,7 +60,10 @@ fn tracing_a_real_program_exits_zero_prints_its_output_and_records_an_openat() {
     let observations = report["observations"]
         .as_sequence()
         .expect("observations is a list");
-    assert!(!observations.is_empty(), "expected at least one observation");
+    assert!(
+        !observations.is_empty(),
+        "expected at least one observation"
+    );
     assert!(
         observations
             .iter()
@@ -153,8 +156,11 @@ fn the_report_replaces_a_permission_locked_target_by_rename_not_in_place_write()
     let dir = tempdir().expect("temp dir");
     let report_path = dir.path().join("report.yaml");
 
-    write(&report_path, "sentinel: old-content-that-must-not-survive\n")
-        .expect("seed the target with old content");
+    write(
+        &report_path,
+        "sentinel: old-content-that-must-not-survive\n",
+    )
+    .expect("seed the target with old content");
     set_permissions(&report_path, Permissions::from_mode(0o000))
         .expect("lock down the pre-existing target");
 

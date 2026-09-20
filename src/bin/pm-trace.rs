@@ -78,7 +78,11 @@ const EXIT_INTERNAL_FAILURE: u8 = 1;
 /// runs the program to completion or until the timeout fires, then writes the resulting
 /// report as YAML to `--report` and exits with a code that says which of those happened.
 #[derive(Parser)]
-#[clap(name = "pm-trace", version, about = "Trace one program under ptrace and record what it touched")]
+#[clap(
+    name = "pm-trace",
+    version,
+    about = "Trace one program under ptrace and record what it touched"
+)]
 struct Args {
     /// Where the trace report is written, as YAML.
     ///

@@ -45,7 +45,7 @@ use std::{
 };
 
 use hakoniwa::{Container, MountOptions, Namespace, Runctl, Stdio};
-use miette::{miette, IntoDiagnostic, WrapErr};
+use miette::{IntoDiagnostic, WrapErr, miette};
 use tracing::{debug, info, warn};
 
 use crate::{

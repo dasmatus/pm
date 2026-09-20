@@ -19,13 +19,13 @@ use std::{
     any::Any,
     collections::HashMap,
     num::NonZeroUsize,
-    panic::{catch_unwind, AssertUnwindSafe},
+    panic::{AssertUnwindSafe, catch_unwind},
     path::{Path, PathBuf},
     sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError},
     thread::{available_parallelism, scope},
 };
 
-use miette::{miette, IntoDiagnostic, WrapErr};
+use miette::{IntoDiagnostic, WrapErr, miette};
 use tracing::{debug, info, warn};
 
 use crate::{

@@ -21,9 +21,9 @@ use std::{
     process::Command,
 };
 
-use miette::{miette, IntoDiagnostic, WrapErr};
+use miette::{IntoDiagnostic, WrapErr, miette};
 use serde::{Deserialize, Serialize};
-use serde_yaml::{from_str, to_string, to_value, Value};
+use serde_yaml::{Value, from_str, to_string, to_value};
 use tracing::{debug, info, warn};
 use walkdir::WalkDir;
 
@@ -31,12 +31,12 @@ use crate::{
     context::BuildContext,
     graph::Graph,
     metadata::{Metadata, Type},
-    perms::{elf, source, Enforcement, Permissions},
+    perms::{Enforcement, Permissions, elf, source},
     plugin::Registry,
     policy::BuildPolicy,
     progress::{Progress, Task},
     sandbox::BuildSandbox,
-    signing::{verify_file, TrustStore},
+    signing::{TrustStore, verify_file},
     step::{Stage, Step},
     workspace::Workspace,
 };

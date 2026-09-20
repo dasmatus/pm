@@ -19,7 +19,7 @@ use pm::context::BuildContext;
 use pm::metadata::{LibraryType, Metadata, Type};
 use pm::progress::Progress;
 use serde_yaml::from_str;
-use tempfile::{tempdir, TempDir};
+use tempfile::{TempDir, tempdir};
 
 mod common;
 use common::{build_file_yaml, write_build_file};

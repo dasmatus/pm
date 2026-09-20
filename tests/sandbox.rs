@@ -20,7 +20,7 @@ use pm::bf::{BuildFile, BuildOptions};
 use pm::context::BuildContext;
 use pm::progress::Progress;
 use pm::run::PackageRunner;
-use pm::signing::{sign_file, SigningKey, TrustStore};
+use pm::signing::{SigningKey, TrustStore, sign_file};
 use pm::workspace::{HostChild, SandboxedChild, Workspace};
 use serde::Serialize;
 use serde_yaml::to_string;

@@ -20,7 +20,7 @@ use std::{
 use nix::libc;
 use pm::{
     daemon::worker::{JobKind, WorkerEvent, WorkerRequest},
-    signing::{sign_file, SigningKey, TrustStore},
+    signing::{SigningKey, TrustStore, sign_file},
     wire::{
         frame::{read_frame, write_frame},
         types::{CallerContext, PackageOutcome},

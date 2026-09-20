@@ -107,9 +107,7 @@ impl From<&Report> for Diagnostic {
         let spent = message.len() + help.len();
         let worst_case_dropped = overflow + causes.len();
         let reserved = drop_marker(worst_case_dropped).map_or(0, |marker| marker.len());
-        let mut remaining = TOTAL_BUDGET
-            .saturating_sub(spent)
-            .saturating_sub(reserved);
+        let mut remaining = TOTAL_BUDGET.saturating_sub(spent).saturating_sub(reserved);
 
         let mut dropped = overflow;
         causes.retain(|cause| {

@@ -11,7 +11,9 @@ use std::io::Cursor;
 use miette::Report;
 use pm::wire::{
     frame::{MAX_FRAME, read_frame, write_frame},
-    types::{CallerContext, Diagnostic, JobRow, LogLine, Observation, PackageOutcome, ProgressNode},
+    types::{
+        CallerContext, Diagnostic, JobRow, LogLine, Observation, PackageOutcome, ProgressNode,
+    },
 };
 use zbus::zvariant::Type;
 
@@ -143,14 +145,19 @@ fn reading_past_a_truncated_frame_is_an_error_not_a_panic() {
 
     let result = read_frame(&mut reader);
 
-    assert!(result.is_err(), "a short read must be an error, not a hang or a panic");
+    assert!(
+        result.is_err(),
+        "a short read must be an error, not a hang or a panic"
+    );
 }
 
 /// The combined content size a `Diagnostic` is allowed: `message`, `help`
 /// and every `causes` entry together, per the design spec's 64 KiB budget.
 /// `name` is deliberately excluded, matching the spec's own wording.
 fn diagnostic_content_bytes(diagnostic: &Diagnostic) -> usize {
-    diagnostic.message.len() + diagnostic.help.len() + diagnostic.causes.iter().map(String::len).sum::<usize>()
+    diagnostic.message.len()
+        + diagnostic.help.len()
+        + diagnostic.causes.iter().map(String::len).sum::<usize>()
 }
 
 #[test]
@@ -241,7 +248,10 @@ fn sixteen_full_causes_plus_overflow_stays_within_the_64kib_budget() {
 
     let diagnostic = Diagnostic::from(&report);
 
-    assert_eq!(diagnostic.message, "", "the empty head must sanitise to empty, not add bytes of its own");
+    assert_eq!(
+        diagnostic.message, "",
+        "the empty head must sanitise to empty, not add bytes of its own"
+    );
     assert_eq!(diagnostic.help, "");
     assert!(
         diagnostic_content_bytes(&diagnostic) <= 64 * 1024,
@@ -252,7 +262,11 @@ fn sixteen_full_causes_plus_overflow_stays_within_the_64kib_budget() {
     // and then appending one marker leaves the same COUNT. What proves the
     // budget actually trimmed something is that fewer than all 16 original
     // full-size (4096-byte) causes survive.
-    let full_size_causes = diagnostic.causes.iter().filter(|cause| cause.len() == 4096).count();
+    let full_size_causes = diagnostic
+        .causes
+        .iter()
+        .filter(|cause| cause.len() == 4096)
+        .count();
     assert!(
         full_size_causes < 16,
         "fitting the marker inside the budget must cost at least one full-size cause: kept {full_size_causes} of the original 16"

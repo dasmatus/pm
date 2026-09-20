@@ -416,7 +416,11 @@ fn a_thousand_messages_leave_one_node_capped_at_512_chars() {
     }
 
     let nodes = progress.nodes();
-    assert_eq!(nodes.len(), 1, "1000 updates to one node must still be one node");
+    assert_eq!(
+        nodes.len(),
+        1,
+        "1000 updates to one node must still be one node"
+    );
     assert!(
         nodes[0].text.chars().count() <= 512,
         "the stored text must never exceed the wire cap: got {} chars",
@@ -447,7 +451,11 @@ fn sanitise_truncates_with_a_visible_marker_and_never_exceeds_the_cap() {
 
     let result = sanitise(&long, 10);
 
-    assert_eq!(result.chars().count(), 10, "a truncated result stays exactly at the cap");
+    assert_eq!(
+        result.chars().count(),
+        10,
+        "a truncated result stays exactly at the cap"
+    );
     assert!(
         result.ends_with('…'),
         "truncation must be visible, not silently indistinguishable from a short message: {result:?}"
@@ -472,14 +480,26 @@ fn nodes_reports_the_tree_as_wire_types() {
 
     let root = &nodes[0];
     assert_eq!(root.label, "zlib-1.3.1");
-    assert_eq!(root.parent, 0, "a top-level node's parent is the 0 sentinel");
+    assert_eq!(
+        root.parent, 0,
+        "a top-level node's parent is the 0 sentinel"
+    );
     assert_eq!(root.depth, 0);
-    assert_ne!(root.id, 0, "0 is reserved for \"no parent\", so a real id is never 0");
-    assert!(root.started_usec > 0, "started_usec must be a real wall-clock reading");
+    assert_ne!(
+        root.id, 0,
+        "0 is reserved for \"no parent\", so a real id is never 0"
+    );
+    assert!(
+        root.started_usec > 0,
+        "started_usec must be a real wall-clock reading"
+    );
 
     let child = &nodes[1];
     assert_eq!(child.label, "make");
-    assert_eq!(child.parent, root.id, "the command's parent must be the package's wire id");
+    assert_eq!(
+        child.parent, root.id,
+        "the command's parent must be the package's wire id"
+    );
     assert_eq!(child.depth, 1);
     assert_eq!(child.kind, 1, "kind 1 is Message");
     assert_eq!(child.text, "CC deflate.o");
@@ -519,8 +539,15 @@ fn silent_mode_tracks_nodes_exactly_like_a_live_region() {
     command.set_bytes(1024, Some(2048));
 
     let nodes = progress.nodes();
-    assert_eq!(nodes.len(), 2, "bookkeeping runs exactly as it does for a live region");
-    assert_eq!(nodes[1].kind, 2, "the latest report replaces the node's detail, as in live mode");
+    assert_eq!(
+        nodes.len(),
+        2,
+        "bookkeeping runs exactly as it does for a live region"
+    );
+    assert_eq!(
+        nodes[1].kind, 2,
+        "the latest report replaces the node's detail, as in live mode"
+    );
     assert_eq!(nodes[1].done, 1024);
     assert_eq!(nodes[1].total, 2048);
 

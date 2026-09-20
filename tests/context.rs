@@ -22,11 +22,11 @@ use pm::context::BuildContext;
 use pm::download::Downloader;
 use pm::graph::Graph;
 use pm::progress::Progress;
-use pm::signing::{sign_file, SigningKey, TrustStore};
+use pm::signing::{SigningKey, TrustStore, sign_file};
 use tempfile::tempdir;
 
 mod common;
-use common::{build_file_yaml, write_build_file, TestServer};
+use common::{TestServer, build_file_yaml, write_build_file};
 
 #[test]
 fn output_dir_from_the_context_places_the_archive_there() {
