@@ -245,6 +245,9 @@ fn build_at(root: &Path, at: &Path, jobs: usize) -> miette::Result<PathBuf> {
 /// every time another test is added.
 fn timed_build_at(root: &Path, at: &Path, jobs: usize) -> (miette::Result<PathBuf>, Duration) {
     let options = BuildOptions {
+        // These tests exercise graph scheduling and dependency handling, not the
+        // namespace-backed build jail. The dedicated sandbox suites cover that.
+        unsandboxed: true,
         jobs: NonZeroUsize::new(jobs),
         ..BuildOptions::default()
     };

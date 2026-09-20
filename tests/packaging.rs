@@ -42,7 +42,14 @@ printf 'stand-in for an archive\\n' > \"$DESTDIR/usr/lib/libbar.a\"\n";
 /// path to whatever archive it produced.
 fn run_in(build: &BuildFile, at: &Path) -> PathBuf {
     let _cwd = CwdGuard::enter(at);
-    let produced = build.run().expect("the build must succeed");
+    let produced = build
+        .run_with(BuildOptions {
+            // These tests exercise packaging, metadata and dependency bundling.
+            // The dedicated sandbox suites cover namespace-backed confinement.
+            unsandboxed: true,
+            ..BuildOptions::default()
+        })
+        .expect("the build must succeed");
     // Resolve relative results while the current directory is still the one
     // `run()` wrote into.
     if produced.is_absolute() {
@@ -321,7 +328,12 @@ fn a_build_whose_step_fails_does_not_leave_an_archive_behind() {
 
     let _cwd = CwdGuard::enter(work.path());
     assert!(
-        build.run().is_err(),
+        build
+            .run_with(BuildOptions {
+                unsandboxed: true,
+                ..BuildOptions::default()
+            })
+            .is_err(),
         "a failing build step must fail the build"
     );
     assert!(
@@ -613,14 +625,20 @@ fn a_build_reporting_into_a_region_still_produces_its_archive() {
     let build = BuildFile::load_unverified(&build_file).expect("the build file must load");
 
     // A region that renders for real, into nothing. This is the whole stack:
-    // a package line, a jailed command under it whose stdout is captured and
+    // a package line, a build command under it whose stdout is captured and
     // streamed into that line, and the archive at the end of it.
     let progress = Progress::to_writer(Box::new(std::io::sink()), 100);
 
     let archive = {
         let _cwd = CwdGuard::enter(work.path());
         let produced = build
-            .run_with_progress(BuildOptions::default(), &progress)
+            .run_with_progress(
+                BuildOptions {
+                    unsandboxed: true,
+                    ..BuildOptions::default()
+                },
+                &progress,
+            )
             .expect("the build must succeed with a region attached");
         if produced.is_absolute() {
             produced
