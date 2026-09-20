@@ -21,9 +21,9 @@ use std::{
     process::Command,
 };
 
-use miette::{IntoDiagnostic, WrapErr, miette};
+use miette::{miette, IntoDiagnostic, WrapErr};
 use serde::{Deserialize, Serialize};
-use serde_yaml::{Value, from_str, to_string, to_value};
+use serde_yaml::{from_str, to_string, to_value, Value};
 use tracing::{debug, info, warn};
 use walkdir::WalkDir;
 
@@ -31,11 +31,11 @@ use crate::{
     context::BuildContext,
     graph::Graph,
     metadata::{Metadata, Type},
-    perms::{Enforcement, Permissions, elf, source},
+    perms::{elf, source, Enforcement, Permissions},
     policy::BuildPolicy,
     progress::{Progress, Task},
     sandbox::BuildSandbox,
-    signing::{TrustStore, verify_file},
+    signing::{verify_file, TrustStore},
     step::{Stage, Step},
     workspace::Workspace,
 };
@@ -583,7 +583,7 @@ impl BuildFile {
         dependency_archives: &[PathBuf],
     ) -> miette::Result<BuildSandbox> {
         if env.options.unsandboxed {
-            return Ok(BuildSandbox::unsandboxed(workdir, staging));
+            return Ok(BuildSandbox::unsandboxed_in(env.ctx, workdir, staging));
         }
 
         let read_only = self.read_only_mounts(dependency_archives);

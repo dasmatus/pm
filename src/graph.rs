@@ -19,13 +19,13 @@ use std::{
     any::Any,
     collections::HashMap,
     num::NonZeroUsize,
-    panic::{AssertUnwindSafe, catch_unwind},
+    panic::{catch_unwind, AssertUnwindSafe},
     path::{Path, PathBuf},
     sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError},
     thread::{available_parallelism, scope},
 };
 
-use miette::{IntoDiagnostic, WrapErr, miette};
+use miette::{miette, IntoDiagnostic, WrapErr};
 use tracing::{debug, info, warn};
 
 use crate::{
@@ -252,6 +252,10 @@ impl Graph {
             lock(&bridge_schedule).cancelled = true;
             bridge_wakeup.notify_all();
         });
+        if cancel.is_cancelled() {
+            lock(&schedule).cancelled = true;
+            wakeup.notify_all();
+        }
 
         let run = BuildRun {
             ctx,

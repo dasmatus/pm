@@ -22,11 +22,11 @@ use pm::context::BuildContext;
 use pm::download::Downloader;
 use pm::graph::Graph;
 use pm::progress::Progress;
-use pm::signing::{SigningKey, TrustStore, sign_file};
+use pm::signing::{sign_file, SigningKey, TrustStore};
 use tempfile::tempdir;
 
 mod common;
-use common::{TestServer, build_file_yaml, write_build_file};
+use common::{build_file_yaml, write_build_file, TestServer};
 
 #[test]
 fn output_dir_from_the_context_places_the_archive_there() {
@@ -179,6 +179,54 @@ fn a_path_supplied_through_the_context_resolves_a_steps_first_word() {
 }
 
 #[test]
+fn a_path_and_home_supplied_through_the_context_are_used_unsandboxed() {
+    let work = tempdir().expect("work directory");
+    let toolchain = tempdir().expect("toolchain directory");
+    let home = tempdir().expect("home directory");
+    let seen_home = work.path().join("seen-home.txt");
+    let tool = toolchain.path().join("pm-context-host-tool");
+    write(
+        &tool,
+        format!(
+            "#!/bin/sh\nset -eu\nprintf '%s\\n' \"$HOME\" > \"{}\"\n",
+            seen_home.display()
+        ),
+    )
+    .expect("write the tool");
+    let chmod = Command::new("chmod")
+        .arg("755")
+        .arg(&tool)
+        .status()
+        .expect("chmod the tool");
+    assert!(chmod.success(), "chmod must succeed");
+
+    let build_file = write_build_file(
+        work.path().join("build.yaml"),
+        &build_file_yaml("pathhomecheck", &["1"], &[], &["pm-context-host-tool"]),
+    );
+    let build = BuildFile::load_unverified(&build_file).expect("load the build file");
+    let ctx = BuildContext::from_env()
+        .expect("capture the ambient build context")
+        .with_output_dir(work.path().to_path_buf())
+        .with_path(toolchain.path().as_os_str().to_owned())
+        .with_home(Some(home.path().to_path_buf()));
+    let options = BuildOptions {
+        permissive: true,
+        unsandboxed: true,
+        ..BuildOptions::default()
+    };
+
+    build
+        .run_with_progress_in(&ctx, options, &Progress::disabled())
+        .expect("an unsandboxed build must use PATH and HOME from the explicit context");
+
+    assert_eq!(
+        std::fs::read_to_string(&seen_home).expect("read the tool output"),
+        format!("{}\n", home.path().display())
+    );
+}
+
+#[test]
 fn a_cancelled_token_makes_a_parked_worker_return_instead_of_hang() {
     let dir = tempdir().expect("a temporary directory");
 
@@ -282,5 +330,35 @@ fn a_cancelled_token_stops_a_download_between_chunks() {
     assert!(
         !dest.exists(),
         "a cancelled download must not leave a partial file behind"
+    );
+}
+
+#[test]
+fn a_pre_cancelled_token_stops_scheduling_before_any_package_starts() {
+    let dir = tempdir().expect("a temporary directory");
+    let top = write_build_file(
+        dir.path().join("top.yaml"),
+        &build_file_yaml("precanceltop", &["1"], &[], &[]),
+    );
+
+    let build = BuildFile::load_unverified(&top).expect("load the root build file");
+    let ctx = BuildContext::from_env()
+        .expect("capture the ambient build context")
+        .with_output_dir(dir.path().to_path_buf());
+    let options = BuildOptions::default();
+    let graph = Graph::resolve_in(&ctx, &build, options).expect("the graph must resolve");
+
+    let cancel = Cancel::new();
+    cancel.cancel();
+    let result = graph.build_with(&ctx, options, &Progress::disabled(), &cancel);
+
+    assert!(
+        result.is_err(),
+        "a pre-cancelled token must prevent scheduling, got {:?}",
+        result.ok()
+    );
+    assert!(
+        !dir.path().join("precanceltop-1.cpkg").exists(),
+        "no package archive must be produced when cancellation is already set"
     );
 }

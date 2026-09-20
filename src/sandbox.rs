@@ -45,7 +45,7 @@ use std::{
 };
 
 use hakoniwa::{Container, MountOptions, Namespace, Runctl, Stdio};
-use miette::{IntoDiagnostic, WrapErr, miette};
+use miette::{miette, IntoDiagnostic, WrapErr};
 use tracing::{debug, info, warn};
 
 use crate::{
@@ -74,7 +74,8 @@ pub const CONTAINER_DESTDIR: &str = "/dest";
 /// `pub(crate)` so [`crate::context::BuildContext::from_env`] can fall back to
 /// it when the process has no `PATH` at all - the same fallback `resolve`
 /// used to apply itself before it started taking `PATH` from a context.
-pub(crate) const CONTAINER_PATH: &str = "/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bin:/sbin";
+pub(crate) const CONTAINER_PATH: &str =
+    "/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bin:/sbin";
 
 /// The directories `Container::rootfs("/")` mirrors from the host.
 ///
@@ -143,10 +144,12 @@ pub struct BuildSandbox {
     progress: Task,
     /// `PATH` used to resolve a step's first word, from the [`BuildContext`]
     /// this sandbox was built with. Unused in [`Mode::Host`]: a command run
-    /// there goes through [`std::process::Command`] directly, which lets the
-    /// host's own `execvp` do its own `PATH` search over the *process's*
-    /// environment rather than this one.
+    /// there goes through [`std::process::Command`] directly, with this value
+    /// explicitly set on the child process.
     path: OsString,
+    /// `$HOME` handed to host commands in [`Mode::Host`]. `None` means remove
+    /// `HOME` from the child process environment.
+    home: Option<PathBuf>,
 }
 
 /// Whether commands are confined or run straight on the host.
@@ -172,7 +175,13 @@ impl BuildSandbox {
         destdir: &Path,
         extra_ro: &[&Path],
     ) -> miette::Result<Self> {
-        Self::new_in(&BuildContext::from_env()?, policy, workdir, destdir, extra_ro)
+        Self::new_in(
+            &BuildContext::from_env()?,
+            policy,
+            workdir,
+            destdir,
+            extra_ro,
+        )
     }
 
     /// Build a jail for `policy`, staging into `workdir` and `destdir`.
@@ -270,18 +279,36 @@ impl BuildSandbox {
             visible,
             progress: Task::detached(),
             path: ctx.path.clone(),
+            home: ctx.home.clone(),
         })
     }
 
     /// An unsandboxed escape hatch for debugging: commands run unconfined on
     /// the host, as the calling user.
     ///
-    /// Unlike [`BuildSandbox::new_in`], this takes no [`BuildContext`]: a
-    /// command run this way goes through [`std::process::Command`] directly,
-    /// which searches the *process's* `PATH` itself rather than going through
-    /// [`BuildSandbox::resolve`].
+    /// Unlike [`BuildSandbox::new_in`], this captures `PATH` and `$HOME` from
+    /// the process environment. Use [`BuildSandbox::unsandboxed_in`] when an
+    /// explicit [`BuildContext`] has to be preserved.
     #[must_use]
     pub fn unsandboxed(workdir: &Path, destdir: &Path) -> Self {
+        let path = env::var_os("PATH").unwrap_or_else(|| OsString::from(CONTAINER_PATH));
+        let home = env::var_os("HOME").map(PathBuf::from);
+        Self::unsandboxed_with_env(workdir, destdir, path, home)
+    }
+
+    /// As [`BuildSandbox::unsandboxed`], using an explicit [`BuildContext`]
+    /// instead of the ambient process environment.
+    #[must_use]
+    pub fn unsandboxed_in(ctx: &BuildContext, workdir: &Path, destdir: &Path) -> Self {
+        Self::unsandboxed_with_env(workdir, destdir, ctx.path.clone(), ctx.home.clone())
+    }
+
+    fn unsandboxed_with_env(
+        workdir: &Path,
+        destdir: &Path,
+        path: OsString,
+        home: Option<PathBuf>,
+    ) -> Self {
         warn!(
             workdir = %workdir.display(),
             destdir = %destdir.display(),
@@ -295,8 +322,8 @@ impl BuildSandbox {
             destdir: destdir.to_path_buf(),
             visible: Vec::new(),
             progress: Task::detached(),
-            // Never read: `run_on_host` does not call `resolve`.
-            path: OsString::new(),
+            path,
+            home,
         }
     }
 
@@ -450,12 +477,17 @@ impl BuildSandbox {
 
         let task = self.progress.child(basename(program));
         let mut host = HostCommand::new(program);
-        let host = host
-            .args(args)
+        host.args(args)
             .current_dir(&self.workdir)
             .env("DESTDIR", &self.destdir)
+            .env("PATH", &self.path)
             .stdin(HostStdio::null())
             .stderr(HostStdio::piped());
+        if let Some(home) = &self.home {
+            host.env("HOME", home);
+        } else {
+            host.env_remove("HOME");
+        }
 
         let failure = || {
             format!(

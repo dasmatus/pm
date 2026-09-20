@@ -58,23 +58,23 @@ use std::{
     },
     path::{Path, PathBuf},
     sync::{
-        Arc,
         atomic::{AtomicBool, Ordering},
         mpsc::{self, Sender},
+        Arc,
     },
     thread::{self, JoinHandle},
     time::Duration,
 };
 
-use miette::{IntoDiagnostic, WrapErr};
+use miette::{miette, IntoDiagnostic, WrapErr};
 use serde::{Deserialize, Serialize};
-use tracing::{Level, warn};
+use tracing::{warn, Level};
 use tracing_subscriber::fmt;
 
 use crate::{
     bf::{BuildFile, BuildOptions},
     graph::Graph,
-    progress::{Progress, sanitise},
+    progress::{sanitise, Progress},
     wire::{
         frame::{read_frame, write_frame},
         types::{CallerContext, Diagnostic, LogLine, PackageOutcome, ProgressNode},
@@ -328,14 +328,8 @@ pub fn run(fd: RawFd) -> miette::Result<()> {
 
     match writer.join() {
         Ok(Ok(())) => Ok(()),
-        Ok(Err(report)) => {
-            warn!(error = ?report, "failed to write every worker event");
-            Ok(())
-        }
-        Err(_) => {
-            warn!("the worker event writer thread panicked");
-            Ok(())
-        }
+        Ok(Err(report)) => Err(report),
+        Err(_) => Err(miette!("the worker event writer thread panicked")),
     }
 }
 
@@ -605,6 +599,8 @@ fn find_archive(dir: &Path, name: &str) -> Option<PathBuf> {
         .find(|path| {
             path.file_name()
                 .and_then(|file_name| file_name.to_str())
-                .is_some_and(|file_name| file_name.starts_with(&prefix) && file_name.ends_with(".cpkg"))
+                .is_some_and(|file_name| {
+                    file_name.starts_with(&prefix) && file_name.ends_with(".cpkg")
+                })
         })
 }
