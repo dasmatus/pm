@@ -79,7 +79,11 @@ fn permissive_builds_a_command_that_matches_no_fingerprint() {
     let file = build_file(work.path(), &with_command("basename /a/b"));
     let path = file.display().to_string();
 
-    let strict = pm_build(&["build", &path], work.path());
+    // This test is about the classification gate, not the build jail: the
+    // dedicated sandbox suites already cover namespace-dependent confinement.
+    // Run both variants unsandboxed so the default test suite does not depend
+    // on kernel features it deliberately leaves to tests/sandbox.rs.
+    let strict = pm_build(&["build", "--unsandboxed", &path], work.path());
     let stderr = String::from_utf8_lossy(&strict.stderr);
     assert!(
         !strict.status.success(),
@@ -87,7 +91,10 @@ fn permissive_builds_a_command_that_matches_no_fingerprint() {
          succeeded:\n{stderr}"
     );
 
-    let permissive = pm_build(&["build", "--permissive", &path], work.path());
+    let permissive = pm_build(
+        &["build", "--permissive", "--unsandboxed", &path],
+        work.path(),
+    );
     assert!(
         permissive.status.success(),
         "--permissive must let the same build through, got:\n{}",
