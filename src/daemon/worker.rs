@@ -39,17 +39,16 @@
 //! # Caller context, and why mutating this process is fine here
 //!
 //! [`apply_caller_context`] changes this process's current directory and
-//! environment to match the job's [`CallerContext`]. Task 1's
-//! `BuildContext`, which would let the library accept these explicitly
-//! instead, is landing in a parallel branch not yet merged into this one -
-//! see that function's own docs for exactly what that leaves unwired.
+//! environment to match the job's [`CallerContext`], while [`run_build`]
+//! carries the caller's trust store and output directory through an explicit
+//! [`BuildContext`].
 //! Mutating process-global state to answer for a single caller is only
 //! sound because this worker is a fresh, single-purpose process that
 //! exists to run exactly one job as exactly that caller: `pmd` itself must
 //! never do this, because it serves every client from one process.
 
 use std::{
-    env::{current_dir, set_current_dir},
+    env::set_current_dir,
     fs::read_dir,
     num::NonZeroUsize,
     os::{
@@ -73,7 +72,9 @@ use tracing_subscriber::fmt;
 
 use crate::{
     bf::{BuildFile, BuildOptions},
+    context::BuildContext,
     graph::Graph,
+    plugin::Registry,
     progress::{sanitise, Progress},
     wire::{
         frame::{read_frame, write_frame},
@@ -344,21 +345,6 @@ pub fn run(fd: RawFd) -> miette::Result<()> {
 ///
 /// Returns a diagnostic if `ctx.cwd` cannot be made the current directory.
 ///
-/// # A gap this task leaves open
-///
-/// [`CallerContext::trust_dir`] and [`CallerContext::output_dir`] are NOT
-/// applied here, because nothing in this task's library entry points -
-/// [`BuildFile::load`], [`Graph::resolve`], [`Graph::build`] - takes either
-/// as a parameter. `BuildFile::load` resolves its trust store from
-/// `$XDG_CONFIG_HOME`/`$HOME` internally
-/// (`crate::signing::default_trust_dir`), and every package's archive lands
-/// in [`current_dir`] (`bf.rs`'s `build_alone`, unconditionally, for the
-/// root package and every dependency alike) - which, after this function
-/// runs, is `ctx.cwd`, not `ctx.output_dir`. Task 1's `BuildContext` is
-/// what gives the library a seam to accept either explicitly instead of
-/// leaning on process-global state; until it merges, `HOME` is the only
-/// lever this worker has over where the trust store is read from, and
-/// `cwd` is the only lever it has over where an archive is written.
 fn apply_caller_context(ctx: &CallerContext) -> miette::Result<()> {
     set_current_dir(&ctx.cwd)
         .into_diagnostic()
@@ -450,18 +436,29 @@ fn drain_events(mut sink: UnixStream, events: mpsc::Receiver<WorkerEvent>) -> mi
 /// Loads, resolves and builds `request.target`, turning the result into the
 /// events [`run`] sends back.
 ///
-/// Calls the library's existing public entry points -
-/// [`BuildFile::load`] and [`Graph::resolve`] / [`Graph::build`] - rather
-/// than the higher-level [`BuildFile::run_with_progress`], specifically so
-/// this function can read [`Graph::order`] for the package list before
-/// building: `Graph`'s own per-package Built/Failed/Skipped bookkeeping
-/// (`Progression`, in `graph.rs`) is private, so `order` plus `build`'s
-/// return value are the only public seam this task can build
+/// Calls the explicit-context entry points directly -
+/// [`BuildFile::load_in`] and [`Graph::resolve_in`] / [`Graph::build_in`] -
+/// rather than the higher-level [`BuildFile::run_with_progress_in`],
+/// specifically so this function can read [`Graph::order`] for the package
+/// list before building: `Graph`'s own per-package Built/Failed/Skipped
+/// bookkeeping (`Progression`, in `graph.rs`) is private, so `order` plus
+/// `build`'s return value are the only public seam this task can build
 /// [`PackageOutcome`] from at all. See [`package_outcome`] for exactly what
 /// that costs.
 fn run_build(request: &WorkerRequest, progress: &Progress) -> (Vec<PackageOutcome>, Outcome) {
     let target = Path::new(&request.target);
-    let build_file = match BuildFile::load(target) {
+    let ctx = BuildContext {
+        cwd: PathBuf::from(&request.context.cwd),
+        output_dir: PathBuf::from(&request.context.output_dir),
+        trust_dir: PathBuf::from(&request.context.trust_dir),
+        path: request.context.path.clone().into(),
+        home: match request.context.home.as_str() {
+            "" => None,
+            home => Some(PathBuf::from(home)),
+        },
+        scratch_root: None,
+    };
+    let build_file = match BuildFile::load_in(&ctx, target) {
         Ok(build_file) => build_file,
         Err(report) => return (Vec::new(), Outcome::Failed(Diagnostic::from(&report))),
     };
@@ -470,25 +467,24 @@ fn run_build(request: &WorkerRequest, progress: &Progress) -> (Vec<PackageOutcom
         permissive: request.permissive,
         unsandboxed: request.unsandboxed,
         jobs: request.jobs,
+        plugins: Registry::none(),
     };
 
-    let graph = match Graph::resolve(&build_file, options) {
+    let graph = match Graph::resolve_in(&ctx, &build_file, options) {
         Ok(graph) => graph,
         Err(report) => return (Vec::new(), Outcome::Failed(Diagnostic::from(&report))),
     };
     let names: Vec<String> = graph.order().map(str::to_owned).collect();
     let root_name = build_file.name().to_owned();
+    let output_dir = ctx.output_dir.clone();
 
-    // Read once, before the build runs, rather than once per package below:
-    // `bf.rs::build_alone` calls `current_dir()` itself for every package's
-    // archive destination, and nothing between here and there changes it.
-    let cwd = current_dir().ok();
-
-    match graph.build(options, progress) {
+    match graph.build_in(&ctx, options, progress) {
         Ok(archive) => {
             let outcomes = names
                 .iter()
-                .map(|name| package_outcome(name, &root_name, Some(&archive), cwd.as_deref(), None))
+                .map(|name| {
+                    package_outcome(name, &root_name, Some(&archive), Some(&output_dir), None)
+                })
                 .collect();
             (outcomes, Outcome::Succeeded(archive))
         }
@@ -501,7 +497,7 @@ fn run_build(request: &WorkerRequest, progress: &Progress) -> (Vec<PackageOutcom
                         name,
                         &root_name,
                         None,
-                        cwd.as_deref(),
+                        Some(&output_dir),
                         Some(&diagnostic.message),
                     )
                 })
@@ -544,7 +540,7 @@ fn package_outcome(
     name: &str,
     root: &str,
     root_archive: Option<&Path>,
-    cwd: Option<&Path>,
+    output_dir: Option<&Path>,
     error: Option<&str>,
 ) -> PackageOutcome {
     if name == root {
@@ -564,7 +560,7 @@ fn package_outcome(
         };
     }
 
-    match cwd.and_then(|dir| find_archive(dir, name)) {
+    match output_dir.and_then(|dir| find_archive(dir, name)) {
         // Found by globbing, not by being handed the path: see this
         // function's docs for why that can be a stale file from an earlier
         // run rather than proof this run built anything.

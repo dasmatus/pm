@@ -19,7 +19,7 @@ use pm::context::BuildContext;
 use pm::metadata::{LibraryType, Metadata, Type};
 use pm::progress::Progress;
 use serde_yaml::from_str;
-use tempfile::{TempDir, tempdir};
+use tempfile::{tempdir, TempDir};
 
 mod common;
 use common::{build_file_yaml, write_build_file};
@@ -52,28 +52,18 @@ printf 'stand-in for an archive\\n' > \"$DESTDIR/usr/lib/libbar.a\"\n";
 /// already is too - unlike the process cwd this used to move to, there is no
 /// relative result to resolve.
 fn run_in(build: &BuildFile, at: &Path) -> PathBuf {
-<<<<<<< HEAD
     build
-        .run_with_progress_in(&ctx_at(at), BuildOptions::default(), &Progress::disabled())
+        .run_with_progress_in(
+            &ctx_at(at),
+            BuildOptions {
+                // These tests exercise packaging, metadata and dependency bundling.
+                // The dedicated sandbox suites cover namespace-backed confinement.
+                unsandboxed: true,
+                ..BuildOptions::default()
+            },
+            &Progress::disabled(),
+        )
         .expect("the build must succeed")
-=======
-    let _cwd = CwdGuard::enter(at);
-    let produced = build
-        .run_with(BuildOptions {
-            // These tests exercise packaging, metadata and dependency bundling.
-            // The dedicated sandbox suites cover namespace-backed confinement.
-            unsandboxed: true,
-            ..BuildOptions::default()
-        })
-        .expect("the build must succeed");
-    // Resolve relative results while the current directory is still the one
-    // `run()` wrote into.
-    if produced.is_absolute() {
-        produced
-    } else {
-        current_dir().expect("a current directory").join(produced)
-    }
->>>>>>> origin/master
 }
 
 /// A finished build: the archive, the directory it was extracted into, and the
@@ -345,18 +335,14 @@ fn a_build_whose_step_fails_does_not_leave_an_archive_behind() {
 
     assert!(
         build
-<<<<<<< HEAD
             .run_with_progress_in(
                 &ctx_at(work.path()),
-                BuildOptions::default(),
+                BuildOptions {
+                    unsandboxed: true,
+                    ..BuildOptions::default()
+                },
                 &Progress::disabled()
             )
-=======
-            .run_with(BuildOptions {
-                unsandboxed: true,
-                ..BuildOptions::default()
-            })
->>>>>>> origin/master
             .is_err(),
         "a failing build step must fail the build"
     );
@@ -658,29 +644,16 @@ fn a_build_reporting_into_a_region_still_produces_its_archive() {
     // streamed into that line, and the archive at the end of it.
     let progress = Progress::to_writer(Box::new(std::io::sink()), 100);
 
-<<<<<<< HEAD
     let archive = build
-        .run_with_progress_in(&ctx_at(work.path()), BuildOptions::default(), &progress)
+        .run_with_progress_in(
+            &ctx_at(work.path()),
+            BuildOptions {
+                unsandboxed: true,
+                ..BuildOptions::default()
+            },
+            &progress,
+        )
         .expect("the build must succeed with a region attached");
-=======
-    let archive = {
-        let _cwd = CwdGuard::enter(work.path());
-        let produced = build
-            .run_with_progress(
-                BuildOptions {
-                    unsandboxed: true,
-                    ..BuildOptions::default()
-                },
-                &progress,
-            )
-            .expect("the build must succeed with a region attached");
-        if produced.is_absolute() {
-            produced
-        } else {
-            current_dir().expect("a current directory").join(produced)
-        }
-    };
->>>>>>> origin/master
 
     assert!(
         archive.is_file(),

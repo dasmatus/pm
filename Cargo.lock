@@ -116,7 +116,6 @@ dependencies = [
 ]
 
 [[package]]
-<<<<<<< HEAD
 name = "async-broadcast"
 version = "0.7.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -237,8 +236,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8b75356056920673b02621b35afd0f7dda9306d03c79a30f5c56c44cf256e3de"
 
 [[package]]
-=======
->>>>>>> origin/master
 name = "async-trait"
 version = "0.1.92"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -339,7 +336,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3ded4057c258ba199e2d26386d3af3780957ecaee6c4ef4041c6b4b8b97c0b06"
 
 [[package]]
-<<<<<<< HEAD
+name = "block-buffer"
+version = "0.10.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3078c7629b62d3f0439517fa394996acacc5cbc91c5a20d8c658e77abd503a71"
+dependencies = [
+ "generic-array",
+]
+
+[[package]]
 name = "blocking"
 version = "1.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -350,14 +355,6 @@ dependencies = [
  "futures-io",
  "futures-lite",
  "piper",
-=======
-name = "block-buffer"
-version = "0.10.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3078c7629b62d3f0439517fa394996acacc5cbc91c5a20d8c658e77abd503a71"
-dependencies = [
- "generic-array",
->>>>>>> origin/master
 ]
 
 [[package]]
@@ -850,12 +847,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "34aa73646ffb006b8f5147f3dc182bd4bcb190227ce861fc4a4844bf8e3cb2c0"
 
 [[package]]
-<<<<<<< HEAD
-name = "endi"
-version = "1.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "66b7e2430c6dff6a955451e2cfc438f09cea1965a9d6f87f7e3b90decc014099"
-=======
 name = "encoding_rs"
 version = "0.8.41"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -869,7 +860,12 @@ dependencies = [
  "scopeguard",
  "simdutf8",
 ]
->>>>>>> origin/master
+
+[[package]]
+name = "endi"
+version = "1.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "66b7e2430c6dff6a955451e2cfc438f09cea1965a9d6f87f7e3b90decc014099"
 
 [[package]]
 name = "enumflags2"
@@ -1015,7 +1011,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "53c0fa8157de1303bfffdaa1cc2a673bfffb60102f76b0ef4441659124373fed"
 
 [[package]]
-<<<<<<< HEAD
 name = "futures-lite"
 version = "2.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1027,12 +1022,12 @@ dependencies = [
  "parking",
  "pin-project-lite",
 ]
-=======
+
+[[package]]
 name = "futures-sink"
 version = "0.3.34"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1944426bf7d03f1d14f708785e4b33efd750b36d48a157b836b3efc15ede8e1d"
->>>>>>> origin/master
 
 [[package]]
 name = "futures-task"
@@ -1783,7 +1778,7 @@ dependencies = [
  "tree-sitter-rust",
  "url",
  "walkdir",
-<<<<<<< HEAD
+ "wasmtime",
  "zbus",
 ]
 
@@ -1799,9 +1794,6 @@ dependencies = [
  "pin-project-lite",
  "rustix",
  "windows-sys 0.61.2",
-=======
- "wasmtime",
->>>>>>> origin/master
 ]
 
 [[package]]
@@ -2668,7 +2660,12 @@ dependencies = [
 ]
 
 [[package]]
-<<<<<<< HEAD
+name = "typenum"
+version = "1.20.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b6f5e870be6c3b371b77fe0ee0bafb859fa4964b4404c27de1d380043c4dda20"
+
+[[package]]
 name = "uds_windows"
 version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2678,12 +2675,6 @@ dependencies = [
  "tempfile",
  "windows-sys 0.61.2",
 ]
-=======
-name = "typenum"
-version = "1.20.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b6f5e870be6c3b371b77fe0ee0bafb859fa4964b4404c27de1d380043c4dda20"
->>>>>>> origin/master
 
 [[package]]
 name = "unarray"

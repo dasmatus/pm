@@ -9,11 +9,7 @@
 
 use std::{
     io::Write as _,
-    os::unix::{
-        io::AsRawFd as _,
-        net::UnixStream,
-        process::CommandExt as _,
-    },
+    os::unix::{io::AsRawFd as _, net::UnixStream, process::CommandExt as _},
     path::Path,
     process::{Child, Command, Stdio},
     sync::mpsc,
@@ -24,7 +20,7 @@ use std::{
 use nix::libc;
 use pm::{
     daemon::worker::{JobKind, WorkerEvent, WorkerRequest},
-    signing::{SigningKey, TrustStore, sign_file},
+    signing::{sign_file, SigningKey, TrustStore},
     wire::{
         frame::{read_frame, write_frame},
         types::{CallerContext, PackageOutcome},
@@ -76,19 +72,18 @@ fn write_signed_build_file_named(work: &Path, name: &str, yaml: &str) -> std::pa
     path
 }
 
-/// A [`CallerContext`] naming `work` as both the working directory and the
-/// output directory.
-///
-/// The worker only ever chdirs to `cwd` (see `daemon::worker::apply_caller_context`'s
-/// docs on the gap this leaves): until `BuildContext` lands, an archive
-/// lands wherever `cwd` points, never `output_dir`, so this test keeps the
-/// two equal rather than pretend a value that is silently ignored is doing
-/// something.
+/// A [`CallerContext`] that keeps each test's working tree, output directory,
+/// and trust store self-contained.
 fn caller_context(work: &Path, home: &Path) -> CallerContext {
     CallerContext {
         cwd: work.display().to_string(),
         output_dir: work.display().to_string(),
-        trust_dir: home.join(".config").join("pm").join("trusted").display().to_string(),
+        trust_dir: home
+            .join(".config")
+            .join("pm")
+            .join("trusted")
+            .display()
+            .to_string(),
         path: std::env::var("PATH").expect("PATH must be set for the test to find real tools"),
         home: home.display().to_string(),
     }
@@ -234,8 +229,7 @@ fn a_frame_carrying_a_nested_enum_round_trips() {
     write_frame(&mut a, &payload).expect("write a frame carrying a nested enum");
 
     let received = read_frame(&mut b).expect("read the frame back");
-    let decoded: Outer =
-        serde_json::from_slice(&received).expect("decode a nested enum frame");
+    let decoded: Outer = serde_json::from_slice(&received).expect("decode a nested enum frame");
     assert_eq!(
         decoded, sent,
         "a nested enum must round-trip through this protocol's codec"
@@ -461,7 +455,10 @@ fn read_frame_on_a_truncated_stream_errors_rather_than_hangs() {
     let errored = rx
         .recv_timeout(Duration::from_secs(5))
         .expect("read_frame must return within 5 seconds instead of hanging");
-    assert!(errored, "a truncated frame must be an error, not a short success");
+    assert!(
+        errored,
+        "a truncated frame must be an error, not a short success"
+    );
 
     writer_thread.join().expect("the writer thread panicked");
     reader_thread.join().expect("the reader thread panicked");

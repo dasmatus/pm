@@ -30,12 +30,9 @@ use tracing::{debug, info, warn};
 
 use crate::{
     bf::{BuildFile, BuildOptions, Verification},
-<<<<<<< HEAD
     cancel::Cancel,
     context::BuildContext,
-=======
     plugin::Registry,
->>>>>>> origin/master
     policy::BuildPolicy,
     progress::{Progress, Task},
 };
@@ -74,7 +71,7 @@ struct Node {
 /// holds while deciding whether to park - see `Graph::build_with`.
 struct BuildRun<'a> {
     ctx: &'a BuildContext,
-    options: BuildOptions,
+    options: BuildOptions<'a>,
     progress: &'a Progress,
 }
 
@@ -96,8 +93,7 @@ impl Graph {
     /// verified, when the dependencies close a cycle, when a build file's
     /// commands cannot be classified, or when two packages in the graph would
     /// be packaged to the same archive name.
-<<<<<<< HEAD
-    pub fn resolve(root: &BuildFile, options: BuildOptions) -> miette::Result<Self> {
+    pub fn resolve(root: &BuildFile, options: BuildOptions<'_>) -> miette::Result<Self> {
         Self::resolve_in(&BuildContext::from_env()?, root, options)
     }
 
@@ -111,11 +107,8 @@ impl Graph {
     pub fn resolve_in(
         ctx: &BuildContext,
         root: &BuildFile,
-        options: BuildOptions,
+        options: BuildOptions<'_>,
     ) -> miette::Result<Self> {
-=======
-    pub fn resolve(root: &BuildFile, options: BuildOptions<'_>) -> miette::Result<Self> {
->>>>>>> origin/master
         let key = match root.source() {
             // Fall back to the path as given when it cannot be canonicalised,
             // exactly as parsing does: identity degrades, resolution still runs.
@@ -186,8 +179,7 @@ impl Graph {
     ///
     /// Returns a diagnostic naming every package that failed, and how many were
     /// skipped because something they needed did.
-<<<<<<< HEAD
-    pub fn build(&self, options: BuildOptions, progress: &Progress) -> miette::Result<PathBuf> {
+    pub fn build(&self, options: BuildOptions<'_>, progress: &Progress) -> miette::Result<PathBuf> {
         self.build_in(&BuildContext::from_env()?, options, progress)
     }
 
@@ -201,7 +193,7 @@ impl Graph {
     pub fn build_in(
         &self,
         ctx: &BuildContext,
-        options: BuildOptions,
+        options: BuildOptions<'_>,
         progress: &Progress,
     ) -> miette::Result<PathBuf> {
         self.build_with(ctx, options, progress, &Cancel::new())
@@ -220,13 +212,10 @@ impl Graph {
     pub fn build_with(
         &self,
         ctx: &BuildContext,
-        options: BuildOptions,
+        options: BuildOptions<'_>,
         progress: &Progress,
         cancel: &Cancel,
     ) -> miette::Result<PathBuf> {
-=======
-    pub fn build(&self, options: BuildOptions<'_>, progress: &Progress) -> miette::Result<PathBuf> {
->>>>>>> origin/master
         let jobs = options
             .jobs
             .map_or_else(default_jobs, NonZeroUsize::get)
@@ -301,18 +290,13 @@ impl Graph {
     }
 
     /// One worker: take a ready package, build it, release what it unblocks.
-<<<<<<< HEAD
-    fn work(&self, run: &BuildRun, schedule: &Mutex<Schedule>, wakeup: &Condvar, summary: &Task) {
-=======
     fn work(
         &self,
+        run: &BuildRun<'_>,
         schedule: &Mutex<Schedule>,
         wakeup: &Condvar,
-        options: BuildOptions<'_>,
-        progress: &Progress,
         summary: &Task,
     ) {
->>>>>>> origin/master
         while let Some((index, archives)) = self.claim(schedule, wakeup, summary) {
             let node = &self.nodes[index];
             // Built outside the lock: this is the part that takes minutes.
@@ -450,10 +434,7 @@ fn archive_name(build: &BuildFile) -> String {
 
 /// Depth-first resolution state.
 struct Resolver<'a> {
-<<<<<<< HEAD
     ctx: &'a BuildContext,
-=======
->>>>>>> origin/master
     nodes: Vec<Node>,
     order: Vec<usize>,
     state: HashMap<PathBuf, State>,

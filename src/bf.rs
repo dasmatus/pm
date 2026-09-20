@@ -13,12 +13,7 @@
 //! produced. The two are never interchangeable.
 
 use std::{
-<<<<<<< HEAD
-    collections::HashMap,
-=======
     collections::{BTreeSet, HashMap},
-    env::current_dir,
->>>>>>> origin/master
     fs::{copy, create_dir_all, read_to_string, write},
     iter::once,
     num::NonZeroUsize,
@@ -36,12 +31,8 @@ use crate::{
     context::BuildContext,
     graph::Graph,
     metadata::{Metadata, Type},
-<<<<<<< HEAD
     perms::{elf, source, Enforcement, Permissions},
-=======
-    perms::{Enforcement, Permissions, elf, source},
     plugin::Registry,
->>>>>>> origin/master
     policy::BuildPolicy,
     progress::{Progress, Task},
     sandbox::BuildSandbox,
@@ -130,7 +121,7 @@ impl Default for BuildOptions<'_> {
 struct BuildEnv<'a> {
     ctx: &'a BuildContext,
     policy: &'a BuildPolicy,
-    options: BuildOptions,
+    options: BuildOptions<'a>,
 }
 
 /// A parsed build file: everything needed to build and package one package.
@@ -457,12 +448,8 @@ impl BuildFile {
     /// deleting it, so the half-finished tree can still be inspected.
     pub(crate) fn build_alone(
         &self,
-<<<<<<< HEAD
         ctx: &BuildContext,
-        options: BuildOptions,
-=======
         options: BuildOptions<'_>,
->>>>>>> origin/master
         policy: &BuildPolicy,
         progress: &Progress,
         dependency_archives: &[PathBuf],
@@ -512,12 +499,7 @@ impl BuildFile {
     /// third sibling, so packing `pkg` never picks up the archive itself.
     fn stage(
         &self,
-<<<<<<< HEAD
         env: &BuildEnv<'_>,
-=======
-        policy: &BuildPolicy,
-        options: BuildOptions<'_>,
->>>>>>> origin/master
         task: &Task,
         root: &Path,
         dependency_archives: &[PathBuf],
@@ -563,7 +545,7 @@ impl BuildFile {
             );
         }
         let permissions =
-            self.derive_permissions(options.plugins, &workdir, &staging, &entrypoints)?;
+            self.derive_permissions(env.options.plugins, &workdir, &staging, &entrypoints)?;
         let metadata = Metadata::create(
             self.name.clone(),
             self.version.clone(),
@@ -697,12 +679,7 @@ impl BuildFile {
     /// mounts neither `$HOME` nor the host `/tmp` the workspace lives under.
     fn sandbox(
         &self,
-<<<<<<< HEAD
         env: &BuildEnv<'_>,
-=======
-        policy: &BuildPolicy,
-        options: BuildOptions<'_>,
->>>>>>> origin/master
         workdir: &Path,
         staging: &Path,
         dependency_archives: &[PathBuf],

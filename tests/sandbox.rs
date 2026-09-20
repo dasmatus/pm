@@ -15,17 +15,12 @@ use std::fs::{read, read_to_string, remove_dir_all, write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
-<<<<<<< HEAD
 use hakoniwa::{Container, Runctl};
 use pm::bf::{BuildFile, BuildOptions};
 use pm::context::BuildContext;
 use pm::progress::Progress;
-=======
-use miette::Context as _;
-use pm::bf::{BuildFile, BuildOptions};
->>>>>>> origin/master
 use pm::run::PackageRunner;
-use pm::signing::{SigningKey, TrustStore, sign_file};
+use pm::signing::{sign_file, SigningKey, TrustStore};
 use pm::workspace::{HostChild, SandboxedChild, Workspace};
 use serde::Serialize;
 use serde_yaml::to_string;
@@ -270,7 +265,6 @@ fn package_staging_with_options(
     )
     .expect("write the build file");
 
-<<<<<<< HEAD
     let build = BuildFile::load_unverified(&build_file).expect("load the build file");
     // `output_dir` is pointed at `work` explicitly, rather than moving the
     // process's current directory there: the whole point of `BuildContext` is
@@ -281,20 +275,8 @@ fn package_staging_with_options(
         .expect("capture the ambient build context")
         .with_output_dir(work.path().to_path_buf());
     let archive = build
-        .run_with_progress_in(&ctx, BuildOptions::default(), &Progress::disabled())
+        .run_with_progress_in(&ctx, options, &Progress::disabled())
         .expect("the build must succeed");
-=======
-    let build = BuildFile::load_unverified(&build_file).context("load the build file")?;
-    let archive = {
-        let _cwd = CwdGuard::enter(work.path());
-        let produced = build.run_with(options).context("the build must succeed")?;
-        if produced.is_absolute() {
-            produced
-        } else {
-            current_dir().expect("a current directory").join(produced)
-        }
-    };
->>>>>>> origin/master
 
     sign(&archive, work.path());
     Ok((work, archive))
@@ -494,7 +476,8 @@ fn an_unknown_bin_lists_the_available_binaries_in_sorted_order() {
 #[test]
 #[ignore = "requires unprivileged user namespaces; run with `cargo test --test sandbox -- --ignored`"]
 fn the_chooser_seam_picks_an_entrypoint_by_name_without_a_terminal() {
-    let (_work, archive) = package_with_three_binaries("choosebyname");
+    let (_work, archive) =
+        package_with_three_binaries("choosebyname").expect("build the test package");
 
     // This closure never touches stdin - it does not need to, and that is
     // exactly the point: a daemon with no terminal to prompt on can answer
@@ -526,7 +509,8 @@ fn the_chooser_seam_picks_an_entrypoint_by_name_without_a_terminal() {
 
 #[test]
 fn an_unknown_name_from_the_chooser_is_refused_like_a_bad_bin() {
-    let (_work, archive) = package_with_three_binaries("badchoice");
+    let (_work, archive) =
+        package_with_three_binaries("badchoice").expect("build the test package");
 
     let error = PackageRunner::new(archive)
         .trust_dir(trust_dir(_work.path()))
@@ -557,7 +541,8 @@ fn an_unknown_name_from_the_chooser_is_refused_like_a_bad_bin() {
 #[test]
 #[ignore = "requires unprivileged user namespaces; run with `cargo test --test sandbox -- --ignored`"]
 fn the_tracer_seam_is_called_instead_of_monitor_trace_when_supplied() {
-    let (_work, archive) = package_with_a_runnable_binary("tracerseam");
+    let (_work, archive) =
+        package_with_a_runnable_binary("tracerseam").expect("build the test package");
     let called = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let called_in_closure = called.clone();
 
@@ -769,7 +754,8 @@ fn a_hostile_tar_cannot_write_outside_the_extraction_destination() {
     // inside the jail. If that write ever lands, the two-mount claim in
     // `extract_jailed`'s doc comment - the archive read-only, the
     // destination writable, nothing else reachable - is false.
-    let (work, archive) = package_with_a_runnable_binary("shimescape");
+    let (work, archive) =
+        package_with_a_runnable_binary("shimescape").expect("build the test package");
 
     let marker = work.path().join("escaped-marker");
     let fakebin = work.path().join("fakebin");
