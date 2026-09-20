@@ -829,7 +829,10 @@ impl Schedule {
                 // whoever is reading the log looking for casualties there
                 // aren't any of.
                 if skipped == 0 {
-                    warn!(package = graph.nodes[index].package.name(), "package failed");
+                    warn!(
+                        package = graph.nodes[index].package.name(),
+                        "package failed"
+                    );
                 } else {
                     warn!(
                         package = graph.nodes[index].package.name(),
