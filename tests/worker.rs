@@ -251,7 +251,7 @@ fn successful_build_reports_progress_a_package_outcome_and_an_archive() {
         target: target.display().to_string(),
         context: caller_context(work.path(), &home),
         permissive: true,
-        unsandboxed: false,
+        unsandboxed: true,
         jobs: None,
         log_filter: "warn".to_owned(),
     };
