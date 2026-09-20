@@ -155,7 +155,7 @@ impl Step {
                 dest.display()
             )
         })?;
-        create_dir_all(&dir).map_err(|e| {
+        create_dir_all(dir).map_err(|e| {
             miette!(
                 "Failed to create download directory `{}` for `{url}`: {e}",
                 dir.display()
