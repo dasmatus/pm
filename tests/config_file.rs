@@ -10,9 +10,10 @@ fn generate_declares_no_dependencies() {
     let config = BuildFile::generate();
 
     // The generated example used to declare `/tmp` as a dependency. A
-    // dependency path now has to be a build file, and a missing one is a hard
-    // error rather than a silent skip, so that placeholder would make the
-    // example fail to build the moment anyone ran it.
+    // dependency path now has to name either a build file or a `.cpkg`, and a
+    // missing one is a hard error rather than a silent skip, so that
+    // placeholder would make the example fail to build the moment anyone ran
+    // it.
     assert_eq!(config.dependencies().len(), 0);
     assert!(config.dependencies().next().is_none());
 }

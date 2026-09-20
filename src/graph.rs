@@ -829,10 +829,10 @@ impl Schedule {
                 // whoever is reading the log looking for casualties there
                 // aren't any of.
                 if skipped == 0 {
-                    warn!(package = graph.nodes[index].build.name(), "package failed");
+                    warn!(package = graph.nodes[index].package.name(), "package failed");
                 } else {
                     warn!(
-                        package = graph.nodes[index].build.name(),
+                        package = graph.nodes[index].package.name(),
                         skipped, "package failed; skipping what depends on it"
                     );
                 }
@@ -886,7 +886,7 @@ impl Schedule {
         let mut skipped = Vec::new();
 
         for (index, progression) in self.progression.iter().enumerate() {
-            let name = graph.nodes[index].build.name();
+            let name = graph.nodes[index].package.name();
             match progression {
                 Progression::Failed(report) => failures.push((name, render(report))),
                 Progression::Skipped | Progression::Waiting => skipped.push(name),
@@ -901,7 +901,7 @@ impl Schedule {
                 // be a build reporting success without an archive.
                 _ => Err(miette!(
                     "the build finished without producing an archive for {}",
-                    graph.nodes[graph.root].build.name()
+                    graph.nodes[graph.root].package.name()
                 )),
             };
         }

@@ -45,7 +45,7 @@ A build file is plain YAML with exactly four fields, all required
 |---|---|---|
 | `name` | string | archive is named `<name>-<version>.cpkg` |
 | `version` | list of **strings** | joined with `.`; quote every component, or YAML hands serde an integer and parsing fails |
-| `dependencies` | list of **paths to other build files** | no registry, no names, no version constraints |
+| `dependencies` | list of **paths to build files or `.cpkg` archives** | no registry, no names, no version constraints |
 | `steps` | list of steps | may be empty |
 
 A step (`Step` in `src/step.rs`):
