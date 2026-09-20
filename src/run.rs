@@ -34,7 +34,8 @@
 
 use std::{
     collections::BTreeMap,
-    fs::read_to_string,
+    env,
+    fs::{File, read_to_string},
     io::{IsTerminal, stdin},
     path::{Component, Path, PathBuf},
     process::Command,
@@ -46,14 +47,14 @@ use crate::{
     perms::{
         Enforcement, Grant, Permission, Permissions, Provenance,
         elf::{interpreter, needed_libraries, runpath},
-        monitor::{TraceOptions, trace},
+        monitor::{TraceOptions, TraceReport, trace},
     },
     signing::{TrustStore, default_trust_dir, verify_file},
     workspace::{SandboxedChild, Workspace},
 };
 use dialoguer::{Select, console::Term};
 use hakoniwa::{
-    Container, ExitStatus, MountOptions, Namespace, Runctl,
+    Container, ExitStatus, MountOptions, Namespace, Runctl, Stdio,
     landlock::{CompatMode, FsAccess, Resource, Ruleset},
 };
 use miette::{Context, IntoDiagnostic, miette};
@@ -73,6 +74,42 @@ const CONTAINER_PACKAGE_ROOT: &str = "/pkg";
 /// against a Nix toolchain names its loader and libraries here, and neither is
 /// covered by `rootfs("/")`.
 const NIX_STORE: &str = "/nix/store";
+
+/// Path the archive is bind-mounted at inside the extraction jail, read-only.
+///
+/// See [`PackageRunner::extract_jailed`].
+const EXTRACT_ARCHIVE_MOUNT: &str = "/archive.cpkg";
+
+/// Path the extraction destination is bind-mounted at inside the extraction
+/// jail, writable - the only writable path the jailed `tar` can reach.
+///
+/// See [`PackageRunner::extract_jailed`].
+const EXTRACT_DEST_MOUNT: &str = "/dest";
+
+/// hakoniwa's own sentinel for "the container itself could not run the
+/// command at all" - `unshare`, a mount, `pivot_root` or landlock setup
+/// failed inside the freshly forked child, before it ever reached `execve`.
+///
+/// Not exported by `hakoniwa` (`ExitStatus::FAILURE` is `pub(crate)` there),
+/// so mirrored here. Safe to treat as unambiguous: `tar`'s own documented
+/// exit codes are 0, 1 and 2, never 125, so a `tar` that genuinely ran and
+/// failed can never be confused with a container that never started it.
+/// [`PackageRunner::extract_jailed`] is the ONLY place this constant may
+/// trigger a fallback to [`PackageRunner::extract_unjailed`] - a non-zero,
+/// non-125 status is `tar` itself failing, which must stay a hard error; see
+/// that function's doc comment for why the two must never be conflated.
+const CONTAINER_START_FAILURE: i32 = 125;
+
+/// The directories `Container::rootfs("/")` mirrors from the host.
+///
+/// Mirrors the constant of the same name in [`crate::sandbox`], kept in sync
+/// by hand with `hakoniwa::Container::rootfs_imp`, which hard-codes exactly
+/// this list. [`PackageRunner::extract_jailed`] needs its own copy: a `tar`
+/// that resolves to a directory NOT in this list has to be mounted in on its
+/// own, and mounting a path a SECOND time when it is already nested under one
+/// of these races hakoniwa's own unordered mount application and can
+/// silently shadow the more specific mount.
+const ROOTFS_ROOTS: [&str; 7] = ["/bin", "/etc", "/lib", "/lib32", "/lib64", "/sbin", "/usr"];
 
 /// Package-root file a profile may be recorded in, when it is not inside the
 /// `metadata` member.
@@ -135,6 +172,17 @@ fn package_mount_flags() -> MountOptions {
         | MountOptions::NOSUID
         | MountOptions::NODEV
         | MountOptions::RDONLY
+}
+
+/// Flags for the writable bind mount [`PackageRunner::extract_jailed`] gives
+/// `tar` for the extraction destination.
+///
+/// Same reasoning as [`package_mount_flags`] minus `RDONLY`: `nodev` is asked
+/// for up front so the read-write remount matches what a `nosuid,nodev` `/tmp`
+/// (where the staging workspace this mounts lives) has already locked, and
+/// [`Runctl::MountFallback`] is never actually needed to recover.
+fn extraction_dest_flags() -> MountOptions {
+    MountOptions::BIND | MountOptions::REC | MountOptions::NOSUID | MountOptions::NODEV
 }
 
 /// Extracts a `.cpkg` archive and runs one of its binaries inside a sandbox.
@@ -256,6 +304,59 @@ impl PackageRunner {
     /// Entrypoints that do not resolve to a regular file inside the package are
     /// never run and never offered in the prompt, whoever asked for them.
     ///
+    /// Delegates to [`PackageRunner::run_with`], passing
+    /// `choose_interactively` as the entrypoint chooser and [`trace`] as the
+    /// tracer - today's behaviour, unchanged. Every existing
+    /// caller of `run`, including the ones that assert on its exact numeric
+    /// exit codes, keeps working exactly as it does today; the two seams a
+    /// daemon needs are additions on `run_with`, not changes here.
+    ///
+    /// # Errors
+    ///
+    /// See [`PackageRunner::run_with`].
+    pub fn run(&self, bin: Option<String>) -> miette::Result<ExitStatus> {
+        self.run_with(bin, Self::choose_interactively, trace)
+    }
+
+    /// As [`PackageRunner::run`], but the entrypoint chooser and the profile
+    /// tracer are supplied by the caller instead of hard-coded.
+    ///
+    /// [`PackageRunner::run`] cannot change signature - `tests/landlock.rs`
+    /// and every other existing caller depends on calling it exactly as it is
+    /// today - so the two seams a daemon needs live here, on a sibling entry
+    /// point, and `run` delegates to this method with today's defaults
+    /// plugged in.
+    ///
+    /// - **`choose`** answers "which entrypoint, when `bin` is `None`?" It is
+    ///   handed the *declared* names of every usable entrypoint, sorted, and
+    ///   must return one of them BY NAME - never a positional index, which
+    ///   would be meaningless once the list has been re-derived on the other
+    ///   side of a process boundary. [`PackageRunner::run`] passes
+    ///   `choose_interactively`, which still prompts and picks by index
+    ///   internally before translating the answer back to a name; a daemon
+    ///   instead passes a closure that already has the caller's answer in
+    ///   hand, with nothing to prompt at all. Whichever chooser is asked, a
+    ///   name that does not match a usable entrypoint is refused with the
+    ///   same diagnostic a bad `--bin` gets - both go through the same
+    ///   lookup.
+    /// - **`tracer`** replaces the in-process [`trace`] call inside
+    ///   `audit_run`. `monitor::supervise` reaps with
+    ///   `waitpid(-1, __WALL)`, which would eat a daemon's other children if
+    ///   it ran in the daemon's own process; a daemon instead hands in a
+    ///   closure that spawns `pm-trace` as a separate process and reports
+    ///   back. [`PackageRunner::run`] passes [`trace`] itself, so an
+    ///   unmodified `run` traces exactly as it always has.
+    ///
+    /// # Drop order is unchanged
+    ///
+    /// This is the same function body [`PackageRunner::run`] used to be
+    /// before these two parameters existed: the `workspace`/`SandboxedChild`
+    /// declaration order documented below is exactly as load-bearing as it
+    /// always was. Injecting a closure changes what runs, not the frame it
+    /// runs in - the spawn and the wait are still one call apart, in the same
+    /// stack frame, with nothing able to return between the workspace being
+    /// created and the child being torn down.
+    ///
     /// # Errors
     ///
     /// Returns a diagnostic when the signature is missing, malformed, does not
@@ -263,16 +364,26 @@ impl PackageRunner {
     /// be created; when `tar` fails to extract the archive (its exit status and
     /// stderr are surfaced); when the `metadata` member is missing or is not
     /// valid YAML; when the package exposes no usable binary entrypoints; when
-    /// `bin` names something that is not one of them; when an entrypoint path is
-    /// not valid UTF-8; when a binary has to be picked but there is no terminal
-    /// to prompt on; when the user dismisses the prompt; when
+    /// `bin` (or `choose`'s answer) names something that is not one of them;
+    /// when an entrypoint path is not valid UTF-8; when `choose` itself errors -
+    /// including `choose_interactively` finding no terminal to
+    /// prompt on, or the user dismissing the prompt; when
     /// [`PackageRunner::enforce`] was asked for but the package records no
     /// profile; or when the sandbox cannot be configured, spawned or waited on.
     ///
     /// A profile that cannot be parsed is reported and treated as absent rather
     /// than failing the run - but then `--enforce` has nothing to apply and
     /// errors, so a broken profile can never quietly become a permissive one.
-    pub fn run(&self, bin: Option<String>) -> miette::Result<ExitStatus> {
+    pub fn run_with<C, T>(
+        &self,
+        bin: Option<String>,
+        choose: C,
+        tracer: T,
+    ) -> miette::Result<ExitStatus>
+    where
+        C: FnOnce(&[&str]) -> miette::Result<String>,
+        T: Fn(&Path, &[String], &TraceOptions) -> miette::Result<TraceReport>,
+    {
         info!("Running {}", self.path.display());
 
         // Before `tar` touches it: an archive nobody trusts is not unpacked at
@@ -300,6 +411,7 @@ impl PackageRunner {
                 )
             })?;
 
+        // Jailed unless the container itself cannot start - see `extract`.
         self.extract(&package_root)?;
 
         let metadata_path = package_root.join("metadata");
@@ -316,7 +428,7 @@ impl PackageRunner {
             .wrap_err_with(|| format!("cannot parse the metadata of {}", self.path.display()))?;
 
         let profile = Self::load_profile(&package_root, &metadata_text);
-        let entrypoint = Self::pick_entrypoint(&metadata, bin, &package_root)?;
+        let entrypoint = Self::pick_entrypoint(&metadata, bin, &package_root, choose)?;
         // The entrypoint as it exists on the host right now. The ELF reader and
         // the `ptrace` monitor both work on the host filesystem, so neither can
         // be handed the in-container path.
@@ -330,7 +442,7 @@ impl PackageRunner {
                      have denied"
                 );
             }
-            match self.audit_run(&host_bin, &package_root, &profile) {
+            match self.audit_run(&host_bin, &package_root, &profile, &tracer) {
                 Ok(status) => return Ok(status),
                 Err(error) => warn!(
                     %error,
@@ -654,18 +766,29 @@ impl PackageRunner {
     /// the summary lists the grants a promotion to [`Enforcement::Enforce`] would
     /// need, in the same shape [`Permissions::report`] prints everywhere else.
     ///
+    /// `tracer` runs the traced execution and hands back the report -
+    /// [`trace`] itself for [`PackageRunner::run`], or a caller-supplied
+    /// closure that runs it out of process. See [`PackageRunner::run_with`]
+    /// for why that indirection exists: `monitor::supervise`'s
+    /// `waitpid(-1, __WALL)` must never run inside a process with children of
+    /// its own that it does not own.
+    ///
     /// # Errors
     ///
     /// Returns a diagnostic when the monitor cannot run at all - it is
     /// x86_64-only, and needs `ptrace` to be permitted. `run` catches that,
     /// reports it and runs the package normally instead; it never upgrades the
     /// profile to `Enforce` to compensate.
-    fn audit_run(
+    fn audit_run<T>(
         &self,
         host_bin: &Path,
         package_root: &Path,
         profile: &Profile,
-    ) -> miette::Result<ExitStatus> {
+        tracer: &T,
+    ) -> miette::Result<ExitStatus>
+    where
+        T: Fn(&Path, &[String], &TraceOptions) -> miette::Result<TraceReport>,
+    {
         warn!(
             entrypoint = %host_bin.display(),
             "AUDITING: the entrypoint is traced, NOT jailed. ptrace observes, it does not deny, \
@@ -693,7 +816,7 @@ impl PackageRunner {
             follow_forks: true,
         };
 
-        let report = trace(host_bin, &[], &options)?;
+        let report = tracer(host_bin, &[], &options)?;
         let always = Self::always_allowed(host_bin, package_root);
 
         let mut outside: Vec<Grant> = Vec::new();
@@ -780,13 +903,215 @@ impl PackageRunner {
         Ok(())
     }
 
-    /// Extracts the archive into `dest` with `tar`.
+    /// Extracts the archive into `dest`.
+    ///
+    /// Always tries the jail first. Falls back to
+    /// [`PackageRunner::extract_unjailed`] ONLY when the container itself
+    /// could not be started - no unprivileged user namespaces, no landlock, a
+    /// kernel too old - which is detected, not guessed: see
+    /// [`PackageRunner::extract_jailed`] for exactly how. There is
+    /// deliberately no builder flag or environment variable that could ask
+    /// for the unjailed path directly; the fallback is a property of the
+    /// host, decided fresh on every call, never a standing opt-out a hostile
+    /// archive could rely on finding already set.
+    ///
+    /// **A `tar` that runs and fails is never retried unjailed.** That is the
+    /// opposite case from the container not starting at all, and retrying it
+    /// without the jail would hand a hostile archive - the exact thing this
+    /// jail exists to contain - the one thing it was denied the first time:
+    /// this process's own privileges. See [`PackageRunner::extract_jailed`]'s
+    /// doc comment for how the two are told apart.
+    ///
+    /// # Errors
+    ///
+    /// See [`PackageRunner::extract_jailed`] and
+    /// [`PackageRunner::extract_unjailed`].
+    fn extract(&self, dest: &Path) -> miette::Result<()> {
+        match self.extract_jailed(dest)? {
+            Extraction::Done => Ok(()),
+            Extraction::ContainerUnavailable(reason) => {
+                warn!(
+                    reason = %reason,
+                    package = %self.path.display(),
+                    "the extraction jail could not start (no unprivileged user namespaces, no \
+                     landlock, or a kernel too old?); falling back to UNSANDBOXED extraction - a \
+                     hostile archive member now runs with this process's own privileges"
+                );
+                self.extract_unjailed(dest)
+            }
+        }
+    }
+
+    /// Extracts the archive inside a fresh `hakoniwa` container, so a hostile
+    /// member - a `../` traversal, an absolute path - lands nowhere but `dest`
+    /// even if `tar` itself falls for it.
+    ///
+    /// [`PackageRunner::verify_signature`] runs before this and stops an
+    /// *untrusted* archive from being unpacked at all, but `--unsigned`
+    /// exists, and nothing stops a *trusted* archive from being hostile too -
+    /// `tar` has had real path-traversal bugs, and the signature says nothing
+    /// about which version is installed. `tar` gets exactly two mounts here -
+    /// the archive read-only at [`EXTRACT_ARCHIVE_MOUNT`], `dest` writable at
+    /// [`EXTRACT_DEST_MOUNT`] - plus the host's system directories (and
+    /// `tar`'s own directory, if it lives somewhere else) so it can actually
+    /// run, and the network namespace is unshared unconditionally: unlike
+    /// [`PackageRunner::allow_network`], nothing about extracting an archive
+    /// ever needs a network. A `tar` that resolves a traversal member can
+    /// still only reach those two mounted paths.
+    ///
+    /// # Telling "the container would not start" from "`tar` failed inside it"
+    ///
+    /// This is the one distinction [`PackageRunner::extract`]'s fallback
+    /// depends on, and it is load-bearing enough to spell out in full.
+    /// hakoniwa runs the WHOLE setup - `unshare`, every mount, `pivot_root`,
+    /// the landlock ruleset, and finally `execve` - inside the freshly forked
+    /// child, and if ANY step of that fails, the child reports back an
+    /// [`hakoniwa::ExitStatus`] with `code` set to hakoniwa's own
+    /// [`CONTAINER_START_FAILURE`] sentinel (125) and `reason` describing
+    /// which step - **not** an `Err` from [`hakoniwa::Command::output`]. A
+    /// `tar` that actually ran, whether it exited cleanly or refused a
+    /// hostile member, reports its OWN exit code (0, 1 or 2 for GNU `tar`) or
+    /// a signal through the ordinary `process(...) exited/received ...`
+    /// reason - never 125. So: `code == CONTAINER_START_FAILURE` means `tar`
+    /// never ran at all, and is the ONLY case this function reports as
+    /// [`Extraction::ContainerUnavailable`]; every other non-zero code means
+    /// `tar` ran and failed, and is reported as a hard [`Err`] that
+    /// [`PackageRunner::extract`] will not retry.
+    ///
+    /// # Errors
+    ///
+    /// Returns a diagnostic when `tar` cannot be located on `PATH`, when the
+    /// archive, `dest` or `tar`'s own directory is not valid UTF-8, when the
+    /// container cannot be configured, or when `tar` ran and exited
+    /// unsuccessfully - in which case its exit status and captured stderr are
+    /// reported. Returns `Ok(`[`Extraction::ContainerUnavailable`]`)`, not an
+    /// error, when the container could not be started at all.
+    fn extract_jailed(&self, dest: &Path) -> miette::Result<Extraction> {
+        let archive = self
+            .path
+            .canonicalize()
+            .into_diagnostic()
+            .wrap_err_with(|| format!("cannot resolve {} to extract it", self.path.display()))?;
+        let archive_str = archive.to_str().ok_or_else(|| {
+            miette!(
+                "archive path {} is not valid UTF-8 and cannot be mounted into the extraction jail",
+                archive.display()
+            )
+        })?;
+        let dest_str = dest.to_str().ok_or_else(|| {
+            miette!(
+                "destination path {} is not valid UTF-8 and cannot be mounted into the extraction jail",
+                dest.display()
+            )
+        })?;
+        let tar = locate_tar()?;
+        let tar_str = tar.to_str().ok_or_else(|| {
+            miette!(
+                "`tar` resolved to {}, which is not valid UTF-8",
+                tar.display()
+            )
+        })?;
+
+        let mut container = Container::new();
+        // Same shape as the run jail below: mirror the host's system
+        // directories read-only so `tar` and its dynamic loader can actually
+        // run, then bind the two paths this extraction is allowed to touch.
+        // `MountFallback` matches `package_mount_flags`'s reasoning - both
+        // mounts live under `TMPDIR`, whose flags are locked inside a user
+        // namespace.
+        container
+            .rootfs("/")
+            .into_diagnostic()
+            .wrap_err("cannot mirror the host system directories into the extraction jail")?
+            .devfsmount("/dev")
+            .mount(
+                archive_str,
+                EXTRACT_ARCHIVE_MOUNT,
+                "",
+                package_mount_flags(),
+            )
+            .mount(dest_str, EXTRACT_DEST_MOUNT, "", extraction_dest_flags())
+            .runctl(Runctl::MountFallback)
+            .unshare(Namespace::Network);
+
+        // `rootfs("/")` mirrors only `ROOTFS_ROOTS`. The real system `tar`
+        // usually lives under `/usr` and needs nothing more, but a `tar`
+        // resolved from anywhere else - a Nix profile, a test's own stand-in
+        // on `PATH` - is otherwise invisible inside the container and
+        // `execve` fails with ENOENT before it ever runs. Skip the mount when
+        // it is already covered: mounting a path a second time nested under
+        // an already-mirrored root can shadow the more specific mount,
+        // depending on the order hakoniwa happens to apply them in.
+        if let Some(tar_dir) = tar.parent()
+            && !ROOTFS_ROOTS
+                .iter()
+                .any(|root| tar_dir.starts_with(Path::new(root)))
+        {
+            let tar_dir_str = tar_dir.to_str().ok_or_else(|| {
+                miette!(
+                    "`tar`'s directory {} is not valid UTF-8 and cannot be mounted into the \
+                     extraction jail",
+                    tar_dir.display()
+                )
+            })?;
+            container.mount(tar_dir_str, tar_dir_str, "", package_mount_flags());
+        }
+
+        // Same reasoning as the run jail: a Nix-provisioned `tar` and its
+        // dynamic loader live under the store, not under `/usr`.
+        if Path::new(NIX_STORE).is_dir() {
+            container.mount(NIX_STORE, NIX_STORE, "", package_mount_flags());
+        }
+
+        let output = container
+            .command(tar_str)
+            .arg("-xpf")
+            .arg(EXTRACT_ARCHIVE_MOUNT)
+            .arg("-C")
+            .arg(EXTRACT_DEST_MOUNT)
+            .stdin(Stdio::from(devnull()?))
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .into_diagnostic()
+            .wrap_err_with(|| {
+                format!(
+                    "cannot run `tar` inside the extraction jail for {}",
+                    self.path.display()
+                )
+            })?;
+
+        // See the doc comment above: this ONE code means the container never
+        // ran `tar` at all, and is the only condition that may fall back.
+        if output.status.code == CONTAINER_START_FAILURE {
+            return Ok(Extraction::ContainerUnavailable(output.status.reason));
+        }
+
+        if !output.status.success() {
+            return Err(miette!(
+                "tar failed to extract {} into {} ({}): {}",
+                self.path.display(),
+                dest.display(),
+                output.status.reason,
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+        Ok(Extraction::Done)
+    }
+
+    /// Extracts the archive with an unsandboxed `tar`, at this process's own
+    /// privileges.
+    ///
+    /// **Not the default.** [`PackageRunner::extract`] reaches this only when
+    /// [`PackageRunner::extract_jailed`] reports that the container itself
+    /// could not be started - never when `tar` ran and refused a hostile
+    /// member, which stays a hard failure.
     ///
     /// # Errors
     ///
     /// Returns a diagnostic when `tar` cannot be spawned, or when it exits
     /// unsuccessfully - in which case its exit status and stderr are reported.
-    fn extract(&self, dest: &Path) -> miette::Result<()> {
+    fn extract_unjailed(&self, dest: &Path) -> miette::Result<()> {
         let output = Command::new("tar")
             .arg("-xpf")
             .arg(&self.path)
@@ -807,14 +1132,21 @@ impl PackageRunner {
         Ok(())
     }
 
-    /// Resolves `bin` against the binary entrypoints of `metadata`, prompting
-    /// the user when `bin` is `None`.
+    /// Resolves `bin` against the binary entrypoints of `metadata`, calling
+    /// `choose` for the answer when `bin` is `None`.
     ///
-    /// Both inputs are attacker-controlled - `bin` comes from the command line
-    /// and the entrypoint table ships inside the package - so the answer is
-    /// always one of the entrypoints that [`PackageRunner::resolve_entrypoint`]
-    /// accepted. Entrypoints it rejects are logged and dropped: they are never
-    /// matched against `bin` and never offered in the prompt.
+    /// Both `bin` and the entrypoint table are attacker-controlled - `bin`
+    /// comes from the command line (or, through [`PackageRunner::run_with`],
+    /// from whatever a caller passed) and the table ships inside the package -
+    /// so the answer is always one of the entrypoints that
+    /// [`PackageRunner::resolve_entrypoint`] accepted. Entrypoints it rejects
+    /// are logged and dropped: they are never matched against `bin` and never
+    /// passed to `choose`.
+    ///
+    /// `choose` is handed the *declared* names of the usable entrypoints,
+    /// sorted, and must answer with one of them BY NAME. Whatever it returns
+    /// goes through the exact same lookup `bin` does, so a chooser's wrong
+    /// answer is refused with the exact same diagnostic a bad `--bin` is.
     ///
     /// The returned path is package-relative and symlink-resolved, ready to be
     /// joined onto [`CONTAINER_PACKAGE_ROOT`].
@@ -822,14 +1154,18 @@ impl PackageRunner {
     /// # Errors
     ///
     /// Returns a diagnostic when the package declares no binary entrypoints,
-    /// when none of the ones it declares resolve inside the package, when `bin`
-    /// matches none of the usable ones, when there is no terminal to prompt on,
-    /// or when the user cancels the prompt.
-    fn pick_entrypoint(
+    /// when none of the ones it declares resolve inside the package, when
+    /// `bin` or `choose`'s answer matches none of the usable ones, or when
+    /// `choose` itself errors.
+    fn pick_entrypoint<C>(
         metadata: &Metadata,
         bin: Option<String>,
         package_root: &Path,
-    ) -> miette::Result<PathBuf> {
+        choose: C,
+    ) -> miette::Result<PathBuf>
+    where
+        C: FnOnce(&[&str]) -> miette::Result<String>,
+    {
         // Entrypoints live in a HashMap, whose iteration order is not stable;
         // sort so the prompt and the error listing are reproducible. This is one
         // of the few collects that has to stay: the list is walked twice and the
@@ -872,27 +1208,38 @@ impl PackageRunner {
             ));
         }
 
-        let chosen = match bin {
-            Some(wanted) => usable
-                .iter()
-                .find(|entry| {
-                    entry.declared.as_os_str() == wanted.as_str()
-                        || entry
-                            .declared
-                            .file_name()
-                            .is_some_and(|name| name == wanted.as_str())
-                })
-                .ok_or_else(|| {
-                    miette!(
-                        "{wanted} is not a binary entrypoint of {}. Available: {}",
-                        metadata.name(),
-                        Self::describe(&usable)
-                    )
-                })?,
-            None => Self::choose_interactively(&usable)?,
+        let wanted = match bin {
+            Some(wanted) => wanted,
+            None => {
+                // Owned labels first, because `choose` only borrows for the
+                // length of this call and the closure may want to keep its
+                // answer past it.
+                let labels: Vec<String> = usable
+                    .iter()
+                    .map(|entry| entry.declared.display().to_string())
+                    .collect();
+                let names: Vec<&str> = labels.iter().map(String::as_str).collect();
+                choose(&names)?
+            }
         };
 
-        Ok(chosen.resolved.clone())
+        usable
+            .iter()
+            .find(|entry| {
+                entry.declared.as_os_str() == wanted.as_str()
+                    || entry
+                        .declared
+                        .file_name()
+                        .is_some_and(|name| name == wanted.as_str())
+            })
+            .map(|entry| entry.resolved.clone())
+            .ok_or_else(|| {
+                miette!(
+                    "{wanted} is not a binary entrypoint of {}. Available: {}",
+                    metadata.name(),
+                    Self::describe(&usable)
+                )
+            })
     }
 
     /// Checks that `declared` names a regular file that really lives inside
@@ -957,12 +1304,17 @@ impl PackageRunner {
         Ok(relative.to_path_buf())
     }
 
-    /// Asks the user which of `binaries` to run.
+    /// Asks the user which of `binaries` to run, answering with its declared
+    /// name - the shape [`PackageRunner::pick_entrypoint`] requires of every
+    /// chooser, interactive or not.
     ///
     /// `binaries` is expected to be non-empty and already sorted, so the menu
     /// entries keep the same order from one invocation to the next. A package
     /// with a single binary is not worth a prompt, so that one is chosen
-    /// outright.
+    /// outright. The prompt itself still answers with a position - `Select`
+    /// has no other mode - but that index only ever lives inside this
+    /// function; what it returns to its caller is the name at that position,
+    /// never the index itself.
     ///
     /// # Errors
     ///
@@ -970,15 +1322,10 @@ impl PackageRunner {
     /// is nobody to answer the prompt and the available binaries are listed
     /// instead - when the user dismisses the prompt, or when the prompt itself
     /// fails.
-    fn choose_interactively<'a, 'b>(
-        binaries: &'a [Entrypoint<'b>],
-    ) -> miette::Result<&'a Entrypoint<'b>> {
+    fn choose_interactively(binaries: &[&str]) -> miette::Result<String> {
         if let [only] = binaries {
-            info!(
-                "{} is the only binary entrypoint; running it without prompting",
-                only.declared.display()
-            );
-            return Ok(only);
+            info!("{only} is the only binary entrypoint; running it without prompting");
+            return Ok((*only).to_owned());
         }
 
         // `Select` reads keys straight off the terminal, so with a pipe or
@@ -987,18 +1334,14 @@ impl PackageRunner {
         if !stdin().is_terminal() {
             return Err(miette!(
                 "Cannot prompt for a binary because stdin is not a terminal; pass --bin <NAME> to pick one of: {}",
-                Self::describe(binaries)
+                binaries.join(", ")
             ));
         }
 
-        let labels: Vec<String> = binaries
-            .iter()
-            .map(|entry| entry.declared.display().to_string())
-            .collect();
         // `interact_opt` turns Esc and 'q' into `Ok(None)` instead of an error.
         let selection = Select::new()
             .with_prompt("Select which binary to run")
-            .items(&labels)
+            .items(binaries)
             .default(0)
             .interact_opt();
 
@@ -1022,12 +1365,13 @@ impl PackageRunner {
             .ok_or_else(|| {
                 miette!(
                     "No binary selected; pass --bin <NAME> to run one of: {}",
-                    Self::describe(binaries)
+                    binaries.join(", ")
                 )
             })?;
 
         binaries
             .get(index)
+            .map(|name| (*name).to_owned())
             .ok_or_else(|| miette!("The prompt returned index {index}, which is out of range"))
     }
 
@@ -1052,6 +1396,24 @@ impl PackageRunner {
 struct Entrypoint<'a> {
     declared: &'a Path,
     resolved: PathBuf,
+}
+
+/// What [`PackageRunner::extract_jailed`] managed to do.
+///
+/// Deliberately NOT a plain `bool`: `ContainerUnavailable` is the one outcome
+/// [`PackageRunner::extract`] is allowed to retry unjailed, and naming it
+/// forces every match on this type to say which case it is handling instead
+/// of trusting a `true`/`false` to still mean the same thing at the call
+/// site.
+enum Extraction {
+    /// `tar` ran inside the container and exited successfully.
+    Done,
+    /// The container itself never ran `tar` at all - see
+    /// [`PackageRunner::extract_jailed`]'s doc comment for exactly how this is
+    /// told apart from `tar` running and failing. Carries hakoniwa's own
+    /// description of what failed, for the warning [`PackageRunner::extract`]
+    /// logs before falling back.
+    ContainerUnavailable(String),
 }
 
 /// The run-time profile a package recorded: what it may do, and whether that is
@@ -1108,6 +1470,47 @@ impl Recorded {
             recorded: true,
         })
     }
+}
+
+/// Finds `tar` on `PATH`, canonicalised to an absolute path.
+///
+/// `hakoniwa` execs the program path directly with no `PATH` search of its
+/// own - the same constraint `crate::sandbox::BuildSandbox::resolve` works
+/// around on the build side - so [`PackageRunner::extract_jailed`] cannot
+/// rely on `execvp`'s own search the way the unjailed
+/// [`PackageRunner::extract_unjailed`] does; this does the same search by
+/// hand instead, over the same `PATH` a plain `Command::new("tar")` would
+/// have consulted.
+///
+/// # Errors
+///
+/// Returns a diagnostic when `PATH` is unset, or names no executable `tar`.
+fn locate_tar() -> miette::Result<PathBuf> {
+    let path = env::var_os("PATH").ok_or_else(|| {
+        miette!("cannot extract the package: PATH is not set, so `tar` cannot be located")
+    })?;
+    for dir in env::split_paths(&path) {
+        let candidate = dir.join("tar");
+        if candidate.is_file() {
+            return candidate
+                .canonicalize()
+                .into_diagnostic()
+                .wrap_err_with(|| format!("cannot resolve `{}`", candidate.display()));
+        }
+    }
+    Err(miette!(
+        "cannot extract the package: `tar` was not found on PATH"
+    ))
+}
+
+/// Open `/dev/null` for the jailed `tar`'s stdin.
+///
+/// `tar -xpf` never reads stdin, but leaving it inherited would hand a jailed
+/// process the caller's own terminal for no reason.
+fn devnull() -> miette::Result<File> {
+    File::open("/dev/null")
+        .into_diagnostic()
+        .wrap_err("cannot open /dev/null for tar's stdin inside the extraction jail")
 }
 
 /// Adds one host path to the rule map under its in-container name, merging the

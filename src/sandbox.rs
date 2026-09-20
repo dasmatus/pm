@@ -49,8 +49,10 @@ use miette::{IntoDiagnostic, WrapErr, miette};
 use tracing::{debug, info, warn};
 
 use crate::{
+    context::BuildContext,
     policy::{BuildPolicy, Capability},
     progress::Task,
+    workspace::{HostChild, SandboxedChild},
 };
 
 /// Where the step's working directory is mounted inside the jail.
@@ -68,7 +70,12 @@ pub const CONTAINER_DESTDIR: &str = "/dest";
 /// It is only a courtesy to build systems that re-exec their own helpers:
 /// `pm` itself never relies on it, because `hakoniwa` execs the program path
 /// verbatim without a `PATH` search (see [`BuildSandbox::resolve`]).
-const CONTAINER_PATH: &str = "/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bin:/sbin";
+///
+/// `pub(crate)` so [`crate::context::BuildContext::from_env`] can fall back to
+/// it when the process has no `PATH` at all - the same fallback `resolve`
+/// used to apply itself before it started taking `PATH` from a context.
+pub(crate) const CONTAINER_PATH: &str =
+    "/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bin:/sbin";
 
 /// The directories `Container::rootfs("/")` mirrors from the host.
 ///
@@ -135,6 +142,14 @@ pub struct BuildSandbox {
     /// Detached by default, which is what keeps stdout inherited for every
     /// caller that has no region to draw into.
     progress: Task,
+    /// `PATH` used to resolve a step's first word, from the [`BuildContext`]
+    /// this sandbox was built with. Unused in [`Mode::Host`]: a command run
+    /// there goes through [`std::process::Command`] directly, with this value
+    /// explicitly set on the child process.
+    path: OsString,
+    /// `$HOME` handed to host commands in [`Mode::Host`]. `None` means remove
+    /// `HOME` from the child process environment.
+    home: Option<PathBuf>,
 }
 
 /// Whether commands are confined or run straight on the host.
@@ -147,12 +162,36 @@ enum Mode {
 }
 
 impl BuildSandbox {
+    /// As [`BuildSandbox::new_in`], reading `PATH` and `$HOME` from the
+    /// process instead of an explicit context.
+    ///
+    /// # Errors
+    ///
+    /// As [`BuildSandbox::new_in`], plus whatever [`BuildContext::from_env`]
+    /// itself can fail on.
+    pub fn new(
+        policy: &BuildPolicy,
+        workdir: &Path,
+        destdir: &Path,
+        extra_ro: &[&Path],
+    ) -> miette::Result<Self> {
+        Self::new_in(
+            &BuildContext::from_env()?,
+            policy,
+            workdir,
+            destdir,
+            extra_ro,
+        )
+    }
+
     /// Build a jail for `policy`, staging into `workdir` and `destdir`.
     ///
     /// `extra_ro` are host paths the build legitimately needs to READ - the
     /// build file's own directory, dependency archives. They are mounted
     /// read-only at their own paths, so a command can refer to them by the
-    /// same absolute path it would use on the host.
+    /// same absolute path it would use on the host. `ctx` supplies the `PATH`
+    /// used to resolve a step's first word and the `PATH`/`$HOME` that decide
+    /// which toolchain directories get mounted - see [`toolchain_roots`].
     ///
     /// # Errors
     ///
@@ -160,7 +199,8 @@ impl BuildSandbox {
     /// directory, when an `extra_ro` path does not exist, when any of those
     /// paths is not valid UTF-8 (`hakoniwa` mount points are `&str`), or when
     /// the host's system directories cannot be enumerated for the rootfs.
-    pub fn new(
+    pub fn new_in(
+        ctx: &BuildContext,
         policy: &BuildPolicy,
         workdir: &Path,
         destdir: &Path,
@@ -191,7 +231,7 @@ impl BuildSandbox {
 
         let mut visible: Vec<PathBuf> = ROOTFS_ROOTS.iter().map(PathBuf::from).collect();
 
-        for root in toolchain_roots() {
+        for root in toolchain_roots(ctx) {
             let root_str = as_utf8(&root)?;
             debug!(path = %root_str, "mounting toolchain directory read-only");
             container.mount(root_str, root_str, "", ro_flags());
@@ -238,13 +278,37 @@ impl BuildSandbox {
             destdir,
             visible,
             progress: Task::detached(),
+            path: ctx.path.clone(),
+            home: ctx.home.clone(),
         })
     }
 
     /// An unsandboxed escape hatch for debugging: commands run unconfined on
     /// the host, as the calling user.
+    ///
+    /// Unlike [`BuildSandbox::new_in`], this captures `PATH` and `$HOME` from
+    /// the process environment. Use [`BuildSandbox::unsandboxed_in`] when an
+    /// explicit [`BuildContext`] has to be preserved.
     #[must_use]
     pub fn unsandboxed(workdir: &Path, destdir: &Path) -> Self {
+        let path = env::var_os("PATH").unwrap_or_else(|| OsString::from(CONTAINER_PATH));
+        let home = env::var_os("HOME").map(PathBuf::from);
+        Self::unsandboxed_with_env(workdir, destdir, path, home)
+    }
+
+    /// As [`BuildSandbox::unsandboxed`], using an explicit [`BuildContext`]
+    /// instead of the ambient process environment.
+    #[must_use]
+    pub fn unsandboxed_in(ctx: &BuildContext, workdir: &Path, destdir: &Path) -> Self {
+        Self::unsandboxed_with_env(workdir, destdir, ctx.path.clone(), ctx.home.clone())
+    }
+
+    fn unsandboxed_with_env(
+        workdir: &Path,
+        destdir: &Path,
+        path: OsString,
+        home: Option<PathBuf>,
+    ) -> Self {
         warn!(
             workdir = %workdir.display(),
             destdir = %destdir.display(),
@@ -258,6 +322,8 @@ impl BuildSandbox {
             destdir: destdir.to_path_buf(),
             visible: Vec::new(),
             progress: Task::detached(),
+            path,
+            home,
         }
     }
 
@@ -355,14 +421,20 @@ impl BuildSandbox {
         let (status, out) = if task.is_live() {
             // A live region owns the terminal, so the command's stdout is
             // captured and fed to its progress line instead of written over
-            // the region.
-            let mut child = jailed
+            // the region. Spawned straight into a `SandboxedChild`: `pump`
+            // below can still block for a while on a slow command, and
+            // without the guard an early return between `spawn` and `wait`
+            // would leave the jailed process orphaned with nothing left to
+            // reap it.
+            let child = jailed
                 .stdout(Stdio::piped())
                 .spawn()
                 .into_diagnostic()
                 .wrap_err_with(failure)?;
-            let out = pump(child.stdout.take(), child.stderr.take(), &task);
-            let status = child.wait().into_diagnostic().wrap_err_with(failure)?;
+            let mut guard = SandboxedChild::new(child, program);
+            let (stdout, stderr) = guard.take_pipes();
+            let out = pump(stdout, stderr, &task);
+            let status = guard.wait().wrap_err_with(failure)?;
             (status, out)
         } else {
             // The build's own stdout is the user's primary progress feedback
@@ -405,12 +477,17 @@ impl BuildSandbox {
 
         let task = self.progress.child(basename(program));
         let mut host = HostCommand::new(program);
-        let host = host
-            .args(args)
+        host.args(args)
             .current_dir(&self.workdir)
             .env("DESTDIR", &self.destdir)
+            .env("PATH", &self.path)
             .stdin(HostStdio::null())
             .stderr(HostStdio::piped());
+        if let Some(home) = &self.home {
+            host.env("HOME", home);
+        } else {
+            host.env_remove("HOME");
+        }
 
         let failure = || {
             format!(
@@ -420,13 +497,20 @@ impl BuildSandbox {
         };
 
         let (status, out) = if task.is_live() {
-            let mut child = host
+            // Same reasoning as the jailed branch in `run_jailed`: the guard
+            // makes sure an early return between `spawn` and `wait` cannot
+            // orphan this host process, which `SandboxedChild` cannot cover -
+            // it only accepts a `hakoniwa::Child` - so `HostChild` does the
+            // same job for the plain `std::process::Child` this branch spawns.
+            let child = host
                 .stdout(HostStdio::piped())
                 .spawn()
                 .into_diagnostic()
                 .wrap_err_with(failure)?;
-            let out = pump(child.stdout.take(), child.stderr.take(), &task);
-            let status = child.wait().into_diagnostic().wrap_err_with(failure)?;
+            let mut guard = HostChild::new(child, program.to_owned());
+            let (stdout, stderr) = guard.take_pipes();
+            let out = pump(stdout, stderr, &task);
+            let status = guard.wait().wrap_err_with(failure)?;
             (status, out)
         } else {
             let output = host
@@ -453,8 +537,11 @@ impl BuildSandbox {
     ///
     /// `hakoniwa` passes the program string straight to `execve`, so there is no
     /// `PATH` search and no shell to do one: a bare `make` would fail with
-    /// `ENOENT`. This resolves the name against the *host's* `PATH` - the
-    /// toolchain the user actually has - and then hands back the fully
+    /// `ENOENT`. This resolves the name against the *caller's* `PATH` - taken
+    /// from the [`BuildContext`] this sandbox was built with, which falls back
+    /// to [`CONTAINER_PATH`] exactly as this used to when the process had no
+    /// `PATH` of its own (see [`crate::context::BuildContext::from_env`]) -
+    /// the toolchain the caller actually has - and then hands back the fully
     /// canonicalised path, which is what survives being re-resolved inside the
     /// jail where the intermediate symlink farms of a Nix or Homebrew profile
     /// are not mounted.
@@ -469,10 +556,9 @@ impl BuildSandbox {
             return self.resolve_path(Path::new(program), step_name);
         }
 
-        let path_var = env::var_os("PATH").unwrap_or_else(|| OsString::from(CONTAINER_PATH));
         let mut rejected: Vec<PathBuf> = Vec::new();
 
-        for dir in env::split_paths(&path_var) {
+        for dir in env::split_paths(&self.path) {
             // A relative or empty `PATH` entry means "the current directory",
             // which inside the jail is the workspace. Refusing it keeps program
             // resolution independent of what the build happens to have unpacked.
@@ -566,10 +652,12 @@ impl BuildSandbox {
 /// usual setup, because the `$HOME/.local/bin` entry it skips holds symlinks
 /// whose real binaries are in the store the next mount exposes, and
 /// [`BuildSandbox::resolve`] hands `execve` the canonicalised path.
-fn toolchain_roots() -> Vec<PathBuf> {
-    let home = env::var_os("HOME")
-        .map(PathBuf::from)
-        .and_then(|home| home.canonicalize().ok());
+///
+/// `PATH` and `$HOME` both come from `ctx` rather than the process: a daemon
+/// building on a caller's behalf must mount the caller's toolchain, not its
+/// own.
+fn toolchain_roots(ctx: &BuildContext) -> Vec<PathBuf> {
+    let home = ctx.home.as_deref();
 
     // Sorted, so an ancestor is always visited before anything nested in it.
     let mut candidates: BTreeSet<PathBuf> = BTreeSet::new();
@@ -579,14 +667,12 @@ fn toolchain_roots() -> Vec<PathBuf> {
         candidates.insert(store);
     }
 
-    if let Some(path_var) = env::var_os("PATH") {
-        candidates.extend(
-            env::split_paths(&path_var)
-                .filter(|dir| dir.is_absolute())
-                .filter_map(|dir| dir.canonicalize().ok())
-                .filter(|dir| dir.is_dir()),
-        );
-    }
+    candidates.extend(
+        env::split_paths(&ctx.path)
+            .filter(|dir| dir.is_absolute())
+            .filter_map(|dir| dir.canonicalize().ok())
+            .filter(|dir| dir.is_dir()),
+    );
 
     let mut roots: Vec<PathBuf> = Vec::new();
     for candidate in candidates {
@@ -600,10 +686,7 @@ fn toolchain_roots() -> Vec<PathBuf> {
         {
             continue;
         }
-        if home
-            .as_ref()
-            .is_some_and(|home| home.starts_with(&candidate) || candidate.starts_with(home))
-        {
+        if home.is_some_and(|home| home.starts_with(&candidate) || candidate.starts_with(home)) {
             debug!(
                 path = %candidate.display(),
                 "not mounting a PATH entry inside $HOME into the build sandbox"
