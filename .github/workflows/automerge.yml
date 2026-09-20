@@ -55,6 +55,14 @@ jobs:
             # Wait for checks outside ci as well; failures or timeout prevent
             # merging. GitHub still enforces required reviews and branch rules.
             gh pr checks "$number" --repo "$GH_REPO" --watch --fail-fast
+            # The CLI can exit successfully for cancelled or skipped checks.
+            # Require actual success, not just the absence of reported failures.
+            checks=$(gh pr checks "$number" --repo "$GH_REPO" --json bucket)
+            if ! jq -e 'length > 0 and all(.[]; .bucket == "pass")' \
+              <<< "$checks" >/dev/null; then
+              echo "Skipping PR #$number: not all checks succeeded."
+              continue
+            fi
             gh pr merge "$number" --repo "$GH_REPO" --squash \
               --match-head-commit "$HEAD_SHA"
           done
