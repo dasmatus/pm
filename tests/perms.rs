@@ -630,9 +630,20 @@ fn vendored_and_generated_trees_are_skipped() {
 // elf: the positive case, then the hostile corpus.
 // ---------------------------------------------------------------------------
 
-/// A dynamically linked binary that is definitely on this machine: the test binary.
+/// A dynamically linked binary that is definitely on this machine.
+///
+/// This used to be `current_exe()`, on the reasoning that the test binary is an ELF
+/// sitting right there. It is one, but a debug build of this suite is 250-350 MiB and
+/// [`elf::inspect`] refuses anything past `MAX_FILE_BYTES` (256 MiB), so the test failed
+/// on every machine whose test binary crossed the cap and passed only on the ones where
+/// it did not. A system binary is the input this module actually meets, and sits two
+/// orders of magnitude below the cap.
 fn a_real_binary() -> PathBuf {
-    std::env::current_exe().expect("current exe")
+    ["/bin/ls", "/usr/bin/ls", "/bin/cat", "/usr/bin/env"]
+        .into_iter()
+        .map(PathBuf::from)
+        .find(|path| path.is_file())
+        .expect("no system binary to analyse")
 }
 
 #[test]
@@ -1485,7 +1496,7 @@ fn the_three_signals_merge_into_one_attributed_profile() {
     let from_source = source::scan(dir.path()).expect("scan");
     let from_elf = elf::analyse(&a_real_binary())
         .expect("analyse")
-        .expect("the test binary is an ELF");
+        .expect("the system binary is an ELF");
 
     let target = dir.path().join("subject.txt");
     write(&target, "x\n").expect("write subject");
