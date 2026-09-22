@@ -1,1 +1,1 @@
-# See the Security tab at the top on how to report vulnerabilities. 
+# Please contact dasmatus at ich@dasmat.us if you find something real bad.
