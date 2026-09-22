@@ -328,7 +328,7 @@ fn a_high_volume_step_coalesces_progress_and_sanitises_control_bytes() {
         target: target.display().to_string(),
         context: caller_context(work.path(), &home),
         permissive: true,
-        unsandboxed: false,
+        unsandboxed: true,
         jobs: None,
         log_filter: "warn".to_owned(),
     };
@@ -398,7 +398,7 @@ fn a_failing_step_yields_a_diagnostic_not_a_panic_or_a_silent_success() {
         target: target.display().to_string(),
         context: caller_context(work.path(), &home),
         permissive: true,
-        unsandboxed: false,
+        unsandboxed: true,
         jobs: None,
         log_filter: "warn".to_owned(),
     };
@@ -501,7 +501,7 @@ fn a_stale_archive_from_an_earlier_run_is_never_reported_built() {
         target: target.display().to_string(),
         context: caller_context(work.path(), &home),
         permissive: true,
-        unsandboxed: false,
+        unsandboxed: true,
         jobs: None,
         log_filter: "warn".to_owned(),
     };
