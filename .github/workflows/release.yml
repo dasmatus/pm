@@ -1,0 +1,76 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+# Builds the release binaries for the tagged revision and attaches them to the
+# GitHub release for that tag. Until this existed, a `v*` tag produced no
+# artifact at all: ci.yml and rust-clippy.yml only build, test and lint, so the
+# release page stayed empty.
+#
+# Host tools only. pm is a Linux sandbox for recipe builds; its own release
+# artifacts are the three first-party binaries Cargo.toml declares (pm, pm-trace,
+# pmd) built for the platform the release is run on. Cross-compiled tarballs and
+# a GHCR image are deliberately out of scope until the project asks for them.
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  RUST_BACKTRACE: 1
+
+jobs:
+  release:
+    name: "build and publish"
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      # Same toolchain rule as ci.yml: Cargo.toml sets edition = "2024", which an
+      # older stable cannot parse, so update rather than trusting the image pin.
+      - id: toolchain
+        run: |
+          set -euo pipefail
+          rustup update --no-self-update stable
+          rustup default stable
+          rustc -vV
+          echo "ver=$(rustc -V | tr -d ' ()' )" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: cargo-release-${{ steps.toolchain.outputs.ver }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-release-${{ steps.toolchain.outputs.ver }}-
+      - name: build release binaries
+        run: cargo build --release --locked --all-features
+      # The assets a release carries, named for the tag so two tags cannot
+      # collide, plus a checksum file so a consumer can verify what it got.
+      - name: stage release assets
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          for bin in pm pm-trace pmd; do
+            install -Dm755 "target/release/$bin" "dist/${bin}-${GITHUB_REF_NAME}-x86_64-unknown-linux-gnu"
+          done
+          ( cd dist && sha256sum * > SHA256SUMS )
+          ls -l dist
+      - name: publish release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          note="pm ${GITHUB_REF_NAME}"
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release edit "$GITHUB_REF_NAME" --title "$note"
+          else
+            gh release create "$GITHUB_REF_NAME" --title "$note" --generate-notes
+          fi
+          gh release upload "$GITHUB_REF_NAME" dist/* --clobber
