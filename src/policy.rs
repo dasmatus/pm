@@ -4,7 +4,7 @@
 //! it runs in must not be configured by that same file: a hostile build file
 //! would simply ask for everything. Instead the policy is *derived* - every
 //! command of every step is matched against a built-in table of
-//! [`Fingerprint`]s, and the capabilities of the fingerprints that matched are
+//! [`Fingerprint`]s, contributed by pm's [built-in plugins](crate::plugin::builtin), and the capabilities of the fingerprints that matched are
 //! the only ones the jail in [`crate::sandbox`] hands out. A command that
 //! matches nothing is an error rather than an unconstrained wildcard.
 //!
@@ -31,7 +31,10 @@ use serde::{Deserialize, Serialize};
 use serde_yaml::{Value, from_value, to_value};
 use tracing::{debug, error, warn};
 
-use crate::{plugin::Registry, step::Step};
+use crate::{
+    plugin::{Registry, builtin},
+    step::Step,
+};
 
 /// One capability a build step may need from the sandbox.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -52,7 +55,9 @@ pub enum Capability {
 
 /// A built-in fingerprint: a regex matched against a step command, and what a
 /// matching command needs.
-#[derive(Debug)]
+///
+/// Contributed by a [`crate::plugin::builtin`] plugin.
+#[derive(Debug, Clone, Copy)]
 pub struct Fingerprint {
     /// Stable identifier, reported by [`BuildPolicy::matches`] and listed in
     /// the diagnostic for an unrecognised command.
@@ -70,195 +75,23 @@ pub struct Fingerprint {
 /// keep it from ever colliding with one.
 pub const UNMATCHED: &str = "<unmatched>";
 
-/// Anchor a program name as a whole command word.
+/// The built-in table: every [`crate::plugin::builtin`] plugin's fingerprints, in
+/// precedence order.
 ///
-/// Expands to `^`, an optional leading path, the alternation, and a word
-/// terminator. `concat!` needs literals, so the pieces are spelled out rather
-/// than pulled from constants.
-///
-/// The leading path group is `(?:[\w.+/-]*/)?` and it has to end in `/`, which
-/// is what keeps `evilmake` from matching `make`: there the group can only
-/// match the empty string, and `make` then has to match at the very start of
-/// `evilmake`, which it does not. `.` is a literal inside the character class,
-/// so `./configure` is matched literally and not as "any character followed by
-/// `/configure`". The trailing `(?:\s|$)` demands that the program name end
-/// where the pattern says it does, so `makefile-generator` and `cmake` do not
-/// match `make` either.
-macro_rules! program {
-    ($alternation:literal) => {
-        concat!(r"^(?:[\w.+/-]*/)?(?:", $alternation, r")(?:\s|$)")
-    };
-}
-
-/// As [`program!`], but also allowing up to four leading `word-` groups, so
-/// `aarch64-unknown-linux-gnu-gcc` matches wherever `gcc` does. Used only for
-/// the toolchain programs that are conventionally named after a target triple.
-macro_rules! prefixed_program {
-    ($alternation:literal) => {
-        concat!(
-            r"^(?:[\w.+/-]*/)?(?:[A-Za-z0-9_]+-){0,4}(?:",
-            $alternation,
-            r")(?:\s|$)"
-        )
-    };
-}
-
-/// The built-in table.
-///
-/// Order is precedence: the first fingerprint whose pattern matches wins, so
-/// the specific entries come before the catch-all `coreutils` one.
-static TABLE: &[Fingerprint] = &[
-    Fingerprint {
-        name: "make",
-        // GNU make and the `gmake` spelling it carries on non-GNU systems.
-        pattern: program!(r"g?make"),
-        // `make` runs every recipe line through /bin/sh, and those lines are
-        // overwhelmingly compiler and coreutils invocations.
-        capabilities: &[
-            Capability::Toolchain,
-            Capability::Coreutils,
-            Capability::Shell,
-        ],
-    },
-    Fingerprint {
-        name: "configure",
-        // `./configure`, `../configure` and `/src/configure`; a generated
-        // configure script is a shell script that probes the toolchain.
-        pattern: program!(r"configure"),
-        capabilities: &[
-            Capability::Toolchain,
-            Capability::Coreutils,
-            Capability::Shell,
-        ],
-    },
-    Fingerprint {
-        name: "cmake",
-        pattern: program!(r"cmake|ctest|cpack"),
-        capabilities: &[
-            Capability::Toolchain,
-            Capability::Coreutils,
-            Capability::Shell,
-        ],
-    },
-    Fingerprint {
-        name: "ninja",
-        pattern: program!(r"ninja|samu"),
-        capabilities: &[
-            Capability::Toolchain,
-            Capability::Coreutils,
-            Capability::Shell,
-        ],
-    },
-    Fingerprint {
-        name: "meson",
-        pattern: program!(r"meson"),
-        capabilities: &[
-            Capability::Toolchain,
-            Capability::Coreutils,
-            Capability::Shell,
-        ],
-    },
-    Fingerprint {
-        name: "cargo",
-        // Cargo resolves and downloads the dependency graph itself.
-        pattern: program!(r"cargo|rustc"),
-        capabilities: &[
-            Capability::Toolchain,
-            Capability::Coreutils,
-            Capability::Network,
-        ],
-    },
-    Fingerprint {
-        name: "go",
-        // `go build` fetches modules; `gofmt` is a different word and does not
-        // match, because the pattern demands a word terminator after `go`.
-        pattern: program!(r"go"),
-        capabilities: &[
-            Capability::Toolchain,
-            Capability::Coreutils,
-            Capability::Network,
-        ],
-    },
-    Fingerprint {
-        name: "node",
-        pattern: program!(r"npm|yarn|pnpm|npx|node"),
-        capabilities: &[
-            Capability::Toolchain,
-            Capability::Coreutils,
-            Capability::Network,
-        ],
-    },
-    Fingerprint {
-        name: "pip",
-        pattern: program!(r"pip[23]?"),
-        capabilities: &[
-            Capability::Toolchain,
-            Capability::Coreutils,
-            Capability::Network,
-        ],
-    },
-    Fingerprint {
-        name: "python",
-        // `python setup.py build` and friends. Deliberately NOT granted
-        // Network: a setup.py that needs to download says so with `dl_urls`
-        // or reaches for pip, and both of those grant it explicitly.
-        pattern: program!(r"python[23]?(?:\.\d+)?"),
-        capabilities: &[Capability::Toolchain, Capability::Coreutils],
-    },
-    Fingerprint {
-        name: "pkg-config",
-        pattern: program!(r"pkg-config|pkgconf"),
-        capabilities: &[Capability::Toolchain],
-    },
-    Fingerprint {
-        name: "compiler",
-        // `cc`, `gcc`, `g++`, `clang`, `clang++`, their versioned spellings
-        // (`gcc-14`) and their cross-compiler spellings.
-        pattern: prefixed_program!(r"(?:cc|c\+\+|gcc|g\+\+|clang|clang\+\+)(?:-\d+(?:\.\d+)*)?"),
-        capabilities: &[Capability::Toolchain, Capability::Coreutils],
-    },
-    Fingerprint {
-        name: "ld",
-        // The linker and the rest of binutils, including cross spellings.
-        pattern: prefixed_program!(r"ld|ld\.bfd|ld\.gold|ld\.lld|lld|ar|ranlib|nm|strip|objcopy"),
-        capabilities: &[Capability::Toolchain],
-    },
-    Fingerprint {
-        name: "coreutils",
-        // Not literally GNU coreutils - `sed`, `awk`, `grep` and `patch` live
-        // here too, because they need exactly the same thing from the jail:
-        // the files in the workdir and the destdir, and nothing else.
-        pattern: program!(
-            r"install|cp|mv|rm|mkdir|rmdir|chmod|chown|ln|ls|cat|echo|printf|touch|true|false|test|pwd|env|mktemp|sed|awk|gawk|grep|find|xargs|sort|head|tail|cut|tr|sync|patch"
-        ),
-        capabilities: &[Capability::Coreutils],
-    },
-    Fingerprint {
-        name: "shell",
-        pattern: program!(r"sh|bash|dash|ash|zsh"),
-        capabilities: &[Capability::Shell, Capability::Coreutils],
-    },
-    Fingerprint {
-        name: "archive",
-        pattern: program!(r"tar|unzip|zip|xz|unxz|gzip|gunzip|bzip2|bunzip2|zstd|unzstd|7z|cpio"),
-        capabilities: &[Capability::Archive, Capability::Coreutils],
-    },
-    Fingerprint {
-        name: "git",
-        // Cloning and fetching are the point of invoking git in a build.
-        pattern: program!(r"git"),
-        capabilities: &[
-            Capability::VersionControl,
-            Capability::Network,
-            Capability::Coreutils,
-        ],
-    },
-];
+/// Order is precedence: the first fingerprint whose pattern matches wins, so the
+/// specific entries come before the catch-all `coreutils` one. The plugins list
+/// theirs in an order that keeps that true - see [`crate::plugin::builtin`].
+static TABLE: LazyLock<Vec<Fingerprint>> = LazyLock::new(|| {
+    builtin::all()
+        .iter()
+        .flat_map(|plugin| plugin.fingerprints.iter().copied())
+        .collect()
+});
 
 /// The built-in table. Exposed so tests and `pm explain` can enumerate it.
 #[must_use]
 pub fn fingerprints() -> &'static [Fingerprint] {
-    TABLE
+    &TABLE
 }
 
 /// Every pattern of [`TABLE`], compiled exactly once for the whole process.
@@ -275,7 +108,7 @@ struct Compiled {
 static COMPILED: LazyLock<Compiled> = LazyLock::new(|| {
     let mut regexes = Vec::with_capacity(TABLE.len());
     let mut broken = Vec::new();
-    for fingerprint in TABLE {
+    for fingerprint in TABLE.iter() {
         match Regex::new(fingerprint.pattern) {
             Ok(regex) => regexes.push(Some(regex)),
             Err(e) => {

@@ -9,6 +9,12 @@ answer the two questions its own built-in tables cannot always answer:
 | `classify-command` | what does this build-step command need from the build jail?               | refuses to build, naming the command           |
 | `scan-source`      | what does this source file imply the built program needs at run time?     | contributes nothing for file types it cannot parse |
 
+pm's own answers are organised the same way: `src/plugin/builtin/` holds one
+compiled-in plugin per ecosystem (`buildsys`, `rust`, `go`, `node`, `python`, `c`,
+`posix`, `git`), each carrying its build-command fingerprints and, where pm has
+one, its source grammar. Those are consulted first; the plugins described here
+only ever hear about what none of them recognised.
+
 The interface is `wit/plugin.wit` at the repository root. Read it first; it is
 the contract, and it is commented.
 
