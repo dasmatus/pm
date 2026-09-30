@@ -12,6 +12,16 @@
 //! questions. pm loads every `*.wasm` in `<config>/pm/plugins/`, asks each one to
 //! [`describe`](Plugin::manifest) itself, and calls the hooks it declared.
 //!
+//! # Built-in plugins
+//!
+//! pm's own tables are organised the same way, per ecosystem, in [`builtin`]: the Go
+//! plugin there carries the `go` fingerprint and the Go grammar, the C plugin the
+//! compilers and the C and C++ grammars, and so on. They are compiled in, need no
+//! signature and are consulted **before** anything loaded from disk, which is what keeps
+//! the guarantee below - a loaded plugin only ever hears about a command no built-in
+//! recognised. Teaching pm a new ecosystem natively is a new module there; teaching it
+//! one without rebuilding pm is a component here.
+//!
 //! # Why a component, and why sandboxed
 //!
 //! A plugin runs **in pm's own process**. There is no jail around it, because pm is the
@@ -63,6 +73,8 @@
 //! [`Enforcement::Audit`]: crate::perms::Enforcement::Audit
 //! [`Provenance::Plugin`]: crate::perms::Provenance::Plugin
 
+/// pm's own tables, split by ecosystem into plugins that are compiled in.
+pub mod builtin;
 /// Conversions from what a plugin said into what pm will act on.
 mod convert;
 /// The WebAssembly runtime a plugin is confined to.

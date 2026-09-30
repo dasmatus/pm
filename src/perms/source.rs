@@ -1,7 +1,8 @@
 //! Permissions inferred by parsing the package's own source code.
 //!
 //! Every supported source file under a directory is parsed with tree-sitter and matched
-//! against a table of tree-sitter *queries* - patterns written against the syntax tree,
+//! against a table of tree-sitter *queries*, contributed per language by pm's
+//! [built-in plugins](crate::plugin::builtin) - patterns written against the syntax tree,
 //! not against the text. That distinction is the whole point of this module: a query for
 //! a call to `socket` matches a [`call_expression`] whose function identifier *is*
 //! `socket`, so `my_socket_wrapper()`, the word `connection`, `disconnect()`, a
@@ -58,7 +59,7 @@ use walkdir::WalkDir;
 
 use crate::{
     perms::{Grant, Permission, Permissions, Provenance},
-    plugin::Registry,
+    plugin::{Registry, builtin},
 };
 
 /// One tree-sitter query and the permissions a match implies.
@@ -79,7 +80,7 @@ use crate::{
 /// text mentions `O_WRONLY`, `O_RDWR`, `O_CREAT`, `O_CREATE`, `O_APPEND` or `O_TRUNC`).
 /// Because the query binds `@path` and `@mode` from the same call node, this is a
 /// structural decision rather than a guess from what happens to be nearby.
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub struct SourceQuery {
     /// Stable identifier, printed in the evidence line, e.g. `c:fopen-mode`.
     pub name: &'static str,
@@ -94,12 +95,17 @@ pub struct SourceQuery {
 }
 
 /// One language: how its files are recognised and what is asked of them.
-#[derive(Debug)]
+///
+/// Contributed by a [`crate::plugin::builtin`] plugin, which ships the grammar and the
+/// queries written against it together.
+#[derive(Debug, Clone, Copy)]
 pub struct LanguageRules {
     /// The grammar's name: `c`, `cpp`, `rust`, `python`, `go` or `bash`.
     pub name: &'static str,
     /// File extensions, without the dot, that select this language.
     pub extensions: &'static [&'static str],
+    /// Loads the tree-sitter grammar the queries are written against.
+    pub grammar: fn() -> Language,
     /// The queries run against every file of this language.
     pub queries: &'static [SourceQuery],
 }
@@ -176,6 +182,14 @@ pub fn scan_with(dir: &Path, plugins: &Registry) -> Result<Permissions> {
 pub fn languages() -> &'static [LanguageRules] {
     &RULES
 }
+
+/// Every [`crate::plugin::builtin`] plugin's languages, in plugin order.
+static RULES: LazyLock<Vec<LanguageRules>> = LazyLock::new(|| {
+    builtin::all()
+        .iter()
+        .flat_map(|plugin| plugin.languages.iter().copied())
+        .collect()
+});
 
 /// Largest file that is parsed. Past this it is generated, minified or vendored data,
 /// and parsing it costs far more than the matches are worth.
@@ -261,8 +275,7 @@ fn compile() -> std::result::Result<Vec<Compiled>, String> {
     RULES
         .iter()
         .map(|rules| {
-            let language = grammar(rules.name)
-                .ok_or_else(|| format!("no grammar is wired up for language `{}`", rules.name))?;
+            let language = (rules.grammar)();
             let queries = rules
                 .queries
                 .iter()
@@ -278,19 +291,6 @@ fn compile() -> std::result::Result<Vec<Compiled>, String> {
             })
         })
         .collect()
-}
-
-/// The grammar behind a [`LanguageRules::name`].
-fn grammar(name: &str) -> Option<Language> {
-    Some(match name {
-        "c" => tree_sitter_c::LANGUAGE.into(),
-        "cpp" => tree_sitter_cpp::LANGUAGE.into(),
-        "rust" => tree_sitter_rust::LANGUAGE.into(),
-        "python" => tree_sitter_python::LANGUAGE.into(),
-        "go" => tree_sitter_go::LANGUAGE.into(),
-        "bash" => tree_sitter_bash::LANGUAGE.into(),
-        _ => return None,
-    })
 }
 
 /// Every parseable file under `dir`, paired with the language that claims it.
@@ -616,498 +616,3 @@ impl Findings {
             .collect()
     }
 }
-
-/// Permissions a match implies, as `'static` arrays so [`RULES`] stays a plain constant.
-/// [`Permission`] owns a `PathBuf` and so cannot be promoted out of a temporary, but a
-/// named `static` is never dropped and holds one fine.
-static WANTS_NETWORK: [Permission; 1] = [Permission::Network];
-static WANTS_SPAWN: [Permission; 1] = [Permission::Spawn];
-static WANTS_NOTHING: [Permission; 0] = [];
-
-/// Every language and every query, in the order they run.
-static RULES: [LanguageRules; 6] = [
-    LanguageRules {
-        name: "c",
-        extensions: &["c", "h"],
-        queries: C_QUERIES,
-    },
-    LanguageRules {
-        name: "cpp",
-        extensions: &["cc", "cpp", "cxx", "c++", "hpp", "hh", "hxx"],
-        queries: CPP_QUERIES,
-    },
-    LanguageRules {
-        name: "rust",
-        extensions: &["rs"],
-        queries: RUST_QUERIES,
-    },
-    LanguageRules {
-        name: "python",
-        extensions: &["py", "pyi"],
-        queries: PYTHON_QUERIES,
-    },
-    LanguageRules {
-        name: "go",
-        extensions: &["go"],
-        queries: GO_QUERIES,
-    },
-    LanguageRules {
-        name: "bash",
-        extensions: &["sh", "bash"],
-        queries: BASH_QUERIES,
-    },
-];
-
-/// C, and the base for C++: plain identifier calls plus string literals.
-static C_QUERIES: &[SourceQuery] = &[
-    SourceQuery {
-        name: "c:network-call",
-        query: r#"
-            (call_expression
-              function: (identifier) @_fn
-              (#any-of? @_fn
-                "socket" "socketpair" "connect" "bind" "listen" "accept" "accept4"
-                "getaddrinfo" "gethostbyname" "getnameinfo" "sendto" "recvfrom")) @call
-        "#,
-        implies: &WANTS_NETWORK,
-    },
-    SourceQuery {
-        name: "c:spawn-call",
-        query: r#"
-            (call_expression
-              function: (identifier) @_fn
-              (#any-of? @_fn
-                "fork" "vfork" "system" "popen" "posix_spawn" "posix_spawnp"
-                "execl" "execlp" "execle" "execv" "execvp" "execvpe" "execve")) @call
-        "#,
-        implies: &WANTS_SPAWN,
-    },
-    SourceQuery {
-        name: "c:exec-path",
-        query: r#"
-            (call_expression
-              function: (identifier) @_fn
-              arguments: (argument_list . (string_literal) @exec.path)
-              (#any-of? @_fn
-                "execl" "execlp" "execle" "execv" "execvp" "execvpe" "execve"
-                "posix_spawn" "posix_spawnp")) @call
-        "#,
-        implies: &WANTS_NOTHING,
-    },
-    SourceQuery {
-        name: "c:fopen-mode",
-        query: r#"
-            (call_expression
-              function: (identifier) @_fn
-              arguments: (argument_list (string_literal) @path . (string_literal) @mode)
-              (#any-of? @_fn "fopen" "fopen64" "freopen")) @call
-        "#,
-        implies: &WANTS_NOTHING,
-    },
-    SourceQuery {
-        name: "c:open-flags",
-        query: r#"
-            (call_expression
-              function: (identifier) @_fn
-              arguments: (argument_list (string_literal) @path) @mode
-              (#any-of? @_fn "open" "open64" "openat")) @call
-        "#,
-        implies: &WANTS_NOTHING,
-    },
-    SourceQuery {
-        name: "c:create-path",
-        query: r#"
-            (call_expression
-              function: (identifier) @_fn
-              arguments: (argument_list . (string_literal) @write.path)
-              (#any-of? @_fn "creat" "mkdir" "unlink" "rename" "truncate")) @call
-        "#,
-        implies: &WANTS_NOTHING,
-    },
-    SourceQuery {
-        name: "c:path-literal",
-        query: r"(string_literal) @path",
-        implies: &WANTS_NOTHING,
-    },
-];
-
-/// C++: everything C does, plus the qualified-call and `ofstream` forms C has no node for.
-static CPP_QUERIES: &[SourceQuery] = &[
-    SourceQuery {
-        name: "cpp:network-call",
-        query: r#"
-            (call_expression
-              function: (identifier) @_fn
-              (#any-of? @_fn
-                "socket" "socketpair" "connect" "bind" "listen" "accept"
-                "getaddrinfo" "gethostbyname" "sendto" "recvfrom")) @call
-        "#,
-        implies: &WANTS_NETWORK,
-    },
-    SourceQuery {
-        name: "cpp:network-call-qualified",
-        query: r#"
-            (call_expression
-              function: (qualified_identifier name: (identifier) @_fn)
-              (#any-of? @_fn
-                "socket" "socketpair" "connect" "bind" "listen" "accept"
-                "getaddrinfo" "gethostbyname" "sendto" "recvfrom")) @call
-        "#,
-        implies: &WANTS_NETWORK,
-    },
-    SourceQuery {
-        name: "cpp:spawn-call",
-        query: r#"
-            (call_expression
-              function: (identifier) @_fn
-              (#any-of? @_fn
-                "fork" "vfork" "system" "popen" "posix_spawn"
-                "execl" "execlp" "execv" "execvp" "execve")) @call
-        "#,
-        implies: &WANTS_SPAWN,
-    },
-    SourceQuery {
-        name: "cpp:spawn-call-qualified",
-        query: r#"
-            (call_expression
-              function: (qualified_identifier name: (identifier) @_fn)
-              (#any-of? @_fn
-                "fork" "vfork" "system" "popen" "posix_spawn"
-                "execl" "execlp" "execv" "execvp" "execve")) @call
-        "#,
-        implies: &WANTS_SPAWN,
-    },
-    SourceQuery {
-        name: "cpp:fopen-mode",
-        query: r#"
-            (call_expression
-              function: (identifier) @_fn
-              arguments: (argument_list (string_literal) @path . (string_literal) @mode)
-              (#any-of? @_fn "fopen" "fopen64" "freopen")) @call
-        "#,
-        implies: &WANTS_NOTHING,
-    },
-    SourceQuery {
-        name: "cpp:open-flags",
-        query: r#"
-            (call_expression
-              function: (identifier) @_fn
-              arguments: (argument_list (string_literal) @path) @mode
-              (#any-of? @_fn "open" "open64" "openat")) @call
-        "#,
-        implies: &WANTS_NOTHING,
-    },
-    SourceQuery {
-        name: "cpp:ofstream",
-        query: r#"
-            (declaration
-              type: (qualified_identifier name: (type_identifier) @_ty)
-              declarator: (init_declarator
-                (argument_list . (string_literal) @write.path))
-              (#any-of? @_ty "ofstream" "fstream" "ofstream_t")) @call
-        "#,
-        implies: &WANTS_NOTHING,
-    },
-    SourceQuery {
-        name: "cpp:path-literal",
-        query: r"(string_literal) @path",
-        implies: &WANTS_NOTHING,
-    },
-];
-
-/// Rust: `use` trees name the crate, and the standard library's constructors name the mode.
-static RUST_QUERIES: &[SourceQuery] = &[
-    SourceQuery {
-        name: "rust:net-import",
-        query: r#"
-            (use_declaration
-              [(scoped_identifier path: (scoped_identifier name: (identifier) @_m))
-               (scoped_use_list path: (scoped_identifier name: (identifier) @_m))
-               (scoped_identifier path: (identifier) @_m)
-               (scoped_use_list path: (identifier) @_m)
-               (identifier) @_m]
-              (#any-of? @_m
-                "net" "reqwest" "hyper" "ureq" "curl" "tonic" "socket2" "isahc")) @call
-        "#,
-        implies: &WANTS_NETWORK,
-    },
-    SourceQuery {
-        name: "rust:net-call",
-        query: r#"
-            (call_expression
-              function: (scoped_identifier
-                path: (identifier) @_ty
-                name: (identifier) @_fn)
-              (#any-of? @_ty "TcpStream" "TcpListener" "UdpSocket" "reqwest" "hyper" "ureq")) @call
-        "#,
-        implies: &WANTS_NETWORK,
-    },
-    SourceQuery {
-        name: "rust:process-import",
-        query: r#"
-            (use_declaration
-              [(scoped_identifier path: (scoped_identifier name: (identifier) @_m))
-               (scoped_use_list path: (scoped_identifier name: (identifier) @_m))]
-              (#any-of? @_m "process")) @call
-        "#,
-        implies: &WANTS_SPAWN,
-    },
-    SourceQuery {
-        name: "rust:command-new",
-        query: r#"
-            (call_expression
-              function: (scoped_identifier
-                path: (identifier) @_ty
-                name: (identifier) @_fn)
-              (#eq? @_ty "Command")
-              (#eq? @_fn "new")) @call
-        "#,
-        implies: &WANTS_SPAWN,
-    },
-    SourceQuery {
-        name: "rust:command-program",
-        query: r#"
-            (call_expression
-              function: (scoped_identifier
-                path: (identifier) @_ty
-                name: (identifier) @_fn)
-              arguments: (arguments . (string_literal) @exec.path)
-              (#eq? @_ty "Command")
-              (#eq? @_fn "new")) @call
-        "#,
-        implies: &WANTS_NOTHING,
-    },
-    SourceQuery {
-        name: "rust:file-create",
-        query: r#"
-            (call_expression
-              function: (scoped_identifier name: (identifier) @_fn)
-              arguments: (arguments . (string_literal) @write.path)
-              (#any-of? @_fn
-                "create" "create_new" "create_dir" "create_dir_all"
-                "write" "remove_file" "remove_dir_all" "rename")) @call
-        "#,
-        implies: &WANTS_NOTHING,
-    },
-    SourceQuery {
-        name: "rust:path-literal",
-        query: r"(string_literal) @path",
-        implies: &WANTS_NOTHING,
-    },
-];
-
-/// Python: imports are nodes, and `open`'s mode is its second argument.
-static PYTHON_QUERIES: &[SourceQuery] = &[
-    SourceQuery {
-        name: "python:net-import",
-        query: r#"
-            (import_statement
-              name: [(dotted_name (identifier) @_m)
-                     (aliased_import name: (dotted_name (identifier) @_m))]
-              (#any-of? @_m
-                "socket" "requests" "urllib" "urllib2" "urllib3" "http" "httplib"
-                "httpx" "aiohttp" "ftplib" "smtplib" "telnetlib")) @call
-        "#,
-        implies: &WANTS_NETWORK,
-    },
-    SourceQuery {
-        name: "python:net-import-from",
-        query: r#"
-            (import_from_statement
-              module_name: (dotted_name (identifier) @_m)
-              (#any-of? @_m
-                "socket" "requests" "urllib" "urllib2" "urllib3" "http" "httplib"
-                "httpx" "aiohttp" "ftplib" "smtplib" "telnetlib")) @call
-        "#,
-        implies: &WANTS_NETWORK,
-    },
-    SourceQuery {
-        name: "python:net-call",
-        query: r#"
-            (call
-              function: (attribute object: (identifier) @_obj)
-              (#any-of? @_obj "socket" "requests" "urllib" "httpx" "aiohttp")) @call
-        "#,
-        implies: &WANTS_NETWORK,
-    },
-    SourceQuery {
-        name: "python:spawn-import",
-        query: r#"
-            (import_statement
-              name: [(dotted_name (identifier) @_m)
-                     (aliased_import name: (dotted_name (identifier) @_m))]
-              (#any-of? @_m "subprocess" "multiprocessing" "pty")) @call
-        "#,
-        implies: &WANTS_SPAWN,
-    },
-    SourceQuery {
-        name: "python:spawn-import-from",
-        query: r#"
-            (import_from_statement
-              module_name: (dotted_name (identifier) @_m)
-              (#any-of? @_m "subprocess" "multiprocessing" "pty")) @call
-        "#,
-        implies: &WANTS_SPAWN,
-    },
-    SourceQuery {
-        name: "python:spawn-call",
-        query: r#"
-            (call
-              function: (attribute
-                object: (identifier) @_obj
-                attribute: (identifier) @_fn)
-              (#any-of? @_obj "subprocess" "os")
-              (#any-of? @_fn
-                "run" "call" "check_call" "check_output" "Popen" "system" "popen"
-                "fork" "execv" "execvp" "execl" "execlp" "spawnv" "spawnl" "posix_spawn")) @call
-        "#,
-        implies: &WANTS_SPAWN,
-    },
-    SourceQuery {
-        name: "python:open-mode",
-        query: r#"
-            (call
-              function: (identifier) @_fn
-              arguments: (argument_list (string) @path . (string) @mode)
-              (#any-of? @_fn "open" "fdopen")) @call
-        "#,
-        implies: &WANTS_NOTHING,
-    },
-    SourceQuery {
-        name: "python:write-call",
-        query: r#"
-            (call
-              function: (attribute object: (identifier) @_obj attribute: (identifier) @_fn)
-              arguments: (argument_list . (string) @write.path)
-              (#any-of? @_obj "os" "shutil" "pathlib")
-              (#any-of? @_fn
-                "remove" "unlink" "rename" "mkdir" "makedirs" "rmtree" "copy" "chmod")) @call
-        "#,
-        implies: &WANTS_NOTHING,
-    },
-    SourceQuery {
-        name: "python:path-literal",
-        query: r"(string) @path",
-        implies: &WANTS_NOTHING,
-    },
-];
-
-/// Go: the import path is a string literal, so the import itself is queryable.
-static GO_QUERIES: &[SourceQuery] = &[
-    SourceQuery {
-        name: "go:net-import",
-        query: r#"
-            (import_spec
-              path: (interpreted_string_literal (interpreted_string_literal_content) @_p)
-              (#any-of? @_p
-                "net" "net/http" "net/url" "net/rpc" "net/smtp" "crypto/tls"
-                "golang.org/x/net/http2")) @call
-        "#,
-        implies: &WANTS_NETWORK,
-    },
-    SourceQuery {
-        name: "go:net-call",
-        query: r#"
-            (call_expression
-              function: (selector_expression
-                operand: (identifier) @_pkg
-                field: (field_identifier) @_fn)
-              (#any-of? @_pkg "net" "http" "tls" "smtp")) @call
-        "#,
-        implies: &WANTS_NETWORK,
-    },
-    SourceQuery {
-        name: "go:spawn-import",
-        query: r#"
-            (import_spec
-              path: (interpreted_string_literal (interpreted_string_literal_content) @_p)
-              (#any-of? @_p "os/exec" "syscall")) @call
-        "#,
-        implies: &WANTS_SPAWN,
-    },
-    SourceQuery {
-        name: "go:spawn-call",
-        query: r#"
-            (call_expression
-              function: (selector_expression
-                operand: (identifier) @_pkg
-                field: (field_identifier) @_fn)
-              (#any-of? @_pkg "exec" "os" "syscall")
-              (#any-of? @_fn "Command" "CommandContext" "StartProcess" "Exec" "ForkExec")) @call
-        "#,
-        implies: &WANTS_SPAWN,
-    },
-    SourceQuery {
-        name: "go:openfile-flags",
-        query: r#"
-            (call_expression
-              function: (selector_expression
-                operand: (identifier) @_pkg
-                field: (field_identifier) @_fn)
-              arguments: (argument_list (interpreted_string_literal) @path) @mode
-              (#eq? @_pkg "os")
-              (#any-of? @_fn "OpenFile")) @call
-        "#,
-        implies: &WANTS_NOTHING,
-    },
-    SourceQuery {
-        name: "go:write-call",
-        query: r#"
-            (call_expression
-              function: (selector_expression
-                operand: (identifier) @_pkg
-                field: (field_identifier) @_fn)
-              arguments: (argument_list . (interpreted_string_literal) @write.path)
-              (#any-of? @_pkg "os" "ioutil")
-              (#any-of? @_fn
-                "Create" "WriteFile" "Remove" "RemoveAll" "Mkdir" "MkdirAll" "Rename")) @call
-        "#,
-        implies: &WANTS_NOTHING,
-    },
-    SourceQuery {
-        name: "go:path-literal",
-        query: r"[(interpreted_string_literal) (raw_string_literal)] @path",
-        implies: &WANTS_NOTHING,
-    },
-];
-
-/// Bash: a command name is its own node, and a redirection target is a node too - so
-/// `> /var/log/x` is a write with no heuristics at all.
-static BASH_QUERIES: &[SourceQuery] = &[
-    SourceQuery {
-        name: "bash:network-command",
-        query: r#"
-            (command
-              name: (command_name (word) @_cmd)
-              (#any-of? @_cmd
-                "curl" "wget" "nc" "netcat" "ftp" "sftp" "scp" "rsync" "ssh"
-                "telnet" "git" "pip" "pip3" "npm" "cargo" "apt" "apt-get" "dnf")) @call
-        "#,
-        implies: &WANTS_NETWORK,
-    },
-    SourceQuery {
-        name: "bash:spawn-command",
-        query: r"(command name: (command_name) @call)",
-        implies: &WANTS_SPAWN,
-    },
-    SourceQuery {
-        name: "bash:exec-command",
-        query: r#"
-            (command
-              name: (command_name (word) @_cmd)
-              argument: (word) @exec.path
-              (#any-of? @_cmd "exec" "nohup" "setsid" "sudo" "env" "timeout")) @call
-        "#,
-        implies: &WANTS_NOTHING,
-    },
-    SourceQuery {
-        name: "bash:redirect-write",
-        query: r"(file_redirect destination: [(word) (string)] @write.path) @call",
-        implies: &WANTS_NOTHING,
-    },
-    SourceQuery {
-        name: "bash:path-literal",
-        query: r"[(word) (string) (raw_string)] @path",
-        implies: &WANTS_NOTHING,
-    },
-];
