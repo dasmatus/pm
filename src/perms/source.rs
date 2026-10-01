@@ -203,12 +203,7 @@ fn collect(dir: &Path, plugins: &Registry) -> Result<Vec<(PathBuf, Option<Scanne
 /// no grants and a `debug` line, and a scanner that traps costs this file's grants and a
 /// `warn` line. Source trees are full of such files and none of them is a reason to
 /// abandon the scan.
-fn scan_file(
-    root: &Path,
-    path: &Path,
-    scanner: Option<Scanner>,
-    plugins: &Registry,
-) -> Vec<Grant> {
+fn scan_file(root: &Path, path: &Path, scanner: Option<Scanner>, plugins: &Registry) -> Vec<Grant> {
     let Ok(bytes) = fs::read(path) else {
         debug!(path = %path.display(), "skipping unreadable file");
         return Vec::new();

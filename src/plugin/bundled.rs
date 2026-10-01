@@ -202,10 +202,7 @@ pub fn fingerprint_names() -> Result<Vec<&'static str>> {
 /// Run `call` against this thread's live instance of `plugin`, making one if needed.
 ///
 /// An instance whose call failed is dropped, so the next call gets a fresh one.
-fn with_live<T>(
-    plugin: &'static Loaded,
-    call: impl FnOnce(&mut Live) -> Result<T>,
-) -> Result<T> {
+fn with_live<T>(plugin: &'static Loaded, call: impl FnOnce(&mut Live) -> Result<T>) -> Result<T> {
     let name: &'static str = plugin.manifest.name.as_str();
     LIVE.with(|live| {
         let mut live = live.borrow_mut();
@@ -243,7 +240,10 @@ pub fn classify(command: &str) -> Result<Option<(&'static str, Vec<Capability>)>
             Ok(Some(verdict)) => verdict,
             Ok(None) => continue,
             Err(report) => {
-                warn!(plugin = name, command, "cannot classify this command: {report}");
+                warn!(
+                    plugin = name,
+                    command, "cannot classify this command: {report}"
+                );
                 continue;
             }
         };
@@ -298,7 +298,9 @@ pub fn scan_source(scanner: &'static Loaded, relative: &str, contents: &str) -> 
         contents: contents.to_owned(),
     };
     let answer = with_live(scanner, |live| {
-        live.call(name, |bindings, store| bindings.call_scan_source(store, &file))
+        live.call(name, |bindings, store| {
+            bindings.call_scan_source(store, &file)
+        })
     });
     match answer {
         Ok(grants) => grants
@@ -387,8 +389,8 @@ mod tests {
         assert_eq!(
             seen.into_iter().collect::<Vec<_>>(),
             [
-                "bash", "c", "c++", "cc", "cpp", "cxx", "go", "h", "hh", "hpp", "hxx", "py",
-                "pyi", "rs", "sh"
+                "bash", "c", "c++", "cc", "cpp", "cxx", "go", "h", "hh", "hpp", "hxx", "py", "pyi",
+                "rs", "sh"
             ]
         );
     }

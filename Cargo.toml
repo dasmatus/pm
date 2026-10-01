@@ -58,3 +58,29 @@ zbus = { version = "5.19", default-features = false, features = ["async-io", "bl
 [dev-dependencies]
 divan = "0.1.21"
 proptest = "1.11.0"
+
+# pm compiles its bundled WebAssembly plugins with Cranelift on first use. Unoptimised,
+# that takes ~30s and every test that classifies a command pays it; optimised it is ~2s.
+# Only the compiler is optimised, so pm's own code stays as debuggable as before.
+[profile.dev.package.cranelift-codegen]
+opt-level = 3
+[profile.dev.package.cranelift-frontend]
+opt-level = 3
+[profile.dev.package.cranelift-entity]
+opt-level = 3
+[profile.dev.package.cranelift-bforest]
+opt-level = 3
+[profile.dev.package.cranelift-assembler-x64]
+opt-level = 3
+[profile.dev.package.regalloc2]
+opt-level = 3
+[profile.dev.package.wasmparser]
+opt-level = 3
+[profile.dev.package.wasmtime-environ]
+opt-level = 3
+[profile.dev.package.wasmtime-internal-cranelift]
+opt-level = 3
+[profile.dev.package.wasmtime]
+opt-level = 3
+[profile.dev.package.gimli]
+opt-level = 3
