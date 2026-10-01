@@ -590,19 +590,24 @@ what="system"
     ),
 ];
 
-/// The query table is public so `pm` can print what it looks for; if it ever went empty
-/// every negative test above would pass vacuously.
+/// Every bundled scanner loads and claims extensions; if one went missing every negative
+/// test above would pass vacuously for its language.
 #[test]
-fn every_language_carries_queries() {
-    let languages = source::languages();
-    assert_eq!(languages.len(), 6);
-    for rules in languages {
+fn every_language_has_a_scanner() {
+    let scanners = pm::plugin::bundled::sources().expect("bundled scanners load");
+    assert_eq!(scanners.len(), 6);
+    for scanner in scanners {
+        let manifest = scanner.manifest();
         assert!(
-            !rules.extensions.is_empty(),
-            "{} has no extensions",
-            rules.name
+            manifest.hooks.contains(&pm::plugin::Hook::ScanSource),
+            "{} does not scan sources",
+            manifest.name
         );
-        assert!(!rules.queries.is_empty(), "{} has no queries", rules.name);
+        assert!(
+            !manifest.source_extensions.is_empty(),
+            "{} has no extensions",
+            manifest.name
+        );
     }
 }
 

@@ -53,7 +53,7 @@ use wasmtime::{
     component::{Component, Linker},
 };
 
-use super::wit::{Bindings, LogHost, TypesHost, WitLevel};
+use super::wit::{Bindings, LogHost, TypesHost, WitLevel, bundled::BundledBindings};
 
 /// Instructions one call may execute before it traps.
 ///
@@ -69,6 +69,21 @@ const FUEL: u64 = 200_000_000;
 /// [`crate::perms::source::MAX_FILE_BYTES`], so this is roomy for the only input that
 /// can be large at all.
 const MEMORY_BYTES: usize = 64 << 20;
+
+/// Instructions one call into a **bundled** plugin may execute.
+///
+/// Bundled plugins are pm's own code, shipped inside the binary, and the source scanners
+/// among them parse a whole file with a real grammar - up to
+/// [`crate::perms::source::MAX_FILE_BYTES`] of C++ - where a reference plugin matches a
+/// token stream. The budget is still there so that a bug in one is a logged trap rather
+/// than a hang, but it is sized for a parser, not for a lookup table.
+const BUNDLED_FUEL: u64 = 50_000_000_000;
+
+/// Largest linear memory one bundled plugin instance may grow to.
+///
+/// A bundled instance lives for the whole scan on its thread (see [`Live`]) and keeps
+/// its compiled queries, so it needs room for those beside one file's syntax tree.
+const BUNDLED_MEMORY_BYTES: usize = 1 << 30;
 
 /// Largest table one plugin instance may grow to, in elements.
 const TABLE_ELEMENTS: usize = 10_000;
@@ -189,12 +204,70 @@ impl Runtime {
             .map_err(|error| miette!("cannot meter the plugin {plugin}: {error:?}"))?;
 
         let bindings = Bindings::instantiate(&mut store, component, &self.linker)
-            .map_err(|error| describe(plugin, "instantiate", &mut store, &error))?;
+            .map_err(|error| describe(plugin, "instantiate", FUEL, &mut store, &error))?;
 
         let outcome = call(&bindings, &mut store);
         let spent = FUEL.saturating_sub(store.get_fuel().unwrap_or(0));
         trace!(plugin, fuel = spent, "plugin call finished");
-        outcome.map_err(|error| describe(plugin, "call", &mut store, &error))
+        outcome.map_err(|error| describe(plugin, "call", FUEL, &mut store, &error))
+    }
+
+    /// Instantiate a **bundled** plugin, for [`Live::call`] to call into repeatedly.
+    ///
+    /// The one place pm keeps an instance across calls, and only for its own plugins:
+    /// the tree-sitter scanners compile their queries once per instance, and compiling a
+    /// query costs far more than running one. The isolation a fresh instance buys - one
+    /// file cannot influence what another is found to need - is a defence against a
+    /// plugin pm did not write; a bundled plugin is part of the pm binary that was
+    /// signed and installed, the same code these tables were before they were
+    /// components.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the component does not instantiate, which for a bundled plugin is a bug
+    /// in pm.
+    pub(super) fn instantiate_bundled(&self, plugin: &str, component: &Component) -> Result<Live> {
+        let mut store = Store::new(&self.engine, State::bundled(plugin));
+        store.limiter(|state| &mut state.limits);
+        store
+            .set_fuel(BUNDLED_FUEL)
+            .map_err(|error| miette!("cannot meter the plugin {plugin}: {error:?}"))?;
+        let bindings = BundledBindings::instantiate(&mut store, component, &self.linker)
+            .map_err(|error| describe(plugin, "instantiate", BUNDLED_FUEL, &mut store, &error))?;
+        Ok(Live { store, bindings })
+    }
+}
+
+/// A bundled plugin's instance, kept for the calls one thread makes into it.
+///
+/// See [`Runtime::instantiate_bundled`] for why this exists at all. Each call is still
+/// metered on its own - the fuel is topped up to [`BUNDLED_FUEL`] before it - and an
+/// instance that trapped is the caller's to throw away, since a trap can leave the
+/// guest's memory half-updated.
+pub(super) struct Live {
+    store: Store<State>,
+    bindings: BundledBindings,
+}
+
+impl Live {
+    /// Call into the instance.
+    ///
+    /// # Errors
+    ///
+    /// As [`Runtime::enter`]: a trap, running out of fuel or exceeding a store limit.
+    /// The instance must not be used again after an error.
+    pub(super) fn call<T>(
+        &mut self,
+        plugin: &str,
+        call: impl FnOnce(&BundledBindings, &mut Store<State>) -> wasmtime::Result<T>,
+    ) -> Result<T> {
+        self.store
+            .set_fuel(BUNDLED_FUEL)
+            .map_err(|error| miette!("cannot meter the plugin {plugin}: {error:?}"))?;
+        let outcome = call(&self.bindings, &mut self.store);
+        let spent = BUNDLED_FUEL.saturating_sub(self.store.get_fuel().unwrap_or(0));
+        trace!(plugin, fuel = spent, "bundled plugin call finished");
+        outcome.map_err(|error| describe(plugin, "call", BUNDLED_FUEL, &mut self.store, &error))
     }
 }
 
@@ -210,10 +283,19 @@ pub(super) struct State {
 impl State {
     /// A fresh state for one call by `plugin`.
     fn new(plugin: &str) -> Self {
+        Self::with_memory(plugin, MEMORY_BYTES)
+    }
+
+    /// The state a bundled plugin's long-lived instance runs in.
+    fn bundled(plugin: &str) -> Self {
+        Self::with_memory(plugin, BUNDLED_MEMORY_BYTES)
+    }
+
+    fn with_memory(plugin: &str, memory: usize) -> Self {
         Self {
             plugin: plugin.to_owned(),
             limits: StoreLimitsBuilder::new()
-                .memory_size(MEMORY_BYTES)
+                .memory_size(memory)
                 .table_elements(TABLE_ELEMENTS)
                 // These count the *core* instances, memories and tables inside one
                 // component, not plugins: the adapters `wit-bindgen` emits mean even a
@@ -277,6 +359,7 @@ fn truncate(mut message: String) -> String {
 fn describe(
     plugin: &str,
     what: &str,
+    fuel: u64,
     store: &mut Store<State>,
     error: &wasmtime::Error,
 ) -> miette::Report {
@@ -285,7 +368,7 @@ fn describe(
             help = "The plugin ran past the per-call instruction budget. That is a \
                     runaway loop far more often than it is a plugin that needs more \
                     room.",
-            "the plugin {plugin} used all {FUEL} units of fuel during {what}"
+            "the plugin {plugin} used all {fuel} units of fuel during {what}"
         ),
         Some(Trap::StackOverflow) => {
             miette!("the plugin {plugin} overflowed its {STACK_BYTES}-byte stack during {what}")

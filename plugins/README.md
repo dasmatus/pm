@@ -9,11 +9,22 @@ answer the two questions its own built-in tables cannot always answer:
 | `classify-command` | what does this build-step command need from the build jail?               | refuses to build, naming the command           |
 | `scan-source`      | what does this source file imply the built program needs at run time?     | contributes nothing for file types it cannot parse |
 
-pm's own answers are organised the same way: `src/plugin/builtin/` holds one
-compiled-in plugin per ecosystem (`buildsys`, `rust`, `go`, `node`, `python`, `c`,
-`posix`, `git`), each carrying its build-command fingerprints and, where pm has
-one, its source grammar. Those are consulted first; the plugins described here
-only ever hear about what none of them recognised.
+pm's own answers are plugins too. `bundled/` holds one component per ecosystem
+(`buildsys`, `rust`, `go`, `node`, `python`, `c`, `posix`, `git`) carrying its
+build-command fingerprints, and one tree-sitter scanner per language (`c-source`,
+`cpp-source`, `rust-source`, `python-source`, `go-source`, `bash-source`) carrying
+the grammar and its queries. They are written against the same `wit/plugin.wit`
+(the `bundled` world adds one export listing the fingerprint names), encoded into
+`bundled/components/` by `./build.sh` and embedded into pm, which runs them in the
+same runtime as yours. They are consulted first, in that order, and recorded
+under their own names exactly as the old compiled-in tables were; the plugins
+described here only ever hear about what none of them recognised.
+
+Two things differ for the bundled tier, because it ships with pm rather than
+being installed next to it: its instances are reused across calls on a thread
+(so each grammar's queries compile once, not once per file), and its fuel and
+memory budgets are sized for parsing whole source files. Neither applies to an
+installed plugin.
 
 The interface is `wit/plugin.wit` at the repository root. Read it first; it is
 the contract, and it is commented.

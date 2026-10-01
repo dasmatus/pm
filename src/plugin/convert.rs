@@ -338,7 +338,7 @@ fn permission(from: WitPermission, manifest: &Manifest) -> Option<Permission> {
 
 /// Map a capability across the boundary. Total in both directions by construction: the
 /// WIT enum is the Rust one, written out again.
-fn capability(from: WitCapability) -> Capability {
+pub(super) fn capability(from: WitCapability) -> Capability {
     match from {
         WitCapability::Toolchain => Capability::Toolchain,
         WitCapability::Coreutils => Capability::Coreutils,

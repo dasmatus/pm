@@ -6,7 +6,8 @@
 # wrapped them in a component yet. `encoder/` does that - `wasm-tools component new`
 # does the same job if you have it installed.
 #
-#   ./build.sh            build everything into dist/, refresh the test fixtures
+#   ./build.sh            build everything into dist/, refresh the test fixtures and
+#                         the bundled components pm embeds (bundled/components/)
 #   ./build.sh zig        build one crate into dist/
 #
 # Requires only a Rust toolchain with the wasm32-unknown-unknown target:
@@ -50,4 +51,25 @@ if [ $# -eq 0 ]; then
         cp "$out/$crate.wasm" "$fixtures/$crate.wasm"
     done
     echo "refreshed $fixtures"
+fi
+
+# pm's own bundled plugins: one per ecosystem (bundled/<name>) and one tree-sitter
+# scanner per language (bundled/<lang>-source). They are embedded into pm with
+# `include_bytes!`, so the encoded components are checked in next to the crates and
+# `cargo build` of pm needs no wasm toolchain either.
+#
+# The grammars are C. The vendored tree-sitter-language (see vendor/) ships the few
+# libc headers they include, and this tells the C compiler where they are.
+if [ $# -eq 0 ]; then
+    bundled="buildsys rust go node python c posix git \
+        c-source cpp-source rust-source python-source go-source bash-source"
+    CFLAGS_wasm32_unknown_unknown="-I$here/vendor/tree-sitter-language/wasm/include" \
+        cargo build --release --target "$target" \
+        $(for b in $bundled; do echo "-p bundled-$b"; done)
+    mkdir -p "$here/bundled/components"
+    for b in $bundled; do
+        module="$here/target/$target/release/bundled_$(echo "$b" | tr - _).wasm"
+        "$here/target/release/encoder" "$module" "$here/bundled/components/$b.wasm"
+    done
+    echo "refreshed $here/bundled/components"
 fi

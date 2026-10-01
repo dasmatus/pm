@@ -12,15 +12,15 @@
 //! questions. pm loads every `*.wasm` in `<config>/pm/plugins/`, asks each one to
 //! [`describe`](Plugin::manifest) itself, and calls the hooks it declared.
 //!
-//! # Built-in plugins
+//! # Bundled plugins
 //!
-//! pm's own tables are organised the same way, per ecosystem, in [`builtin`]: the Go
-//! plugin there carries the `go` fingerprint and the Go grammar, the C plugin the
-//! compilers and the C and C++ grammars, and so on. They are compiled in, need no
-//! signature and are consulted **before** anything loaded from disk, which is what keeps
-//! the guarantee below - a loaded plugin only ever hears about a command no built-in
-//! recognised. Teaching pm a new ecosystem natively is a new module there; teaching it
-//! one without rebuilding pm is a component here.
+//! pm's own knowledge is plugins too. The build-command fingerprints and the source
+//! grammars that used to be tables compiled into pm are fourteen components in
+//! [`bundled`], built from `plugins/bundled/` and embedded in the binary. They run in the
+//! same sandbox as an installed plugin, but they are part of pm: they need no signature,
+//! `--no-plugins` leaves them in place, and they are consulted **before** anything loaded
+//! from disk, which is what keeps the guarantee below - an installed plugin only ever
+//! hears about a command no bundled classifier recognised.
 //!
 //! # Why a component, and why sandboxed
 //!
@@ -73,8 +73,8 @@
 //! [`Enforcement::Audit`]: crate::perms::Enforcement::Audit
 //! [`Provenance::Plugin`]: crate::perms::Provenance::Plugin
 
-/// pm's own tables, split by ecosystem into plugins that are compiled in.
-pub mod builtin;
+/// pm's own plugins, embedded in the binary and consulted first.
+pub mod bundled;
 /// Conversions from what a plugin said into what pm will act on.
 mod convert;
 /// The WebAssembly runtime a plugin is confined to.

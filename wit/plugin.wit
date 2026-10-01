@@ -208,3 +208,18 @@ world plugin {
     /// the profile unchanged.
     export scan-source: func(file: source-file) -> list<grant>;
 }
+
+/// The world pm's own bundled plugins export.
+///
+/// Everything a third-party plugin exports, plus the list of fingerprint names its
+/// `classify-command` can answer with. pm embeds these components in its own binary and
+/// consults them **before** any plugin loaded from disk; they replace what used to be
+/// tables compiled into pm. A third-party plugin is built against `plugin`, never this.
+world bundled {
+    include plugin;
+
+    /// Every fingerprint name `classify-command` can return, in the order it tries
+    /// them. pm lists these when a command matches nothing, and recognises them when it
+    /// reads back a serialised build policy.
+    export fingerprints: func() -> list<string>;
+}
