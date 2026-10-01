@@ -144,8 +144,10 @@ and have not signed yet. A build file names commands that run inside a jail; a
 plugin *is* code that runs inside pm and helps decide what that jail allows, so
 the escape hatch gives up rather more here than it does there.
 
-`--no-plugins` loads none at all, which is the honest way to find out whether a
-plugin is responsible for a surprising policy.
+`--no-plugins` loads no installed plugin at all, which is the honest way to find
+out whether one of them is responsible for a surprising policy. It does not turn
+off the bundled plugins: they are pm's own fingerprints and scanners, and a policy
+derived without them would not be pm's.
 
 ## Building one
 

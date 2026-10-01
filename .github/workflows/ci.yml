@@ -9,8 +9,8 @@ on:
 
 # ── What this gates, and what it deliberately does not ─────────────────────
 #
-# Three jobs: rustfmt + clippy, the default test suite, and the confined tests
-# the default suite skips.
+# Four jobs: rustfmt + clippy, the default test suite, the confined tests the
+# default suite skips, and a rebuild of the bundled WebAssembly plugins.
 #
 # `lint` and `test` are separate jobs rather than one. They do not share build
 # artifacts — clippy type-checks and emits .rmeta while `cargo test` needs
@@ -202,3 +202,41 @@ jobs:
         run: cargo test --all-features --test sandbox -- --ignored
       - name: "run jail: landlock"
         run: cargo test --all-features --test landlock -- --ignored
+
+  bundled:
+    name: "bundled plugins rebuild"
+    # Pinned rather than ubuntu-latest: the grammars are C, and the components only
+    # rebuild byte for byte with the clang they were built with (Ubuntu 24.04's 18).
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    # pm runs the components in plugins/bundled/components/, not the sources next
+    # to them, so a source edit that was not followed by ./build.sh --bundled would
+    # pass every other job while pm kept running the old code. This rebuilds them
+    # from source with the toolchain plugins/rust-toolchain.toml pins and fails on
+    # any difference from what is checked in.
+    steps:
+      - uses: actions/checkout@v4
+      - name: toolchain
+        run: |
+          set -euo pipefail
+          clang --version
+          # rustup reads plugins/rust-toolchain.toml and installs that toolchain and
+          # its wasm targets on first use.
+          cd plugins && rustc -vV
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            plugins/target
+          key: cargo-bundled-${{ hashFiles('plugins/rust-toolchain.toml', 'plugins/Cargo.lock') }}
+          restore-keys: cargo-bundled-${{ hashFiles('plugins/rust-toolchain.toml') }}-
+      - run: plugins/build.sh --bundled
+      - name: compare with the checked-in components
+        run: |
+          set -euo pipefail
+          if ! git diff --exit-code --stat -- plugins/bundled/components; then
+            echo "::error::plugins/bundled/components is stale or was not built from these sources; run plugins/build.sh --bundled and commit the result"
+            exit 1
+          fi

@@ -453,7 +453,7 @@ impl Loader {
 /// lives in a store that exists only for the duration of one call.
 pub struct Registry {
     /// `None` exactly when there are no plugins, so a pm with none installed never
-    /// builds a WebAssembly engine at all.
+    /// builds an engine for them (the bundled tier keeps its own).
     runtime: Option<Runtime>,
     plugins: Vec<Plugin>,
     digest: String,

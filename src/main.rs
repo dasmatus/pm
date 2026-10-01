@@ -90,12 +90,12 @@ struct Arge {
 /// that from a different plugin set.
 #[derive(clap::Args, Debug, Clone)]
 struct PluginArgs {
-    /// Do not load any plugins.
+    /// Do not load any installed plugins.
     ///
     /// pm then classifies commands and scans sources with nothing but its own
-    /// built-in tables, which is exactly what it did before there was a plugin
-    /// system. The honest way to find out whether a plugin is responsible for a
-    /// surprising policy.
+    /// bundled plugins, which is exactly what it did before plugins could be
+    /// installed. The honest way to find out whether an installed plugin is
+    /// responsible for a surprising policy.
     #[arg(long, global = true)]
     no_plugins: bool,
 
