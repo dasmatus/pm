@@ -28,3 +28,24 @@ pub(super) use self::{
         },
     },
 };
+
+/// The bindings for the `bundled` world: everything above, plus the `fingerprints`
+/// export pm's own plugins carry.
+///
+/// The shared interfaces are mapped onto the modules generated above, so a
+/// `Manifest`, a `Verdict` or the `log` host is one type whichever world produced it,
+/// and one [`wasmtime::component::Linker`] serves both.
+pub(super) mod bundled {
+    #![allow(clippy::all, clippy::pedantic, missing_docs, unreachable_pub)]
+
+    wasmtime::component::bindgen!({
+        path: "wit",
+        world: "bundled",
+        with: {
+            "pm:plugin/types": super::pm::plugin::types,
+            "pm:plugin/host": super::pm::plugin::host,
+        },
+    });
+
+    pub(in crate::plugin) use self::Bundled as BundledBindings;
+}

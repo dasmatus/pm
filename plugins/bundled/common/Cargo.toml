@@ -1,0 +1,8 @@
+[package]
+name = "bundled"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+regex = { version = "1.13.1", default-features = false, features = ["std", "unicode-perl"] }

@@ -1,33 +1,16 @@
-//! Rust: Cargo, and the Rust grammar.
+//! Reads Rust sources (`.rs`) for what the built program will need at run
+//! time. The query engine is `bundled-source`.
 
-use tree_sitter::Language;
+use bundled_source::{Implies, Language, Scanner, SourceQuery, tree_sitter};
 
-use super::{Builtin, FETCHING_TOOLCHAIN, WANTS_NETWORK, WANTS_NOTHING, WANTS_SPAWN};
-use crate::{
-    perms::source::{LanguageRules, SourceQuery},
-    policy::Fingerprint,
-};
-
-pub(super) static PLUGIN: Builtin = Builtin {
+static SCANNER: Scanner = Scanner::new(&[Language {
     name: "rust",
-    summary: "cargo and rustc; reads `.rs` sources",
-    fingerprints: FINGERPRINTS,
-    languages: &[LanguageRules {
-        name: "rust",
-        extensions: &["rs"],
-        grammar,
-        queries: RUST_QUERIES,
-    }],
-};
+    extensions: &["rs"],
+    grammar,
+    queries: RUST_QUERIES,
+}]);
 
-static FINGERPRINTS: &[Fingerprint] = &[Fingerprint {
-    name: "cargo",
-    // Cargo resolves and downloads the dependency graph itself.
-    pattern: program!(r"cargo|rustc"),
-    capabilities: &FETCHING_TOOLCHAIN,
-}];
-
-fn grammar() -> Language {
+fn grammar() -> tree_sitter::Language {
     tree_sitter_rust::LANGUAGE.into()
 }
 
@@ -45,7 +28,7 @@ static RUST_QUERIES: &[SourceQuery] = &[
               (#any-of? @_m
                 "net" "reqwest" "hyper" "ureq" "curl" "tonic" "socket2" "isahc")) @call
         "#,
-        implies: &WANTS_NETWORK,
+        implies: Implies::Network,
     },
     SourceQuery {
         name: "rust:net-call",
@@ -56,7 +39,7 @@ static RUST_QUERIES: &[SourceQuery] = &[
                 name: (identifier) @_fn)
               (#any-of? @_ty "TcpStream" "TcpListener" "UdpSocket" "reqwest" "hyper" "ureq")) @call
         "#,
-        implies: &WANTS_NETWORK,
+        implies: Implies::Network,
     },
     SourceQuery {
         name: "rust:process-import",
@@ -66,7 +49,7 @@ static RUST_QUERIES: &[SourceQuery] = &[
                (scoped_use_list path: (scoped_identifier name: (identifier) @_m))]
               (#any-of? @_m "process")) @call
         "#,
-        implies: &WANTS_SPAWN,
+        implies: Implies::Spawn,
     },
     SourceQuery {
         name: "rust:command-new",
@@ -78,7 +61,7 @@ static RUST_QUERIES: &[SourceQuery] = &[
               (#eq? @_ty "Command")
               (#eq? @_fn "new")) @call
         "#,
-        implies: &WANTS_SPAWN,
+        implies: Implies::Spawn,
     },
     SourceQuery {
         name: "rust:command-program",
@@ -91,7 +74,7 @@ static RUST_QUERIES: &[SourceQuery] = &[
               (#eq? @_ty "Command")
               (#eq? @_fn "new")) @call
         "#,
-        implies: &WANTS_NOTHING,
+        implies: Implies::Nothing,
     },
     SourceQuery {
         name: "rust:file-create",
@@ -103,11 +86,18 @@ static RUST_QUERIES: &[SourceQuery] = &[
                 "create" "create_new" "create_dir" "create_dir_all"
                 "write" "remove_file" "remove_dir_all" "rename")) @call
         "#,
-        implies: &WANTS_NOTHING,
+        implies: Implies::Nothing,
     },
     SourceQuery {
         name: "rust:path-literal",
         query: r"(string_literal) @path",
-        implies: &WANTS_NOTHING,
+        implies: Implies::Nothing,
     },
 ];
+
+bundled::plugin! {
+    name: "rust-source",
+    summary: "reads Rust sources",
+    commands: &bundled::NO_COMMANDS,
+    sources: &SCANNER,
+}

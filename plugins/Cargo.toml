@@ -1,12 +1,14 @@
 # A workspace of its own, separate from pm's.
 #
-# These crates compile to `wasm32-unknown-unknown`, not to the host, and nothing in pm
-# depends on them: pm loads the *components* they are encoded into, at run time, from a
-# directory. Keeping them out of pm's own build means `cargo build` at the repository
-# root never drags a second target down, and `cargo test` never waits on one.
+# These crates compile to `wasm32-unknown-unknown`, not to the host, so they cannot be
+# members of pm's workspace. Most are example plugins and test fixtures that pm loads
+# at run time from a directory and never builds itself. The exception is `bundled/*`:
+# pm's build.rs runs a nested cargo over this workspace to build those crates and embed
+# them, so a build of pm does compile this second target, into target/bundled-plugins.
 [workspace]
 resolver = "3"
-members = ["encoder", "unitfile", "fixtures/*", "systemd", "sysext", "sysupdate", "zig"]
+members = ["encoder", "unitfile", "fixtures/*", "systemd", "sysext", "sysupdate", "zig", "bundled/*"]
+exclude = ["vendor"]
 # `fixtures/wasi` is built for wasm32-wasip2 rather than wasm32-unknown-unknown; see
 # build.sh. It is a member like the rest so `cargo check` covers it.
 
@@ -18,6 +20,8 @@ publish = false
 [workspace.dependencies]
 wit-bindgen = { version = "0.51.0", default-features = false, features = ["macros", "realloc"] }
 unitfile = { path = "unitfile" }
+bundled = { path = "bundled/common" }
+bundled-source = { path = "bundled/source" }
 
 # Plugins are compiled by wasmtime on every pm invocation that consults them, so size is
 # latency. These four settings keep the reference plugin in the tens of kilobytes rather
@@ -28,3 +32,9 @@ lto = true
 codegen-units = 1
 panic = "abort"
 strip = true
+
+# The grammar crates the `bundled/*-source` plugins use still compile the libc that
+# tree-sitter 0.26 needed on wasm32-unknown-unknown; tree-sitter 0.27 brings its own. See
+# vendor/tree-sitter-language/PATCHED.md.
+[patch.crates-io]
+tree-sitter-language = { path = "vendor/tree-sitter-language" }

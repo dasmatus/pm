@@ -14,3 +14,6 @@ examples/.demo-config
 # tests/fixtures/plugins/.
 /plugins/target
 /plugins/dist
+# pm's build.rs builds the bundled plugins into its own OUT_DIR; nothing under
+# plugins/bundled is generated, and no .wasm built from it is checked in.
+/plugins/bundled/components

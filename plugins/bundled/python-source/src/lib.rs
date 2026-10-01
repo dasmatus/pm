@@ -1,42 +1,16 @@
-//! Python: pip, the interpreter, and the Python grammar.
+//! Reads Python sources (`.py`, `.pyi`) for what the built program will need at run
+//! time. The query engine is `bundled-source`.
 
-use tree_sitter::Language;
+use bundled_source::{Implies, Language, Scanner, SourceQuery, tree_sitter};
 
-use super::{Builtin, FETCHING_TOOLCHAIN, WANTS_NETWORK, WANTS_NOTHING, WANTS_SPAWN};
-use crate::{
-    perms::source::{LanguageRules, SourceQuery},
-    policy::{Capability, Fingerprint},
-};
-
-pub(super) static PLUGIN: Builtin = Builtin {
+static SCANNER: Scanner = Scanner::new(&[Language {
     name: "python",
-    summary: "pip and python; reads `.py` and `.pyi` sources",
-    fingerprints: FINGERPRINTS,
-    languages: &[LanguageRules {
-        name: "python",
-        extensions: &["py", "pyi"],
-        grammar,
-        queries: PYTHON_QUERIES,
-    }],
-};
+    extensions: &["py", "pyi"],
+    grammar,
+    queries: PYTHON_QUERIES,
+}]);
 
-static FINGERPRINTS: &[Fingerprint] = &[
-    Fingerprint {
-        name: "pip",
-        pattern: program!(r"pip[23]?"),
-        capabilities: &FETCHING_TOOLCHAIN,
-    },
-    Fingerprint {
-        name: "python",
-        // `python setup.py build` and friends. Deliberately NOT granted
-        // Network: a setup.py that needs to download says so with `dl_urls`
-        // or reaches for pip, and both of those grant it explicitly.
-        pattern: program!(r"python[23]?(?:\.\d+)?"),
-        capabilities: &[Capability::Toolchain, Capability::Coreutils],
-    },
-];
-
-fn grammar() -> Language {
+fn grammar() -> tree_sitter::Language {
     tree_sitter_python::LANGUAGE.into()
 }
 
@@ -52,7 +26,7 @@ static PYTHON_QUERIES: &[SourceQuery] = &[
                 "socket" "requests" "urllib" "urllib2" "urllib3" "http" "httplib"
                 "httpx" "aiohttp" "ftplib" "smtplib" "telnetlib")) @call
         "#,
-        implies: &WANTS_NETWORK,
+        implies: Implies::Network,
     },
     SourceQuery {
         name: "python:net-import-from",
@@ -63,7 +37,7 @@ static PYTHON_QUERIES: &[SourceQuery] = &[
                 "socket" "requests" "urllib" "urllib2" "urllib3" "http" "httplib"
                 "httpx" "aiohttp" "ftplib" "smtplib" "telnetlib")) @call
         "#,
-        implies: &WANTS_NETWORK,
+        implies: Implies::Network,
     },
     SourceQuery {
         name: "python:net-call",
@@ -72,7 +46,7 @@ static PYTHON_QUERIES: &[SourceQuery] = &[
               function: (attribute object: (identifier) @_obj)
               (#any-of? @_obj "socket" "requests" "urllib" "httpx" "aiohttp")) @call
         "#,
-        implies: &WANTS_NETWORK,
+        implies: Implies::Network,
     },
     SourceQuery {
         name: "python:spawn-import",
@@ -82,7 +56,7 @@ static PYTHON_QUERIES: &[SourceQuery] = &[
                      (aliased_import name: (dotted_name (identifier) @_m))]
               (#any-of? @_m "subprocess" "multiprocessing" "pty")) @call
         "#,
-        implies: &WANTS_SPAWN,
+        implies: Implies::Spawn,
     },
     SourceQuery {
         name: "python:spawn-import-from",
@@ -91,7 +65,7 @@ static PYTHON_QUERIES: &[SourceQuery] = &[
               module_name: (dotted_name (identifier) @_m)
               (#any-of? @_m "subprocess" "multiprocessing" "pty")) @call
         "#,
-        implies: &WANTS_SPAWN,
+        implies: Implies::Spawn,
     },
     SourceQuery {
         name: "python:spawn-call",
@@ -105,7 +79,7 @@ static PYTHON_QUERIES: &[SourceQuery] = &[
                 "run" "call" "check_call" "check_output" "Popen" "system" "popen"
                 "fork" "execv" "execvp" "execl" "execlp" "spawnv" "spawnl" "posix_spawn")) @call
         "#,
-        implies: &WANTS_SPAWN,
+        implies: Implies::Spawn,
     },
     SourceQuery {
         name: "python:open-mode",
@@ -115,7 +89,7 @@ static PYTHON_QUERIES: &[SourceQuery] = &[
               arguments: (argument_list (string) @path . (string) @mode)
               (#any-of? @_fn "open" "fdopen")) @call
         "#,
-        implies: &WANTS_NOTHING,
+        implies: Implies::Nothing,
     },
     SourceQuery {
         name: "python:write-call",
@@ -127,11 +101,18 @@ static PYTHON_QUERIES: &[SourceQuery] = &[
               (#any-of? @_fn
                 "remove" "unlink" "rename" "mkdir" "makedirs" "rmtree" "copy" "chmod")) @call
         "#,
-        implies: &WANTS_NOTHING,
+        implies: Implies::Nothing,
     },
     SourceQuery {
         name: "python:path-literal",
         query: r"(string) @path",
-        implies: &WANTS_NOTHING,
+        implies: Implies::Nothing,
     },
 ];
+
+bundled::plugin! {
+    name: "python-source",
+    summary: "reads Python sources",
+    commands: &bundled::NO_COMMANDS,
+    sources: &SCANNER,
+}

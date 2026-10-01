@@ -332,7 +332,6 @@ impl BuildFile {
     }
 
     /// Paths of the build files or pre-built package archives this package depends on.
-    #[must_use]
     pub fn dependencies(&self) -> impl ExactSizeIterator<Item = &Path> {
         self.dependencies.iter().map(PathBuf::as_path)
     }

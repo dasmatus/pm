@@ -12,11 +12,15 @@ on:
 # Three jobs: rustfmt + clippy, the default test suite, and the confined tests
 # the default suite skips.
 #
+# Every job builds pm, and building pm builds its bundled WebAssembly plugins
+# (build.rs), so every toolchain step adds the wasm32-unknown-unknown target. The
+# C grammars among them need clang, which the runner image has.
+#
 # `lint` and `test` are separate jobs rather than one. They do not share build
 # artifacts — clippy type-checks and emits .rmeta while `cargo test` needs
 # linked test binaries — so folding them together compiles this crate and its
 # dependency graph twice in sequence instead of once each, in parallel. ring,
-# rustls and six tree-sitter grammars make that a real difference.
+# rustls and wasmtime make that a real difference.
 #
 # Only first-party actions are used (checkout, cache). Nothing here needs a
 # marketplace action: rustup ships in the runner image, and the cache is four
@@ -62,6 +66,7 @@ jobs:
           rustup update --no-self-update stable
           rustup default stable
           rustup component add clippy rustfmt
+          rustup target add wasm32-unknown-unknown
           rustc -vV
           echo "ver=$(rustc -V | tr -d ' ()' )" >> "$GITHUB_OUTPUT"
       - uses: actions/cache@v4
@@ -98,6 +103,7 @@ jobs:
           set -euo pipefail
           rustup update --no-self-update stable
           rustup default stable
+          rustup target add wasm32-unknown-unknown
           rustc -vV
           echo "ver=$(rustc -V | tr -d ' ()' )" >> "$GITHUB_OUTPUT"
       - uses: actions/cache@v4
@@ -158,6 +164,7 @@ jobs:
           set -euo pipefail
           rustup update --no-self-update stable
           rustup default stable
+          rustup target add wasm32-unknown-unknown
           rustc -vV
           echo "ver=$(rustc -V | tr -d ' ()' )" >> "$GITHUB_OUTPUT"
       - uses: actions/cache@v4
@@ -202,3 +209,4 @@ jobs:
         run: cargo test --all-features --test sandbox -- --ignored
       - name: "run jail: landlock"
         run: cargo test --all-features --test landlock -- --ignored
+

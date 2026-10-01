@@ -36,6 +36,8 @@ jobs:
           profile: minimal
           toolchain: stable
           components: clippy
+          # build.rs compiles pm's bundled plugins to WebAssembly.
+          target: wasm32-unknown-unknown
           override: true
 
       - name: Install required cargo
