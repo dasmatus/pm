@@ -14,9 +14,10 @@ pm's own answers are plugins too. `bundled/` holds one component per ecosystem
 build-command fingerprints, and one tree-sitter scanner per language (`c-source`,
 `cpp-source`, `rust-source`, `python-source`, `go-source`, `bash-source`) carrying
 the grammar and its queries. They are written against the same `wit/plugin.wit`
-(the `bundled` world adds one export listing the fingerprint names), encoded into
-`bundled/components/` by `./build.sh` and embedded into pm, which runs them in the
-same runtime as yours. They are consulted first, in that order, and recorded
+(the `bundled` world adds one export listing the fingerprint names). pm's own
+`build.rs` compiles and encodes them on every build of pm and embeds them in the
+binary, so building pm needs the `wasm32-unknown-unknown` target and clang (for the
+C grammars); pm runs them in the same runtime as yours. They are consulted first, in that order, and recorded
 under their own names exactly as the old compiled-in tables were; the plugins
 described here only ever hear about what none of them recognised.
 

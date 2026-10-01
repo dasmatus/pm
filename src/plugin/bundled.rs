@@ -1,7 +1,8 @@
 //! pm's own plugins: WebAssembly components embedded in the pm binary.
 //!
 //! What pm knows about build tools and source languages lives in fourteen components
-//! built from `plugins/bundled/`, one per ecosystem: eight that classify build-step
+//! that pm's `build.rs` compiles from `plugins/bundled/` on every build, one per
+//! ecosystem: eight that classify build-step
 //! commands (`buildsys`, `rust`, `go`, `node`, `python`, `c`, `posix`, `git`) and six
 //! that read sources (`c-source`, `cpp-source`, `rust-source`, `python-source`,
 //! `go-source`, `bash-source`). They export the `bundled` world of `wit/plugin.wit` and
@@ -52,12 +53,12 @@ use crate::{
 /// One embedded component.
 type Embedded = (&'static str, &'static [u8]);
 
-/// Embed `plugins/bundled/components/<name>.wasm` under its name.
+/// Embed the component `build.rs` built from `plugins/bundled/<name>` under its name.
 macro_rules! embed {
     ($name:literal) => {
         (
             $name,
-            include_bytes!(concat!("../../plugins/bundled/components/", $name, ".wasm")),
+            include_bytes!(concat!(env!("OUT_DIR"), "/bundled/", $name, ".wasm")),
         )
     };
 }

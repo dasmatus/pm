@@ -1,7 +1,0 @@
-# Pinned so the bundled components in bundled/components/ rebuild byte for byte: CI
-# rebuilds them with this toolchain and compares. Bumping it means running
-# ./build.sh --bundled and committing the components it produces.
-[toolchain]
-channel = "1.99.0"
-components = ["clippy", "rustfmt"]
-targets = ["wasm32-unknown-unknown", "wasm32-wasip2"]

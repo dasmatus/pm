@@ -84,8 +84,9 @@ impl BuildPolicy {
     ///
     /// Returns a diagnostic naming the command if it matches no fingerprint and
     /// `permissive` is false. Also fails if `build` cannot be serialised for
-    /// inspection, or if a bundled plugin fails to load or misbehaves - the latter is
-    /// a bug in pm, not in the build file.
+    /// inspection, or if the bundled plugins fail to load - the latter is a bug in pm,
+    /// not in the build file. A bundled classifier that traps on one command is logged
+    /// and skipped, like an installed plugin, rather than failing the derivation.
     pub fn derive(build: &crate::bf::BuildFile, permissive: bool) -> miette::Result<Self> {
         Self::derive_with(build, permissive, Registry::none())
     }
