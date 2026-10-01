@@ -23,7 +23,8 @@ cd "$here"
 target=wasm32-unknown-unknown
 out="$here/dist"
 # Where tests/plugins.rs reads its components from. Rebuilt here rather than at test
-# time so `cargo test` needs no wasm toolchain at all.
+# time, so the fixtures need nothing at test time. (Building pm itself does need the
+# wasm32-unknown-unknown target, for the bundled plugins; see build.rs.)
 fixtures="$here/../tests/fixtures/plugins"
 
 crates=${*:-"systemd sysext sysupdate zig greedy runaway nameless scanner"}

@@ -73,6 +73,13 @@ fn main() {
         println!("cargo::rerun-if-changed={path}");
     }
 
+    assert!(
+        plugins.join("Cargo.toml").is_file(),
+        "{} is missing: pm builds its bundled plugins from it, so pm builds only from a \
+         checkout of its repository",
+        plugins.display()
+    );
+
     let target_dir = shared_target_dir(&out);
     compile(&plugins, &target_dir);
 
