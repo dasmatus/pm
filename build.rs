@@ -84,6 +84,7 @@ fn main() {
         "plugins/systemd",
         "plugins/sysext",
         "plugins/sysupdate",
+        "plugins/unitfile",
         "plugins/zig",
         "plugins/vendor",
         "wit",

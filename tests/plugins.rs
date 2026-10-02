@@ -118,18 +118,37 @@ fn a_plugin_classifies_a_command_the_built_in_table_refuses() {
 
 #[test]
 fn parallel_plugin_hooks_match_their_serial_results() {
-    let (_root, registry) = unsigned(&["zig", "scanner"]);
+    let (_root, registry) = unsigned(&["zig", "greedy", "scanner"]);
     let parallelism = Parallelism::new(NonZeroUsize::new(2).expect("non-zero worker count"))
         .expect("create parallel plugin workers");
 
+    let command = "zig build -Doptimize=ReleaseSafe";
     assert_eq!(
-        registry.classify_parallel("zig build -Doptimize=ReleaseSafe", &parallelism),
-        registry.classify("zig build -Doptimize=ReleaseSafe")
+        registry.classify_parallel(command, &parallelism),
+        registry.classify(command)
     );
     assert_eq!(
-        registry
-            .scan_source_parallel("fixture.toy", "read /etc/toy.conf\nnetwork\n", &parallelism,),
-        registry.scan_source("fixture.toy", "read /etc/toy.conf\nnetwork\n")
+        registry.classify_parallel(command, &parallelism),
+        Some(("greedy:greedy".into(), vec![Capability::Toolchain])),
+        "the first matching plugin in file-name order wins"
+    );
+
+    let source = "read /etc/toy.conf\nstd.net\n";
+    let serial = registry.scan_source("fixture.zig", source);
+    assert_eq!(
+        registry.scan_source_parallel("fixture.zig", source, &parallelism),
+        serial
+    );
+    assert_eq!(
+        serial
+            .iter()
+            .map(|grant| grant.evidence()[0].as_str())
+            .collect::<Vec<_>>(),
+        [
+            "fixture.zig: toy: 1: directive",
+            "fixture.zig: zig: 2: std.net",
+        ],
+        "grants from overlapping scanners retain registry order"
     );
 }
 

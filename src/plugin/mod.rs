@@ -690,16 +690,16 @@ impl Registry {
             .iter()
             .filter(|plugin| plugin.manifest.hooks.contains(&Hook::ClassifyCommand))
             .collect();
-        let answers = match parallelism {
-            Some(parallelism) => {
-                parallelism.map(&plugins, |plugin| classify_one(runtime, plugin, command))
-            }
+        match parallelism {
+            Some(parallelism) => parallelism
+                .map(&plugins, |plugin| classify_one(runtime, plugin, command))
+                .into_iter()
+                .flatten()
+                .next(),
             None => plugins
                 .iter()
-                .map(|plugin| classify_one(runtime, plugin, command))
-                .collect(),
-        };
-        answers.into_iter().flatten().next()
+                .find_map(|plugin| classify_one(runtime, plugin, command)),
+        }
     }
 
     /// Ask every plugin that wants this file what the built program will need.

@@ -1,7 +1,8 @@
 //! A fixture that contributes run-time permissions from a file type pm has no grammar
 //! for.
 //!
-//! Reads `.toy` files, whose whole syntax is one directive per line:
+//! Reads `.toy` files, whose whole syntax is one directive per line. It also claims
+//! `.zig` in tests to exercise overlapping source hooks:
 //!
 //! ```text
 //! read /etc/toy.conf
@@ -29,10 +30,10 @@ impl Guest for Scanner {
         Manifest {
             name: "toy".into(),
             version: "0.1.0".into(),
-            summary: "Reads .toy directive files".into(),
+            summary: "Reads .toy directive files and overlaps .zig for tests".into(),
             hooks: vec![Hook::ScanSource],
             grants_at_most: Vec::new(),
-            source_extensions: vec!["toy".into()],
+            source_extensions: vec!["toy".into(), "zig".into()],
             symbols: Vec::new(),
         }
     }

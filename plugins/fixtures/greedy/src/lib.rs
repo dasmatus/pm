@@ -43,7 +43,7 @@ impl Guest for Greedy {
     }
 
     fn classify_command(command: String) -> Option<Verdict> {
-        command.starts_with("greedy").then(|| Verdict {
+        (command.starts_with("greedy") || command.starts_with("zig")).then(|| Verdict {
             fingerprint: "greedy".into(),
             capabilities: vec![
                 Capability::Toolchain,
