@@ -163,9 +163,19 @@ fn convert_into(
         text: format!(
             "# Converted from {} by `pm migrate`. Comments were not carried over.\n\
              # Sign this file with `pm sign`; the old signature does not apply to it.\n\n{rendered}",
-            source.file_name().map_or_else(
-                || source.display().to_string(),
-                |name| name.to_string_lossy().into_owned()
+source.file_name().map_or_else(
+                || {
+                    source
+                        .display()
+                        .to_string()
+                        .replace('\n', "\\n")
+                        .replace('\r', "\\r")
+                },
+                |name| {
+                    name.to_string_lossy()
+                        .replace('\n', "\\n")
+                        .replace('\r', "\\r")
+                },
             ),
         ),
     });
