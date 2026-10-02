@@ -353,7 +353,14 @@ impl Progress {
         }
 
         let mut screen = self.lock();
-        let id = screen.push(parent, depth, label);
+        let Some(id) = screen.push(parent, depth, label) else {
+            return Task {
+                progress: self.clone(),
+                id: None,
+                depth,
+                owns_line: true,
+            };
+        };
         screen.draw();
         drop(screen);
 
@@ -443,9 +450,12 @@ impl Screen {
     /// A child is inserted directly after its parent's last descendant rather
     /// than at the end, so a second package opening a line does not push the
     /// first package's commands underneath it.
-    fn push(&mut self, parent: Option<u32>, depth: u16, label: String) -> u32 {
+    fn push(&mut self, parent: Option<u32>, depth: u16, label: String) -> Option<u32> {
         let id = self.next_id;
-        self.next_id = self.next_id.saturating_add(1);
+        if id == u32::MAX {
+            return None;
+        }
+        self.next_id += 1;
 
         let node = Node {
             id,
@@ -461,7 +471,7 @@ impl Screen {
             Some(index) => self.nodes.insert(index, node),
             None => self.nodes.push(node),
         }
-        id
+        Some(id)
     }
 
     /// One past the last node nested under `parent`.
@@ -632,13 +642,36 @@ impl Screen {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn exhausted_task_ids_do_not_reuse_the_last_id() {
+        let progress = Progress::silent();
+        progress.lock().next_id = u32::MAX - 1;
+
+        let parent = progress.task("parent");
+        assert!(parent.is_live());
+
+        let child = parent.child("child");
+        assert!(!child.is_live());
+        child.set_message("ignored");
+
+        assert_eq!(progress.snapshot().len(), 1);
+        parent.set_message("still usable");
+        assert!(progress.snapshot()[0].contains("still usable"));
+    }
+}
+
 /// A single line of the region, owned by whoever is doing the work.
 ///
 /// Dropping it removes the line, along with any lines opened under it.
 #[must_use = "a Task removes its line as soon as it is dropped"]
 pub struct Task {
     progress: Progress,
-    /// `None` when the region is disabled, which makes every method a no-op.
+    /// `None` when the region is disabled or has exhausted its task IDs, making
+    /// every method a no-op.
     id: Option<u32>,
     depth: u16,
     /// Whether dropping this removes the line. False for a [`Task::handle`],

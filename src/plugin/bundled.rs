@@ -193,7 +193,11 @@ pub fn sources() -> Result<&'static [Loaded]> {
 /// # Errors
 ///
 /// As [`commands`].
-pub fn fingerprint_names() -> Result<impl Iterator<Item = &'static str>> {
+pub fn fingerprint_names() -> Result<Vec<&'static str>> {
+    Ok(fingerprint_names_iter()?.collect())
+}
+
+pub(crate) fn fingerprint_names_iter() -> Result<impl Iterator<Item = &'static str>> {
     Ok(commands()?
         .iter()
         .flat_map(|plugin| plugin.fingerprints.iter().copied()))
@@ -337,9 +341,7 @@ mod tests {
     #[test]
     fn fingerprint_precedence_is_unchanged() {
         assert_eq!(
-            fingerprint_names()
-                .expect("bundled classifiers load")
-                .collect::<Vec<_>>(),
+            fingerprint_names().expect("bundled classifiers load"),
             [
                 "make",
                 "configure",
