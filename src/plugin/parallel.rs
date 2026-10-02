@@ -7,6 +7,7 @@
 
 use std::{
     num::NonZeroUsize,
+    panic::{AssertUnwindSafe, catch_unwind},
     sync::{
         Arc,
         mpsc::{self, Receiver, Sender},
@@ -63,7 +64,13 @@ impl Parallelism {
     {
         let (sender, receiver) = mpsc::sync_channel(1);
         self.pool.spawn(move || {
-            let _ = sender.send(task());
+            // Rayon aborts the process on a panic that escapes a `spawn`ed task. Catch
+            // it here so a panicking task only drops its sender: `recv` still reports
+            // disconnection, as the docs promise, and one bad plugin cannot take the
+            // whole build down.
+            if let Ok(value) = catch_unwind(AssertUnwindSafe(task)) {
+                let _ = sender.send(value);
+            }
         });
         receiver
     }
@@ -104,6 +111,18 @@ mod tests {
             .expect("task sends its result");
 
         assert_eq!(result, 42);
+    }
+
+    #[test]
+    fn a_panicking_task_disconnects_instead_of_aborting() {
+        let parallelism = Parallelism::new(NonZeroUsize::new(1).expect("non-zero worker count"))
+            .expect("create worker pool");
+        let receiver = parallelism.spawn(|| -> i32 { panic!("task panicked") });
+
+        assert!(
+            receiver.recv().is_err(),
+            "a panicking task drops its sender, so recv reports disconnection"
+        );
     }
 
     #[test]
