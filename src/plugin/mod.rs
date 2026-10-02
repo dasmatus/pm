@@ -106,6 +106,7 @@ use crate::{
     perms::Grant,
     policy::Capability,
     signing::{TrustStore, config_dir, verify_file},
+    text::comma_join,
 };
 
 /// The extension a plugin file must have to be loaded.
@@ -425,24 +426,23 @@ impl Loader {
         if !self.dir.exists() {
             return Ok(Vec::new());
         }
-        let mut files: Vec<PathBuf> = read_dir(&self.dir)
+        let mut files: Vec<PathBuf> = Vec::new();
+        for entry in read_dir(&self.dir)
             .into_diagnostic()
             .wrap_err_with(|| format!("cannot read the plugin directory {}", self.dir.display()))?
-            .map(|entry| {
-                entry
-                    .into_diagnostic()
-                    .wrap_err_with(|| format!("cannot read an entry of {}", self.dir.display()))
-            })
-            .collect::<Result<Vec<_>>>()?
-            .into_iter()
-            .map(|entry| entry.path())
-            .filter(|path| {
-                path.is_file()
-                    && path
-                        .extension()
-                        .is_some_and(|extension| extension == PLUGIN_EXTENSION)
-            })
-            .collect();
+        {
+            let path = entry
+                .into_diagnostic()
+                .wrap_err_with(|| format!("cannot read an entry of {}", self.dir.display()))?
+                .path();
+            if path.is_file()
+                && path
+                    .extension()
+                    .is_some_and(|extension| extension == PLUGIN_EXTENSION)
+            {
+                files.push(path);
+            }
+        }
         files.sort();
         Ok(files)
     }
@@ -634,8 +634,8 @@ impl Registry {
 
     /// The diagnostic for a well-formed reference nothing offers.
     fn unknown_symbol(&self, reference: &str) -> miette::Report {
-        let offered: Vec<String> = self.symbols().map(|(qualified, _)| qualified).collect();
-        if offered.is_empty() {
+        let mut offered = self.symbols().map(|(qualified, _)| qualified).peekable();
+        if offered.peek().is_none() {
             return miette!(
                 help = "Install the plugin that offers it, or run with --no-plugins to \
                         see what the build file does without one.",
@@ -646,7 +646,7 @@ impl Registry {
         miette!(
             "the build file uses `{OPEN}{reference}}}`, which no loaded plugin \
              offers\navailable symbols: {}",
-            offered.join(", ")
+            comma_join(offered)
         )
     }
 

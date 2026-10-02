@@ -31,6 +31,8 @@ pub mod sandbox;
 pub mod signing;
 /// Individual build steps and their stages.
 pub mod step;
+/// Small text-formatting helpers shared by the library and the binaries.
+pub mod text;
 /// Types and framing that cross the boundary between the daemon and its
 /// clients or its own worker.
 pub mod wire;

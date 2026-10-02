@@ -94,7 +94,7 @@ struct Inner {
 struct Screen {
     canvas: Canvas,
     nodes: Vec<Node>,
-    next_id: u64,
+    next_id: u32,
     frame: usize,
     /// How many lines the last draw left on screen, and therefore how many the
     /// next one has to erase.
@@ -126,9 +126,9 @@ enum Canvas {
 
 /// One line of the region.
 struct Node {
-    id: u64,
-    parent: Option<u64>,
-    depth: usize,
+    id: u32,
+    parent: Option<u32>,
+    depth: u16,
     label: String,
     detail: Detail,
     /// When this line was opened, kept only for [`Screen::render_node`]'s
@@ -173,7 +173,7 @@ impl Node {
         ProgressNode {
             id: wire_id(self.id),
             parent: self.parent.map_or(0, wire_id),
-            depth: u32::try_from(self.depth).unwrap_or(u32::MAX),
+            depth: u32::from(self.depth),
             label: sanitise(&self.label, MESSAGE_CAP),
             kind,
             text,
@@ -187,8 +187,8 @@ impl Node {
 /// Map an internal, 0-based node id to the 1-based id [`ProgressNode`] uses,
 /// so `parent == 0` is free to mean "no parent" without colliding with a
 /// real node's id.
-fn wire_id(id: u64) -> u32 {
-    u32::try_from(id.saturating_add(1)).unwrap_or(u32::MAX)
+fn wire_id(id: u32) -> u32 {
+    id.saturating_add(1)
 }
 
 impl Progress {
@@ -342,7 +342,7 @@ impl Progress {
     }
 
     /// Register a node and return the handle that owns it.
-    fn open(&self, parent: Option<u64>, depth: usize, label: String) -> Task {
+    fn open(&self, parent: Option<u32>, depth: u16, label: String) -> Task {
         if !self.inner.live {
             return Task {
                 progress: self.clone(),
@@ -366,14 +366,14 @@ impl Progress {
     }
 
     /// Remove a node and everything nested under it.
-    fn close(&self, id: u64) {
+    fn close(&self, id: u32) {
         let mut screen = self.lock();
         screen.remove(id);
         screen.draw();
     }
 
     /// Replace what a node says after its label.
-    fn describe(&self, id: u64, detail: Detail) {
+    fn describe(&self, id: u32, detail: Detail) {
         let mut screen = self.lock();
         if let Some(node) = screen.nodes.iter_mut().find(|node| node.id == id) {
             node.detail = detail;
@@ -443,9 +443,9 @@ impl Screen {
     /// A child is inserted directly after its parent's last descendant rather
     /// than at the end, so a second package opening a line does not push the
     /// first package's commands underneath it.
-    fn push(&mut self, parent: Option<u64>, depth: usize, label: String) -> u64 {
+    fn push(&mut self, parent: Option<u32>, depth: u16, label: String) -> u32 {
         let id = self.next_id;
-        self.next_id += 1;
+        self.next_id = self.next_id.saturating_add(1);
 
         let node = Node {
             id,
@@ -465,7 +465,7 @@ impl Screen {
     }
 
     /// One past the last node nested under `parent`.
-    fn end_of_subtree(&self, parent: u64) -> Option<usize> {
+    fn end_of_subtree(&self, parent: u32) -> Option<usize> {
         let start = self.nodes.iter().position(|node| node.id == parent)?;
         let depth = self.nodes[start].depth;
         let tail = self.nodes[start + 1..]
@@ -479,7 +479,7 @@ impl Screen {
     /// The descendants matter: a package whose build fails is dropped while its
     /// command lines are still registered, and leaving those behind would
     /// render commands that belong to nothing.
-    fn remove(&mut self, id: u64) {
+    fn remove(&mut self, id: u32) {
         let mut doomed = vec![id];
         let mut index = 0;
         while index < doomed.len() {
@@ -489,7 +489,7 @@ impl Screen {
                 .iter()
                 .filter(|node| node.parent == Some(parent))
                 .map(|node| node.id);
-            doomed.extend(children.collect::<Vec<_>>());
+            doomed.extend(children);
             index += 1;
         }
         self.nodes.retain(|node| !doomed.contains(&node.id));
@@ -522,7 +522,11 @@ impl Screen {
     /// One line: spinner, label and detail on the left, elapsed on the right.
     fn render_node(&self, node: &Node, width: usize, now: Instant) -> String {
         let frame = FRAMES[self.frame % FRAMES.len()];
-        let mut left = format!("{}{frame} {}", " ".repeat(node.depth * INDENT), node.label);
+        let mut left = format!(
+            "{}{frame} {}",
+            " ".repeat(usize::from(node.depth) * INDENT),
+            node.label
+        );
         match &node.detail {
             Detail::Silent => {}
             Detail::Message(message) => left.push_str(&format!("  {message}")),
@@ -635,8 +639,8 @@ impl Screen {
 pub struct Task {
     progress: Progress,
     /// `None` when the region is disabled, which makes every method a no-op.
-    id: Option<u64>,
-    depth: usize,
+    id: Option<u32>,
+    depth: u16,
     /// Whether dropping this removes the line. False for a [`Task::handle`],
     /// which refers to a line somebody else owns.
     owns_line: bool,
@@ -682,9 +686,10 @@ impl Task {
     /// Open a line nested under this one.
     pub fn child(&self, label: impl Into<String>) -> Self {
         match self.id {
-            Some(parent) => self
-                .progress
-                .open(Some(parent), self.depth + 1, label.into()),
+            Some(parent) => {
+                self.progress
+                    .open(Some(parent), self.depth.saturating_add(1), label.into())
+            }
             None => Self::detached(),
         }
     }

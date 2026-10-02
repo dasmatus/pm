@@ -50,6 +50,7 @@ use crate::{
         monitor::{TraceOptions, TraceReport, trace},
     },
     signing::{TrustStore, default_trust_dir, verify_file},
+    text::comma_join,
     workspace::{SandboxedChild, Workspace},
 };
 use dialoguer::{Select, console::Term};
@@ -1334,7 +1335,7 @@ impl PackageRunner {
         if !stdin().is_terminal() {
             return Err(miette!(
                 "Cannot prompt for a binary because stdin is not a terminal; pass --bin <NAME> to pick one of: {}",
-                binaries.join(", ")
+                comma_join(binaries)
             ));
         }
 
@@ -1365,7 +1366,7 @@ impl PackageRunner {
             .ok_or_else(|| {
                 miette!(
                     "No binary selected; pass --bin <NAME> to run one of: {}",
-                    binaries.join(", ")
+                    comma_join(binaries)
                 )
             })?;
 
@@ -1380,11 +1381,7 @@ impl PackageRunner {
     /// The *declared* paths are listed, because those are the names `--bin`
     /// matches against.
     fn describe(binaries: &[Entrypoint<'_>]) -> String {
-        binaries
-            .iter()
-            .map(|entry| entry.declared.display().to_string())
-            .collect::<Vec<_>>()
-            .join(", ")
+        comma_join(binaries.iter().map(|entry| entry.declared.display()))
     }
 }
 
@@ -1660,9 +1657,9 @@ fn covered(permission: &Permission, profile: &Permissions, always: &[(PathBuf, F
 /// allowed instead. That is wider than wanted, and it is still the right trade:
 /// the alternative is an enforced package that cannot start, with a failure that
 /// looks nothing like "the profile was too tight".
-fn library_directories(host_bin: &Path, needed: &[String]) -> Vec<PathBuf> {
+fn library_directories(host_bin: &Path, needed: &[String]) -> impl Iterator<Item = PathBuf> {
     if needed.is_empty() {
-        return Vec::new();
+        return Vec::new().into_iter();
     }
 
     let origin = host_bin.parent().unwrap_or(Path::new("."));
@@ -1679,7 +1676,7 @@ fn library_directories(host_bin: &Path, needed: &[String]) -> Vec<PathBuf> {
     search.extend(DEFAULT_LIBRARY_DIRS.iter().map(PathBuf::from));
 
     let mut found: Vec<PathBuf> = Vec::new();
-    let mut unresolved = 0usize;
+    let mut unresolved = 0u32;
     for soname in needed {
         match search
             .iter()
@@ -1712,7 +1709,7 @@ fn library_directories(host_bin: &Path, needed: &[String]) -> Vec<PathBuf> {
             }
         }
     }
-    found
+    found.into_iter()
 }
 
 /// Turns a trace report into the exit status `run` returns.

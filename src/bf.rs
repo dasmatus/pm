@@ -39,6 +39,7 @@ use crate::{
     sandbox::BuildSandbox,
     signing::{TrustStore, verify_file},
     step::{Stage, Step},
+    text::comma_join,
     workspace::Workspace,
 };
 
@@ -851,7 +852,7 @@ fn summarise(permissions: &Permissions) -> String {
     .filter(|&(_, wanted)| wanted)
     .map(|(label, _)| label.to_owned());
 
-    counted.chain(flagged).collect::<Vec<_>>().join(", ")
+    comma_join(counted.chain(flagged))
 }
 
 /// Classify every regular file under `staging`, keyed by its path RELATIVE to
