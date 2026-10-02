@@ -1,0 +1,14 @@
+id = "pm"
+name = "PM"
+description = "PM Package support."
+version = "0.1.0"
+schema_version = 1
+authors = ["dasmatus"]
+
+[grammars.starlark]
+repository = "https://github.com/tree-sitter-grammars/tree-sitter-starlark"
+commit = "a453dbf3ba433db0e5ec621a38a7e59d72e4dc69"
+
+[language_servers.pm-lsp]
+name = "pm-lsp"
+languages = ["PM Package"]

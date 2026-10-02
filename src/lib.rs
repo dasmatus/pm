@@ -14,6 +14,8 @@ pub mod download;
 pub mod graph;
 /// Package metadata written into each archive.
 pub mod metadata;
+/// Converting YAML build files to Starlark.
+pub mod migrate;
 /// Inferring the permissions a package actually needs, from its source, its
 /// built objects and a traced execution.
 pub mod perms;
@@ -29,6 +31,8 @@ pub mod run;
 pub mod sandbox;
 /// Ed25519 signing and verification of build files and packages.
 pub mod signing;
+/// Build files written in Starlark.
+pub mod star;
 /// Individual build steps and their stages.
 pub mod step;
 /// Small text-formatting helpers shared by the library and the binaries.

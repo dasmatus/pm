@@ -3,6 +3,7 @@ use miette::{IntoDiagnostic, WrapErr, miette};
 use pm::{
     bf::{BuildFile, BuildOptions},
     metadata::Metadata,
+    migrate,
     perms::Enforcement,
     plugin::{Loader, Registry, Trust, default_plugin_dir},
     policy::{BuildPolicy, Capability, UNMATCHED},
@@ -13,6 +14,7 @@ use pm::{
         Signature, SigningKey, TrustStore, default_key_path, default_trust_dir, sign_file,
         verify_file,
     },
+    star,
     step::Step,
     text::comma_join,
     workspace::Workspace,
@@ -202,7 +204,34 @@ enum Commands {
         #[arg(long)]
         relative: bool,
     },
+    /// Convert a YAML build file to a Starlark `.package` file.
+    ///
+    /// Build files are Starlark now; YAML is deprecated. The new file describes the
+    /// same package. It is not signed - run `pm sign` on it - and YAML comments are
+    /// not carried over. The YAML file is left in place.
+    Migrate {
+        /// The YAML build file to convert.
+        file: PathBuf,
+        /// Where to write the result. Defaults to the input with a `.package` extension.
+        #[arg(short, long, value_name = "PATH", conflicts_with_all = ["stdout", "recursive"])]
+        output: Option<PathBuf>,
+        /// Print the result instead of writing it.
+        #[arg(long)]
+        stdout: bool,
+        /// Also convert every YAML build file it depends on, and rename those dependencies.
+        ///
+        /// Relative dependency paths are resolved against the current directory,
+        /// as `pm build` does.
+        #[arg(short, long, conflicts_with = "stdout")]
+        recursive: bool,
+        /// Overwrite files that already exist.
+        #[arg(short, long)]
+        force: bool,
+    },
     /// Write an example build file to the given path.
+    ///
+    /// A path ending in `.package` gets a Starlark file; anything else gets the
+    /// deprecated YAML form.
     Generate {
         /// Path the example build file is written to.
         file: PathBuf,
@@ -424,6 +453,13 @@ fn main() -> miette::Result<()> {
         }
         Commands::Plugins { digests } => list_plugins(&plugin_args.load()?, digests)?,
         Commands::Generate { file, force } => generate(&file, force)?,
+        Commands::Migrate {
+            file,
+            output,
+            stdout,
+            recursive,
+            force,
+        } => migrate_command(&file, output.as_deref(), stdout, recursive, force)?,
         Commands::Run {
             package,
             bin,
@@ -1407,13 +1443,60 @@ fn sibling(path: &Path, suffix: &str) -> PathBuf {
     PathBuf::from(name)
 }
 
+/// `pm migrate`: convert YAML build files to Starlark and report what to do next.
+///
+/// # Errors
+///
+/// Fails if a file cannot be read or converted, or if a target exists and
+/// `force` is false.
+fn migrate_command(
+    file: &Path,
+    output: Option<&Path>,
+    stdout: bool,
+    recursive: bool,
+    force: bool,
+) -> miette::Result<()> {
+    let converted = migrate::convert_file(file, recursive)?;
+    if stdout {
+        for item in &converted {
+            print!("{}", item.text);
+        }
+        return Ok(());
+    }
+    // Check every target before writing any, so a refusal halfway through does
+    // not leave a half-migrated tree.
+    if !force {
+        for item in &converted {
+            let target = output.unwrap_or(&item.target);
+            if target.exists() {
+                return Err(miette!(
+                    help = "Pass --force to overwrite it.",
+                    "{} already exists.",
+                    target.display()
+                ));
+            }
+        }
+    }
+    for item in &converted {
+        let target = output.unwrap_or(&item.target);
+        migrate::write_converted(item, output, force)?;
+        println!("{} -> {}", item.source.display(), target.display());
+    }
+    eprintln!("Sign the new file(s) with `pm sign`; signatures do not carry over.");
+    Ok(())
+}
+
 /// Writes the example build file to `file`.
 ///
 /// # Errors
 ///
 /// Fails if `file` exists and `force` is false, or if it cannot be written.
 fn generate(file: &Path, force: bool) -> miette::Result<()> {
-    let example = to_string(&BuildFile::generate()).into_diagnostic()?;
+    let example = if star::is_starlark(file) {
+        star::render(&BuildFile::generate())?
+    } else {
+        to_string(&BuildFile::generate()).into_diagnostic()?
+    };
 
     if force {
         // This pre-check is racy, deliberately: `--force` already opted into

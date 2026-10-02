@@ -38,6 +38,7 @@ use crate::{
     progress::{Progress, Task},
     sandbox::BuildSandbox,
     signing::{TrustStore, verify_file},
+    star,
     step::{Stage, Step},
     text::comma_join,
     workspace::Workspace,
@@ -172,7 +173,8 @@ impl BuildFile {
         }
     }
 
-    /// Parse a signed build file from YAML on disk.
+    /// Parse a signed build file from disk: Starlark if it ends in `.package`,
+    /// otherwise (deprecated) YAML.
     ///
     /// The detached signature at `<path>.sig` is verified against the local
     /// trust store **before** the file is parsed, and every dependency loaded
@@ -419,15 +421,45 @@ impl BuildFile {
         &self.steps
     }
 
-    /// Parse the YAML at `path`, recording where it came from and how far it
-    /// was trusted.
+    /// Parse YAML build-file text without touching the disk or any signature.
+    ///
+    /// For tooling that converts or inspects a build file; nothing it returns is
+    /// trusted, and `pm build` never goes through here.
+    ///
+    /// # Errors
+    ///
+    /// Fails if `text` is not a valid YAML build file.
+    pub fn from_yaml(text: &str) -> miette::Result<Self> {
+        from_str(text)
+            .into_diagnostic()
+            .wrap_err("not a valid YAML build file")
+    }
+
+    /// Replace every dependency path with `f` of it.
+    pub(crate) fn map_dependencies(&mut self, f: impl Fn(&Path) -> PathBuf) {
+        for dependency in &mut self.dependencies {
+            *dependency = f(dependency);
+        }
+    }
+
+    /// Parse the build file at `path` - Starlark if it ends in `.package`, YAML
+    /// otherwise - recording where it came from and how far it was trusted.
     fn parse(path: &Path, verification: Verification) -> miette::Result<Self> {
         let text = read_to_string(path)
             .into_diagnostic()
             .wrap_err_with(|| format!("cannot read build file {}", path.display()))?;
-        let mut build_file: Self = from_str(&text)
-            .into_diagnostic()
-            .wrap_err_with(|| format!("cannot parse build file {}", path.display()))?;
+        let mut build_file: Self = if star::is_starlark(path) {
+            star::parse(&path.display().to_string(), text)
+                .wrap_err_with(|| format!("cannot evaluate build file {}", path.display()))?
+        } else {
+            warn!(
+                file = %path.display(),
+                "YAML build files are deprecated; convert it with `pm migrate`"
+            );
+            from_str(&text)
+                .into_diagnostic()
+                .wrap_err_with(|| format!("cannot parse build file {}", path.display()))?
+        };
         // Fall back to the path as given when it cannot be canonicalised; cycle
         // detection degrades but the build still runs.
         build_file.source = Some(path.canonicalize().unwrap_or_else(|_| path.to_path_buf()));

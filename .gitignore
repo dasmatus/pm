@@ -4,7 +4,7 @@
 
 # Demo artifacts. `examples/demo.sh` regenerates all of these.
 /out
-/pm.yaml
+/pm.package
 *.cpkg
 *.sig
 examples/.demo-config
