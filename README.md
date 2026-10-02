@@ -1,7 +1,33 @@
 # pm
 
 Build signed recipes into `.cpkg` archives and run their entrypoints in a Linux
-sandbox. See [the examples](examples/README.md) for recipe syntax and signing.
+sandbox. See [the examples](examples/README.md) for `.package` recipe syntax and signing.
+
+## Build files are Starlark
+
+Recipes are [Starlark](https://github.com/bazelbuild/starlark) programs in
+`*.package` files that call `package(...)` once, with `step(...)` for each
+build step. Loops, functions and comprehensions generate steps and commands;
+evaluation is hermetic (no I/O, no `load()`) and happens before the policy is
+derived and before anything runs.
+
+```python
+package(
+    name = "hello",
+    version = "1.0.0",
+    steps = [
+        step(Install, "stage", ["install -Dm755 /usr/bin/echo /dest/usr/bin/hello"]),
+    ],
+)
+```
+
+* `pm generate build.package` writes a starter file.
+* `pm migrate build.yaml` converts a YAML recipe (`-r` follows its YAML
+  dependencies). YAML recipes still load but are deprecated; migrated files are
+  unsigned, so run `pm sign` on them.
+* `pm-lsp` is a language server (diagnostics, completion, hover) for `.package`
+  files, and [`editors/`](editors/README.md) has tree-sitter queries and
+  Zed and Neovim integrations that use it.
 
 ## Integration with distribution build tools
 

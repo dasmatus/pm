@@ -1,0 +1,20 @@
+{
+  "grammars": [
+    {
+      "name": "pm",
+      "scope": "source.pm",
+      "file-types": [
+        "package"
+      ],
+      "highlights": "queries/highlights.scm",
+      "locals": "queries/locals.scm",
+      "injections": "queries/injections.scm",
+      "injection-regex": "^pm$"
+    }
+  ],
+  "metadata": {
+    "version": "0.1.0",
+    "license": "MIT",
+    "description": "Tree-sitter query overlays for pm .package build files"
+  }
+}

@@ -16,6 +16,10 @@ name = "entrypoints"
 harness = false
 
 [[bin]]
+name = "pm-lsp"
+path = "src/bin/pm-lsp.rs"
+
+[[bin]]
 name = "pm-trace"
 path = "src/bin/pm-trace.rs"
 
@@ -24,6 +28,7 @@ name = "pmd"
 path = "src/bin/pmd.rs"
 
 [dependencies]
+anyhow = "1"
 arbitrary = { version = "1.4.2", features = ["derive"] }
 clap = { version = "4.6.6", features = ["derive"] }
 dialoguer = "0.12.0"

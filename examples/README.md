@@ -4,19 +4,19 @@ A chain of four packages, each depending on the one below it, ending at `pm`'s
 own build file. Building the top of the chain builds all of them:
 
 ```
-examples/01-seed/build.yaml     dependencies: []
+examples/01-seed/build.package     dependencies: []
         ^
-examples/02-lib/build.yaml      dependencies: [../examples/01-seed/build.yaml]
+examples/02-lib/build.package      dependencies: [../examples/01-seed/build.package]
         ^
-examples/03-app/build.yaml      dependencies: [../examples/02-lib/build.yaml]
+examples/03-app/build.package      dependencies: [../examples/02-lib/build.package]
         ^
-pm.yaml            (repo root)  dependencies: [../examples/03-app/build.yaml]
+pm.package            (repo root)  dependencies: [../examples/03-app/build.package]
 ```
 
-`pm.yaml` really does compile `pm` with `cargo build --release`, inside the same
+`pm.package` really does compile `pm` with `cargo build --release`, inside the same
 jail every other package in the chain gets. The three files under `examples/`
-are committed verbatim and are machine-independent; `pm.yaml` is generated from
-`pm.yaml.in` because it has to name absolute paths (see
+are committed verbatim and are machine-independent; `pm.package` is generated from
+`pm.package.in` because it has to name absolute paths (see
 [No `$srcdir`](#no-srcdir)).
 
 ```sh
@@ -38,27 +38,58 @@ package through `pm` wants `TMPDIR` on real disk.
 
 ## The format
 
-A build file is plain YAML with exactly four fields, all required
-(`BuildFile` in `src/bf.rs`):
+A build file is Starlark, signed as one file. The entrypoint is a top-level
+`package(...)` call, and `load()` is deliberately disabled: a signature covers
+one recipe file, so allowing imports would let part of what runs live outside
+that signed unit.
+
+`package(...)` accepts:
 
 | field | type | notes |
 |---|---|---|
 | `name` | string | archive is named `<name>-<version>.cpkg` |
-| `version` | list of **strings** | joined with `.`; quote every component, or YAML hands serde an integer and parsing fails |
+| `version` | string **or** list of strings | `"0.1.0"` and `["0", "1", "0"]` are equivalent |
 | `dependencies` | list of **paths to build files or `.cpkg` archives** | no registry, no names, no version constraints |
-| `steps` | list of steps | may be empty |
+| `steps` | list of `step(...)` values | may be empty |
 
-A step (`Step` in `src/step.rs`):
+A step (`Step` in `src/step.rs`) is built with `step(...)`:
 
 | field | type | notes |
 |---|---|---|
-| `stage` | `Prepare` \| `Build` \| `Install` \| `Test` | required — serde does not apply the Rust default |
+| `stage` | `Prepare` \| `Build` \| `Install` \| `Test` | required; these four stage constants are built in |
 | `name` | string | diagnostics and logging only |
 | `run` | list of strings | commands, in order |
-| `dl_urls` | map URL → SHA-256, or `null` | the only optional field |
+| `dl_urls` | map URL → SHA-256, or `None` | the only optional field |
 
 Steps are sorted by stage and keep their authored order within a stage
 (`BuildFile::execute_steps`). `pm generate <file>` writes a minimal skeleton.
+
+Local helpers, loops and comprehensions are fine as long as they stay in the
+same signed file:
+
+```python
+def ro_probe(path):
+    return "test ! -w %s" % path
+
+package(
+    name = "demo",
+    version = "0.1.0",
+    dependencies = [],
+    steps = [
+        step(
+            stage = Prepare,
+            name = "confine",
+            run = [ro_probe(path) for path in ["/usr", "/etc"]],
+        ),
+    ],
+)
+```
+
+### Migrating from YAML
+
+YAML build files still load, but they are deprecated. Use `pm migrate FILE` to
+write a `.package` file beside it, add `-r` to rewrite YAML dependencies in the
+same chain, and re-sign the result: signatures and comments do not carry over.
 
 ### There is no shell
 
@@ -66,11 +97,12 @@ This is the single most surprising thing about the format. A command string is
 split on whitespace and `execve`d directly (`Step::execute`). No quoting, no
 globbing, no pipes, no redirection, **no variable expansion**.
 
-```yaml
-run:
-- install -Dm755 /usr/bin/echo /dest/usr/bin/seed   # works
-- cp foo $DESTDIR/bin/                              # creates a directory literally named $DESTDIR
-- make install                                      # works, and is the intended shape
+```python
+run = [
+    "install -Dm755 /usr/bin/echo /dest/usr/bin/seed",  # works
+    "cp foo $DESTDIR/bin/",                             # creates a directory literally named $DESTDIR
+    "make install",                                     # works, and is the intended shape
+]
 ```
 
 `DESTDIR` is in the environment, set to `/dest`, because that is the Makefile
@@ -158,7 +190,7 @@ its own sources must spell an absolute path.
 
 The three files under `examples/` sidestep this entirely — they stage payloads
 copied out of `/usr/bin`, so they need no absolute path and are committed as-is.
-`pm.yaml` cannot: cargo needs `--manifest-path`. Hence `pm.yaml.in` and the five
+`pm.package` cannot: cargo needs `--manifest-path`. Hence `pm.package.in` and the five
 placeholders `@SRCDIR@`, `@HOME@`, `@TRIPLE@`, `@CC@`, `@AR@`.
 
 ---
@@ -202,17 +234,17 @@ $ ls -a /home/matus            $ ls -a /home/matus/Dokumente
 Dokumente                      incubator
 ```
 
-Nothing else in `$HOME` is reachable. `pm.yaml`'s `confine` step asserts the
+Nothing else in `$HOME` is reachable. `pm.package`'s `confine` step asserts the
 sharp form with the real `$HOME` substituted in:
 
-```yaml
-- test ! -e /home/matus/.ssh
-- test ! -e /home/matus/.config
-- test ! -e /home/matus/.local
-- test ! -e /home/matus/.bashrc
+```python
+"test ! -e /home/matus/.ssh",
+"test ! -e /home/matus/.config",
+"test ! -e /home/matus/.local",
+"test ! -e /home/matus/.bashrc",
 ```
 
-All four exist on the host; none exist in the jail. `examples/*/build.yaml`
+All four exist on the host; none exist in the jail. `examples/*/build.package`
 cannot make that assertion without hard-coding a username, so they assert
 `/root`, `/var`, the read-only `/usr` and the host-`/tmp` decoy instead.
 
@@ -488,7 +520,7 @@ error: linker `cc` not found
   = note: No such file or directory (os error 2)
 ```
 
-`pm.yaml` works around it without needing an environment or a shell, by naming
+`pm.package` works around it without needing an environment or a shell, by naming
 the binaries in cargo's own config:
 
 ```
