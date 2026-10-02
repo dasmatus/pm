@@ -6,7 +6,7 @@ Minimal Neovim support for `pm` `.package` files.
 
 ```lua
 {
-  dir = "/home/runner/work/pm/pm/editors/nvim",
+  dir = "/path/to/pm/editors/nvim",
   ft = { "pm" },
   config = function()
     require("pm").setup()
