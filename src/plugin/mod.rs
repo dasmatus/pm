@@ -79,6 +79,8 @@ pub mod bundled;
 mod convert;
 /// The WebAssembly runtime a plugin is confined to.
 mod engine;
+/// Bounded, channel-backed parallel work for plugin integrations.
+pub mod parallel;
 /// The bindings generated from `wit/plugin.wit`.
 mod wit;
 
@@ -97,6 +99,7 @@ use wasmtime::component::Component;
 
 use self::{
     engine::Runtime,
+    parallel::Parallelism,
     wit::{WitSourceFile, WitVerdict},
 };
 use crate::{
@@ -659,35 +662,44 @@ impl Registry {
     #[must_use]
     pub fn classify(&self, command: &str) -> Option<(String, Vec<Capability>)> {
         let runtime = self.runtime.as_ref()?;
-        self.plugins
+        self.classify_plugins(runtime, command, None)
+    }
+
+    /// As [`Registry::classify`], evaluating eligible plugins concurrently.
+    ///
+    /// Results are considered in the registry's original load order, so the first
+    /// matching plugin still wins regardless of completion order.
+    #[must_use]
+    pub fn classify_parallel(
+        &self,
+        command: &str,
+        parallelism: &Parallelism,
+    ) -> Option<(String, Vec<Capability>)> {
+        let runtime = self.runtime.as_ref()?;
+        self.classify_plugins(runtime, command, Some(parallelism))
+    }
+
+    fn classify_plugins(
+        &self,
+        runtime: &Runtime,
+        command: &str,
+        parallelism: Option<&Parallelism>,
+    ) -> Option<(String, Vec<Capability>)> {
+        let plugins: Vec<&Plugin> = self
+            .plugins
             .iter()
             .filter(|plugin| plugin.manifest.hooks.contains(&Hook::ClassifyCommand))
-            .find_map(|plugin| {
-                let answer: WitVerdict = runtime
-                    .enter(
-                        &plugin.manifest.name,
-                        &plugin.component,
-                        |bindings, store| bindings.call_classify_command(store, command),
-                    )
-                    .map_err(|report| {
-                        warn!(
-                            plugin = %plugin.manifest.name,
-                            command,
-                            "cannot classify this command: {report}"
-                        );
-                    })
-                    .ok()
-                    .flatten()?;
-                let verdict = convert::verdict(answer, &plugin.manifest)?;
-                debug!(
-                    plugin = %plugin.manifest.name,
-                    command,
-                    fingerprint = %verdict.0,
-                    capabilities = ?verdict.1,
-                    "a plugin classified a command the built-in table did not"
-                );
-                Some(verdict)
-            })
+            .collect();
+        let answers = match parallelism {
+            Some(parallelism) => parallelism.map(&plugins, |plugin| {
+                classify_one(runtime, plugin, command)
+            }),
+            None => plugins
+                .iter()
+                .map(|plugin| classify_one(runtime, plugin, command))
+                .collect(),
+        };
+        answers.into_iter().flatten().next()
     }
 
     /// Ask every plugin that wants this file what the built program will need.
@@ -701,6 +713,29 @@ impl Registry {
     /// information worth keeping rather than a tie to break.
     #[must_use]
     pub fn scan_source(&self, relative: &str, contents: &str) -> Vec<Grant> {
+        self.scan_source_with(relative, contents, None)
+    }
+
+    /// As [`Registry::scan_source`], asking interested plugins concurrently.
+    ///
+    /// Grants are concatenated in registry order; callers get the same result as
+    /// [`Registry::scan_source`] with a different execution schedule.
+    #[must_use]
+    pub fn scan_source_parallel(
+        &self,
+        relative: &str,
+        contents: &str,
+        parallelism: &Parallelism,
+    ) -> Vec<Grant> {
+        self.scan_source_with(relative, contents, Some(parallelism))
+    }
+
+    fn scan_source_with(
+        &self,
+        relative: &str,
+        contents: &str,
+        parallelism: Option<&Parallelism>,
+    ) -> Vec<Grant> {
         let Some(runtime) = self.runtime.as_ref() else {
             return Vec::new();
         };
@@ -708,35 +743,82 @@ impl Registry {
             return Vec::new();
         };
 
-        self.plugins
+        let plugins: Vec<&Plugin> = self
+            .plugins
             .iter()
             .filter(|plugin| {
                 plugin.manifest.hooks.contains(&Hook::ScanSource)
                     && plugin.manifest.source_extensions.contains(&extension)
             })
-            .flat_map(|plugin| {
-                let file = WitSourceFile {
-                    path: relative.to_owned(),
-                    contents: contents.to_owned(),
-                };
-                match runtime.enter(
-                    &plugin.manifest.name,
-                    &plugin.component,
-                    |bindings, store| bindings.call_scan_source(store, &file),
-                ) {
-                    Ok(raw) => convert::grants(raw, &plugin.manifest, relative),
-                    Err(report) => {
-                        warn!(
-                            plugin = %plugin.manifest.name,
-                            file = %relative,
-                            "cannot scan this file; its grants are missing from the profile: \
-                             {report}"
-                        );
-                        Vec::new()
-                    }
-                }
-            })
-            .collect()
+            .collect();
+        let grants = match parallelism {
+            Some(parallelism) => parallelism.map(&plugins, |plugin| {
+                scan_source_one(runtime, plugin, relative, contents)
+            }),
+            None => plugins
+                .iter()
+                .map(|plugin| scan_source_one(runtime, plugin, relative, contents))
+                .collect(),
+        };
+        grants.into_iter().flatten().collect()
+    }
+}
+
+fn classify_one(
+    runtime: &Runtime,
+    plugin: &Plugin,
+    command: &str,
+) -> Option<(String, Vec<Capability>)> {
+    let answer: WitVerdict = runtime
+        .enter(
+            &plugin.manifest.name,
+            &plugin.component,
+            |bindings, store| bindings.call_classify_command(store, command),
+        )
+        .map_err(|report| {
+            warn!(
+                plugin = %plugin.manifest.name,
+                command,
+                "cannot classify this command: {report}"
+            );
+        })
+        .ok()
+        .flatten()?;
+    let verdict = convert::verdict(answer, &plugin.manifest)?;
+    debug!(
+        plugin = %plugin.manifest.name,
+        command,
+        fingerprint = %verdict.0,
+        capabilities = ?verdict.1,
+        "a plugin classified a command the built-in table did not"
+    );
+    Some(verdict)
+}
+
+fn scan_source_one(
+    runtime: &Runtime,
+    plugin: &Plugin,
+    relative: &str,
+    contents: &str,
+) -> Vec<Grant> {
+    let file = WitSourceFile {
+        path: relative.to_owned(),
+        contents: contents.to_owned(),
+    };
+    match runtime.enter(
+        &plugin.manifest.name,
+        &plugin.component,
+        |bindings, store| bindings.call_scan_source(store, &file),
+    ) {
+        Ok(raw) => convert::grants(raw, &plugin.manifest, relative),
+        Err(report) => {
+            warn!(
+                plugin = %plugin.manifest.name,
+                file = %relative,
+                "cannot scan this file; its grants are missing from the profile: {report}"
+            );
+            Vec::new()
+        }
     }
 }
 

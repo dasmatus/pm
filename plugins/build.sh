@@ -6,7 +6,7 @@
 # wrapped them in a component yet. `encoder/` does that - `wasm-tools component new`
 # does the same job if you have it installed.
 #
-#   ./build.sh            build everything into dist/, refresh the test fixtures
+#   ./build.sh            build everything into dist/
 #   ./build.sh zig        build one crate into dist/
 #
 # pm's own bundled plugins (bundled/) are not built here: pm's build.rs builds them on
@@ -22,11 +22,6 @@ cd "$here"
 
 target=wasm32-unknown-unknown
 out="$here/dist"
-# Where tests/plugins.rs reads its components from. Rebuilt here rather than at test
-# time, so the fixtures need nothing at test time. (Building pm itself does need the
-# wasm32-unknown-unknown target, for the bundled plugins; see build.rs.)
-fixtures="$here/../tests/fixtures/plugins"
-
 crates=${*:-"systemd sysext sysupdate zig greedy runaway nameless scanner"}
 
 mkdir -p "$out"
@@ -46,12 +41,4 @@ done
 if [ $# -eq 0 ]; then
     cargo build --release --target wasm32-wasip2 -p wasi
     cp "$here/target/wasm32-wasip2/release/wasi.wasm" "$out/wasi.wasm"
-fi
-
-if [ $# -eq 0 ]; then
-    mkdir -p "$fixtures"
-    for crate in greedy nameless runaway scanner systemd sysext sysupdate wasi zig; do
-        cp "$out/$crate.wasm" "$fixtures/$crate.wasm"
-    done
-    echo "refreshed $fixtures"
 fi

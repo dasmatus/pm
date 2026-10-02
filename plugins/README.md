@@ -157,7 +157,7 @@ repository root never drags a `wasm32` target in.
 
 ```sh
 rustup target add wasm32-unknown-unknown
-./build.sh              # everything, into dist/, and refresh the test fixtures
+./build.sh              # everything, into dist/
 ./build.sh zig          # just one
 ```
 

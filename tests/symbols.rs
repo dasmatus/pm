@@ -29,11 +29,9 @@ use tempfile::{TempDir, tempdir};
 mod common;
 use common::{build_file_yaml, write_build_file};
 
-/// Where the checked-in components live.
+/// Where `build.rs` generated the test components.
 fn fixture(name: &str) -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/fixtures/plugins")
-        .join(format!("{name}.wasm"))
+    Path::new(env!("PM_TEST_PLUGIN_DIR")).join(format!("{name}.wasm"))
 }
 
 /// Load `names` with signature checking off.

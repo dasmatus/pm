@@ -1,11 +1,12 @@
-//! Build pm's bundled plugins from `plugins/bundled/` and encode them as components.
+//! Build pm's bundled plugins and test fixtures from `plugins/` and encode them as components.
 //!
 //! The components are not checked in. Every build of pm compiles them here, for
 //! `wasm32-unknown-unknown` in release mode, with a nested cargo invocation over the
-//! `plugins/` workspace, and [`pm::plugin::bundled`] embeds the results from `OUT_DIR`.
+//! `plugins/` workspace. [`pm::plugin::bundled`] embeds the bundled results; test fixtures
+//! are written to `OUT_DIR` and never embedded in pm.
 //! That needs two things a plain Rust build does not:
 //!
-//! - the `wasm32-unknown-unknown` target (`rustup target add wasm32-unknown-unknown`);
+//! - the `wasm32-unknown-unknown` and `wasm32-wasip2` targets;
 //! - a C compiler that targets wasm32, which is clang - the tree-sitter grammars are C.
 //!
 //! The nested build has its own target directory, `bundled-plugins/` next to pm's own
@@ -46,6 +47,11 @@ const BUNDLED: [&str; 14] = [
     "bash-source",
 ];
 
+/// Example and adversarial plugins used by integration tests, not embedded in pm.
+const TEST_PLUGINS: [&str; 8] = [
+    "systemd", "sysext", "sysupdate", "zig", "greedy", "runaway", "nameless", "scanner",
+];
+
 /// Variables cargo sets for this build script that describe pm's own build. Passed
 /// through, they would make the nested cargo build the plugins with pm's flags or into
 /// pm's target directory.
@@ -67,6 +73,11 @@ fn main() {
         "plugins/Cargo.toml",
         "plugins/Cargo.lock",
         "plugins/bundled",
+        "plugins/fixtures",
+        "plugins/systemd",
+        "plugins/sysext",
+        "plugins/sysupdate",
+        "plugins/zig",
         "plugins/vendor",
         "wit",
     ] {
@@ -92,6 +103,25 @@ fn main() {
             .join(format!("bundled_{}.wasm", name.replace('-', "_")));
         encode(&module, &components.join(format!("{name}.wasm")));
     }
+
+    let test_components = out.join("test-plugins");
+    fs::create_dir_all(&test_components).expect("create the plugin test fixtures directory");
+    for name in TEST_PLUGINS {
+        let module = target_dir
+            .join(TARGET)
+            .join("release")
+            .join(format!("{}.wasm", name.replace('-', "_")));
+        encode(&module, &test_components.join(format!("{name}.wasm")));
+    }
+    compile_wasi_fixture(&plugins, &target_dir);
+    copy_if_changed(
+        &target_dir.join("wasm32-wasip2/release/wasi.wasm"),
+        &test_components.join("wasi.wasm"),
+    );
+    println!(
+        "cargo::rustc-env=PM_TEST_PLUGIN_DIR={}",
+        test_components.display()
+    );
 }
 
 /// `bundled-plugins/` in pm's target directory, found as the ancestor of `OUT_DIR` that
@@ -125,6 +155,9 @@ fn compile(plugins: &Path, target_dir: &Path) {
     for name in BUNDLED {
         command.arg("-p").arg(format!("bundled-{name}"));
     }
+    for name in TEST_PLUGINS {
+        command.arg("-p").arg(name);
+    }
     for key in NOT_INHERITED {
         command.env_remove(key);
     }
@@ -136,6 +169,36 @@ fn compile(plugins: &Path, target_dir: &Path) {
         status.success(),
         "building pm's bundled plugins failed ({status}). They are WebAssembly: this needs \
          `rustup target add {TARGET}` and clang on PATH for the C grammars"
+    );
+}
+
+/// Build the one fixture whose imports intentionally require a WASI host.
+fn compile_wasi_fixture(plugins: &Path, target_dir: &Path) {
+    let cargo = env::var_os("CARGO").unwrap_or_else(|| OsString::from("cargo"));
+    let mut command = Command::new(cargo);
+    command
+        .current_dir(plugins)
+        .args([
+            "build",
+            "--release",
+            "--locked",
+            "--target",
+            "wasm32-wasip2",
+            "--target-dir",
+        ])
+        .arg(target_dir)
+        .arg("-p")
+        .arg("wasi");
+    for key in NOT_INHERITED {
+        command.env_remove(key);
+    }
+    let status = command
+        .status()
+        .unwrap_or_else(|error| panic!("cannot run cargo to build the WASI test fixture: {error}"));
+    assert!(
+        status.success(),
+        "building the WASI plugin test fixture failed ({status}); this needs \
+         `rustup target add wasm32-wasip2`"
     );
 }
 
@@ -155,9 +218,20 @@ fn encode(module: &Path, component: &Path) {
                 module.display()
             )
         });
+    copy_bytes_if_changed(&encoded, component);
+}
+
+/// Copy `source` into `destination` only when the bytes differ.
+fn copy_if_changed(source: &Path, destination: &Path) {
+    let bytes = fs::read(source)
+        .unwrap_or_else(|error| panic!("cannot read {}: {error}", source.display()));
+    copy_bytes_if_changed(&bytes, destination);
+}
+
+fn copy_bytes_if_changed(bytes: &[u8], destination: &Path) {
     // Rewriting an unchanged file would make cargo rebuild pm for nothing.
-    if fs::read(component).ok().as_deref() != Some(encoded.as_slice()) {
-        fs::write(component, &encoded)
-            .unwrap_or_else(|error| panic!("cannot write {}: {error}", component.display()));
+    if fs::read(destination).ok().as_deref() != Some(bytes) {
+        fs::write(destination, bytes)
+            .unwrap_or_else(|error| panic!("cannot write {}: {error}", destination.display()));
     }
 }
