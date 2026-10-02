@@ -16,8 +16,8 @@ build-command fingerprints, and one tree-sitter scanner per language (`c-source`
 the grammar and its queries. They are written against the same `wit/plugin.wit`
 (the `bundled` world adds one export listing the fingerprint names). pm's own
 `build.rs` compiles and encodes them on every build of pm and embeds them in the
-binary, so building pm needs the `wasm32-unknown-unknown` target and clang (for the
-C grammars); pm runs them in the same runtime as yours. They are consulted first, in that order, and recorded
+binary, so building pm needs the `wasm32-unknown-unknown` and `wasm32-wasip2` targets
+and clang (for the C grammars); pm runs them in the same runtime as yours. They are consulted first, in that order, and recorded
 under their own names exactly as the old compiled-in tables were; the plugins
 described here only ever hear about what none of them recognised.
 
@@ -156,8 +156,8 @@ The crates here are a separate cargo workspace, so `cargo build` at the
 repository root never drags a `wasm32` target in.
 
 ```sh
-rustup target add wasm32-unknown-unknown
-./build.sh              # everything, into dist/, and refresh the test fixtures
+rustup target add wasm32-unknown-unknown wasm32-wasip2
+./build.sh              # everything, into dist/
 ./build.sh zig          # just one
 ```
 

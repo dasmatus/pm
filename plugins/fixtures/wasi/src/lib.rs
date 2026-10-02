@@ -12,8 +12,8 @@
 //! and the test goes red.
 //!
 //! Built for `wasm32-wasip2`, unlike every other crate here, because that is the target
-//! that links a WASI libc. `rustc` emits a component directly for it, so `plugins/build.sh`
-//! skips the encoding step for this one.
+//! that links a WASI libc. `rustc` emits a component directly for it, so `build.rs` can
+//! place it in the integration-test fixture directory without an encoding step.
 
 wit_bindgen::generate!({ path: "../../../wit", world: "plugin" });
 

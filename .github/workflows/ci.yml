@@ -12,9 +12,9 @@ on:
 # Three jobs: rustfmt + clippy, the default test suite, and the confined tests
 # the default suite skips.
 #
-# Every job builds pm, and building pm builds its bundled WebAssembly plugins
-# (build.rs), so every toolchain step adds the wasm32-unknown-unknown target. The
-# C grammars among them need clang, which the runner image has.
+# Every job builds pm, and building pm builds its bundled WebAssembly plugins and
+# integration-test fixtures (build.rs), so every toolchain step adds both wasm targets.
+# The C grammars need clang, which the runner image has.
 #
 # `lint` and `test` are separate jobs rather than one. They do not share build
 # artifacts — clippy type-checks and emits .rmeta while `cargo test` needs
@@ -66,7 +66,7 @@ jobs:
           rustup update --no-self-update stable
           rustup default stable
           rustup component add clippy rustfmt
-          rustup target add wasm32-unknown-unknown
+          rustup target add wasm32-unknown-unknown wasm32-wasip2
           rustc -vV
           echo "ver=$(rustc -V | tr -d ' ()' )" >> "$GITHUB_OUTPUT"
       - uses: actions/cache@v4
@@ -103,7 +103,7 @@ jobs:
           set -euo pipefail
           rustup update --no-self-update stable
           rustup default stable
-          rustup target add wasm32-unknown-unknown
+          rustup target add wasm32-unknown-unknown wasm32-wasip2
           rustc -vV
           echo "ver=$(rustc -V | tr -d ' ()' )" >> "$GITHUB_OUTPUT"
       - uses: actions/cache@v4
@@ -164,7 +164,7 @@ jobs:
           set -euo pipefail
           rustup update --no-self-update stable
           rustup default stable
-          rustup target add wasm32-unknown-unknown
+          rustup target add wasm32-unknown-unknown wasm32-wasip2
           rustc -vV
           echo "ver=$(rustc -V | tr -d ' ()' )" >> "$GITHUB_OUTPUT"
       - uses: actions/cache@v4
@@ -209,4 +209,3 @@ jobs:
         run: cargo test --all-features --test sandbox -- --ignored
       - name: "run jail: landlock"
         run: cargo test --all-features --test landlock -- --ignored
-

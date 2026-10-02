@@ -1,11 +1,8 @@
 //! Tests for [`pm::plugin`]: what a WebAssembly plugin may do to a build, and the far
 //! longer list of what it may not.
 //!
-//! Every component these tests load is a real one, built from `plugins/` by
-//! `plugins/build.sh` and checked in under `tests/fixtures/plugins/`. They are checked
-//! in rather than built here on purpose: `cargo test` then needs no `wasm32` target, no
-//! `wit-bindgen` and no second compile, and the thing under test is the same artefact a
-//! user would install.
+//! Every component these tests load is a real one, built from `plugins/` by `build.rs`
+//! into Cargo's build output. They are not checked in or embedded in the pm executable.
 //!
 //! The fixtures are deliberately badly behaved, because the interesting claims are about
 //! misbehaviour. `greedy` asks for more than it published, `runaway` never returns,
@@ -14,6 +11,7 @@
 
 use std::{
     fs::{copy, create_dir_all, write},
+    num::NonZeroUsize,
     path::{Path, PathBuf},
     time::{Duration, Instant},
 };
@@ -21,7 +19,7 @@ use std::{
 use pm::{
     bf::BuildFile,
     perms::{Permission, Provenance, source::scan_with},
-    plugin::{Hook, Loader, Registry, Trust},
+    plugin::{Hook, Loader, Parallelism, Registry, Trust},
     policy::{BuildPolicy, Capability},
     signing::{SigningKey, TrustStore, sign_file},
 };
@@ -30,11 +28,9 @@ use tempfile::{TempDir, tempdir};
 mod common;
 use common::{build_file_yaml, write_build_file};
 
-/// Where the checked-in components live.
+/// Where `build.rs` generated the test components.
 fn fixture(name: &str) -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/fixtures/plugins")
-        .join(format!("{name}.wasm"))
+    Path::new(env!("PM_TEST_PLUGIN_DIR")).join(format!("{name}.wasm"))
 }
 
 /// A plugin directory holding `names`, and the temporary directory keeping it alive.
@@ -117,6 +113,42 @@ fn a_plugin_classifies_a_command_the_built_in_table_refuses() {
     assert!(
         policy.grants(Capability::Network),
         "`zig build` resolves build.zig.zon dependencies"
+    );
+}
+
+#[test]
+fn parallel_plugin_hooks_match_their_serial_results() {
+    let (_root, registry) = unsigned(&["zig", "greedy", "scanner"]);
+    let parallelism = Parallelism::new(NonZeroUsize::new(2).expect("non-zero worker count"))
+        .expect("create parallel plugin workers");
+
+    let command = "zig build -Doptimize=ReleaseSafe";
+    assert_eq!(
+        registry.classify_parallel(command, &parallelism),
+        registry.classify(command)
+    );
+    assert_eq!(
+        registry.classify_parallel(command, &parallelism),
+        Some(("greedy:greedy".into(), vec![Capability::Toolchain])),
+        "the first matching plugin in file-name order wins"
+    );
+
+    let source = "read /etc/toy.conf\nstd.net\n";
+    let serial = registry.scan_source("fixture.zig", source);
+    assert_eq!(
+        registry.scan_source_parallel("fixture.zig", source, &parallelism),
+        serial
+    );
+    assert_eq!(
+        serial
+            .iter()
+            .map(|grant| grant.evidence()[0].as_str())
+            .collect::<Vec<_>>(),
+        [
+            "fixture.zig: toy: 1: directive",
+            "fixture.zig: zig: 2: std.net",
+        ],
+        "grants from overlapping scanners retain registry order"
     );
 }
 

@@ -2,9 +2,9 @@
 #
 # These crates compile to `wasm32-unknown-unknown`, not to the host, so they cannot be
 # members of pm's workspace. Most are example plugins and test fixtures that pm loads
-# at run time from a directory and never builds itself. The exception is `bundled/*`:
-# pm's build.rs runs a nested cargo over this workspace to build those crates and embed
-# them, so a build of pm does compile this second target, into target/bundled-plugins.
+# at run time from a directory. `bundled/*` and the integration-test fixtures are built
+# by pm's build.rs with a nested cargo invocation; only the bundled components are
+# embedded in the executable.
 [workspace]
 resolver = "3"
 members = ["encoder", "unitfile", "fixtures/*", "systemd", "sysext", "sysupdate", "zig", "bundled/*"]

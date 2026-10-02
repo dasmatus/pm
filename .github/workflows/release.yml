@@ -38,8 +38,8 @@ jobs:
           set -euo pipefail
           rustup update --no-self-update stable
           rustup default stable
-          # build.rs compiles pm's bundled plugins to WebAssembly.
-          rustup target add wasm32-unknown-unknown
+          # build.rs compiles pm's bundled plugins and test fixtures to WebAssembly.
+          rustup target add wasm32-unknown-unknown wasm32-wasip2
           rustc -vV
           echo "ver=$(rustc -V | tr -d ' ()' )" >> "$GITHUB_OUTPUT"
       - uses: actions/cache@v4

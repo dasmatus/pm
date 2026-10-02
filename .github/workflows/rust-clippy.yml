@@ -36,9 +36,13 @@ jobs:
           profile: minimal
           toolchain: stable
           components: clippy
-          # build.rs compiles pm's bundled plugins to WebAssembly.
+          # build.rs compiles pm's bundled plugins and test fixtures to WebAssembly.
+          # This input takes one target triple; the second is added below.
           target: wasm32-unknown-unknown
           override: true
+
+      - name: Add the wasip2 target
+        run: rustup target add wasm32-wasip2
 
       - name: Install required cargo
         run: cargo install clippy-sarif sarif-fmt
