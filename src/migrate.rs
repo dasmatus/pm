@@ -41,6 +41,10 @@ fn is_yaml(path: &Path) -> bool {
         .is_some_and(|ext| ext == "yaml" || ext == "yml")
 }
 
+fn is_convertible_dependency(path: &Path) -> bool {
+    !star::is_starlark(path) && !path.extension().is_some_and(|ext| ext == "cpkg")
+}
+
 /// The path of the Starlark file `source` converts to: `.yaml` and `.yml` become
 /// `.package`, and anything else gets `.package` appended.
 #[must_use]
@@ -81,6 +85,30 @@ pub fn convert_file(source: &Path, recursive: bool) -> miette::Result<Vec<Conver
     // Dependencies are pushed ahead of their dependents, so the file the user
     // named is last; put it first.
     done.rotate_right(1);
+    let mut targets = HashSet::new();
+    for converted in &done {
+        let parent = converted
+            .target
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let target = parent
+            .canonicalize()
+            .into_diagnostic()
+            .wrap_err_with(|| format!("cannot resolve target directory {}", parent.display()))?
+            .join(
+                converted
+                    .target
+                    .file_name()
+                    .ok_or_else(|| miette!("{} has no file name", converted.target.display()))?,
+            );
+        if !targets.insert(target.clone()) {
+            return Err(miette!(
+                "multiple source files map to the same target {}",
+                target.display()
+            ));
+        }
+    }
     Ok(done)
 }
 
@@ -113,11 +141,14 @@ fn convert_into(
             .dependencies()
             .map(Path::to_path_buf)
             .collect::<Vec<_>>();
-        for dependency in dependencies.iter().filter(|path| is_yaml(path)) {
+        for dependency in dependencies
+            .iter()
+            .filter(|path| is_convertible_dependency(path))
+        {
             convert_into(dependency, recursive, seen, done)?;
         }
         build.map_dependencies(|path| {
-            if is_yaml(path) {
+            if is_convertible_dependency(path) {
                 target_path(path)
             } else {
                 path.to_path_buf()

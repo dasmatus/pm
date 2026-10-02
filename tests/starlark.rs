@@ -254,6 +254,54 @@ fn recursive_migration_rewrites_dependencies() {
 }
 
 #[test]
+fn recursive_migration_rewrites_extensionless_dependencies() {
+    let dir = tempdir().expect("tempdir");
+    let dependency = dir.path().join("leaf");
+    write(
+        &dependency,
+        "name: leaf\nversion: ['1']\ndependencies: []\nsteps: []\n",
+    )
+    .expect("write");
+    let root = dir.path().join("build.yaml");
+    write(
+        &root,
+        format!(
+            "name: root\nversion: ['1']\ndependencies:\n- {}\nsteps: []\n",
+            dependency.display()
+        ),
+    )
+    .expect("write");
+
+    let converted = migrate::convert_file(&root, true).expect("converts");
+    assert_eq!(converted.len(), 2);
+    assert_eq!(converted[1].target, dir.path().join("leaf.package"));
+    assert!(converted[0].text.contains("leaf.package"));
+}
+
+#[test]
+fn recursive_migration_rejects_duplicate_targets() {
+    let dir = tempdir().expect("tempdir");
+    let yaml = "name: leaf\nversion: ['1']\ndependencies: []\nsteps: []\n";
+    let first = dir.path().join("leaf.yaml");
+    let second = dir.path().join("leaf.yml");
+    write(&first, yaml).expect("write");
+    write(&second, yaml).expect("write");
+    let root = dir.path().join("build.yaml");
+    write(
+        &root,
+        format!(
+            "name: root\nversion: ['1']\ndependencies:\n- {}\n- {}\nsteps: []\n",
+            first.display(),
+            second.display()
+        ),
+    )
+    .expect("write");
+
+    let error = migrate::convert_file(&root, true).expect_err("targets collide");
+    assert!(format!("{error}").contains("leaf.package"), "{error}");
+}
+
+#[test]
 fn migrating_a_starlark_file_is_an_error() {
     let dir = tempdir().expect("tempdir");
     let path = dir.path().join("build.package");

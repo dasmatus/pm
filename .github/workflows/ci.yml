@@ -86,11 +86,14 @@ jobs:
       # Formatting first: it costs a second and fails before the long build, so
       # a whitespace-only mistake does not cost a full clippy compile to learn.
       - run: cargo fmt --all --check
+      - run: cargo fmt --manifest-path editors/zed/Cargo.toml --check
       # --all-targets so the benches, the examples and src/bin/pm-fuzz.rs are
       # linted too. Without it clippy checks the lib and the main binary only,
       # and divan benches with `harness = false` are exactly the kind of target
       # that rots unnoticed.
       - run: cargo clippy --all-targets --all-features -- -D warnings
+      - run: cargo clippy --manifest-path editors/zed/Cargo.toml --locked --all-targets --all-features -- -D warnings
+      - run: cargo check --manifest-path editors/zed/Cargo.toml --locked
 
   test:
     name: "test suite"
