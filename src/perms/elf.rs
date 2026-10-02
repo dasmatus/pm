@@ -608,12 +608,13 @@ fn grants(path: &Path, inspection: &Inspection) -> Vec<Grant> {
 fn summarise(libraries: &[&str]) -> String {
     /// How many names to print before falling back to a count.
     const SHOWN: usize = 3;
-    let head = libraries
-        .iter()
-        .take(SHOWN)
-        .copied()
-        .collect::<Vec<&str>>()
-        .join(", ");
+    let mut head = String::new();
+    for (position, library) in libraries.iter().take(SHOWN).enumerate() {
+        if position > 0 {
+            head.push_str(", ");
+        }
+        head.push_str(library);
+    }
     match libraries.len().checked_sub(SHOWN) {
         Some(0) | None => head,
         Some(rest) => format!("{head} and {rest} more"),
@@ -634,11 +635,11 @@ fn summarise(libraries: &[&str]) -> String {
 ///   a literal `$LIB` grants a directory that cannot exist;
 /// - any `$ORIGIN` component when `object` is not an absolute path, since the expansion
 ///   would be relative to whatever directory the sandbox happens to start in.
-fn components(object: &Path, raw: &str) -> Vec<PathBuf> {
+fn components<'a>(object: &'a Path, raw: &'a str) -> impl Iterator<Item = PathBuf> + 'a {
     let origin = object.parent().filter(|_| object.is_absolute());
     raw.split(':')
         .filter(|component| !component.is_empty())
-        .filter_map(|component| {
+        .filter_map(move |component| {
             let expanded = match origin {
                 Some(origin) => component
                     .replace("${ORIGIN}", &origin.to_string_lossy())
@@ -654,7 +655,6 @@ fn components(object: &Path, raw: &str) -> Vec<PathBuf> {
             }
             Some(PathBuf::from(expanded))
         })
-        .collect()
 }
 
 /// A diagnostic naming the file and what is wrong with it.

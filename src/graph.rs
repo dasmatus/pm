@@ -388,7 +388,7 @@ impl Graph {
 
             if let Some(index) = state.ready.pop() {
                 state.running += 1;
-                let archives = state.archives_for(self, index);
+                let archives = state.archives_for(self, index).collect();
                 state.describe(summary, self.len());
                 return Some((index, archives));
             }
@@ -794,7 +794,11 @@ impl Schedule {
     ///
     /// Every one of them is `Built`: a package only becomes ready once all its
     /// dependencies have settled successfully.
-    fn archives_for(&self, graph: &Graph, index: usize) -> Vec<PathBuf> {
+    fn archives_for<'a>(
+        &'a self,
+        graph: &'a Graph,
+        index: usize,
+    ) -> impl Iterator<Item = PathBuf> + 'a {
         graph.nodes[index]
             .dependencies
             .iter()
@@ -802,7 +806,6 @@ impl Schedule {
                 Progression::Built(archive) => Some(archive.clone()),
                 _ => None,
             })
-            .collect()
     }
 
     /// Record how `index` turned out, and release or skip what was waiting on it.

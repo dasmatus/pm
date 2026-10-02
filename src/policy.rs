@@ -34,6 +34,7 @@ use tracing::{debug, warn};
 use crate::{
     plugin::{Registry, bundled},
     step::Step,
+    text::comma_join,
 };
 
 /// One capability a build step may need from the sandbox.
@@ -177,7 +178,7 @@ impl BuildPolicy {
                     "these commands"
                 },
                 unknown.join(", "),
-                bundled::fingerprint_names()?.join(", ")
+                comma_join(bundled::fingerprint_names_iter()?)
             );
             if permissive {
                 warn!("{report:?}");
@@ -426,9 +427,9 @@ fn static_name(name: &str) -> Option<&'static str> {
     if name == UNMATCHED {
         return Some(UNMATCHED);
     }
-    bundled::fingerprint_names()
+    bundled::fingerprint_names_iter()
         .ok()
-        .and_then(|names| names.into_iter().find(|known| *known == name))
+        .and_then(|mut names| names.find(|known| *known == name))
         .or_else(|| interned(name))
 }
 

@@ -14,6 +14,7 @@ use pm::{
         verify_file,
     },
     step::Step,
+    text::comma_join,
     workspace::Workspace,
 };
 use serde::Serialize;
@@ -674,7 +675,7 @@ fn list_plugins(plugins: &Registry, digests: bool) -> miette::Result<()> {
 /// [`pm::perms::Permissions::report`] prints its empty groups: the absence of a grant is
 /// the interesting half of a review, and an omitted line reads as an oversight.
 fn join_or_none(items: impl Iterator<Item = String>) -> String {
-    let joined = items.collect::<Vec<_>>().join(", ");
+    let joined = comma_join(items);
     if joined.is_empty() {
         "none".to_owned()
     } else {
@@ -792,12 +793,12 @@ fn explain_text(
     let capabilities = if policy.capabilities().is_empty() {
         "none".to_owned()
     } else {
-        policy
-            .capabilities()
-            .iter()
-            .map(|capability| format!("{capability:?}"))
-            .collect::<Vec<_>>()
-            .join(", ")
+        comma_join(
+            policy
+                .capabilities()
+                .iter()
+                .map(|capability| format!("{capability:?}")),
+        )
     };
 
     println!("{:<LABEL_WIDTH$}{}", "build file:", file.display());
@@ -816,12 +817,11 @@ fn explain_text(
         println!(
             "{:<LABEL_WIDTH$}{}",
             "plugins:",
-            plugins
-                .plugins()
-                .iter()
-                .map(|plugin| format!("{} {}", plugin.manifest().name, plugin.manifest().version))
-                .collect::<Vec<_>>()
-                .join(", ")
+            comma_join(plugins.plugins().iter().map(|plugin| format!(
+                "{} {}",
+                plugin.manifest().name,
+                plugin.manifest().version
+            )))
         );
     }
     if !symbols.is_empty() {
@@ -868,7 +868,7 @@ fn explain_text(
 /// serialise private implementation structs: their layout is not a CLI contract.
 #[derive(Serialize)]
 struct ExplainReport<'a> {
-    schema_version: u32,
+    schema_version: u8,
     name: &'a str,
     version: &'a [String],
     dependencies: Vec<&'a Path>,

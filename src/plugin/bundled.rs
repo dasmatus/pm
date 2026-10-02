@@ -194,10 +194,13 @@ pub fn sources() -> Result<&'static [Loaded]> {
 ///
 /// As [`commands`].
 pub fn fingerprint_names() -> Result<Vec<&'static str>> {
+    Ok(fingerprint_names_iter()?.collect())
+}
+
+pub(crate) fn fingerprint_names_iter() -> Result<impl Iterator<Item = &'static str>> {
     Ok(commands()?
         .iter()
-        .flat_map(|plugin| plugin.fingerprints.iter().copied())
-        .collect())
+        .flat_map(|plugin| plugin.fingerprints.iter().copied()))
 }
 
 /// Run `call` against this thread's live instance of `plugin`, making one if needed.

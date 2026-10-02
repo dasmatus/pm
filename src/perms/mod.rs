@@ -47,6 +47,7 @@ use std::{
     path::{Component, Path, PathBuf},
 };
 
+use crate::text::comma_join;
 use serde::{Deserialize, Serialize};
 use tracing::debug;
 
@@ -470,12 +471,7 @@ impl<'a> Row<'a> {
             .permission
             .path()
             .map_or_else(|| "(granted)".to_owned(), |path| path.display().to_string());
-        let provenance = grant
-            .provenance
-            .iter()
-            .map(|provenance| provenance.label())
-            .collect::<Vec<_>>()
-            .join(", ");
+        let provenance = comma_join(grant.provenance.iter().map(|provenance| provenance.label()));
         Self {
             subject,
             provenance,

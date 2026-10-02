@@ -52,6 +52,7 @@ use crate::{
     context::BuildContext,
     policy::{BuildPolicy, Capability},
     progress::Task,
+    text::comma_join,
     workspace::{HostChild, SandboxedChild},
 };
 
@@ -656,7 +657,7 @@ impl BuildSandbox {
 /// `PATH` and `$HOME` both come from `ctx` rather than the process: a daemon
 /// building on a caller's behalf must mount the caller's toolchain, not its
 /// own.
-fn toolchain_roots(ctx: &BuildContext) -> Vec<PathBuf> {
+fn toolchain_roots(ctx: &BuildContext) -> impl Iterator<Item = PathBuf> {
     let home = ctx.home.as_deref();
 
     // Sorted, so an ancestor is always visited before anything nested in it.
@@ -699,7 +700,7 @@ fn toolchain_roots(ctx: &BuildContext) -> Vec<PathBuf> {
         }
         roots.push(candidate);
     }
-    roots
+    roots.into_iter()
 }
 
 /// Canonicalise a path that has to be an existing directory.
@@ -857,11 +858,7 @@ fn report_stderr(step_name: &str, command: &str, stderr: &[u8]) {
 
 /// Comma-separated path list for diagnostics.
 fn describe_paths(paths: &[PathBuf]) -> String {
-    paths
-        .iter()
-        .map(|path| format!("`{}`", path.display()))
-        .collect::<Vec<_>>()
-        .join(", ")
+    comma_join(paths.iter().map(|path| format!("`{}`", path.display())))
 }
 
 /// Is `path` a file this user could exec?
