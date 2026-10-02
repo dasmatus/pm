@@ -11,6 +11,7 @@
 
 use std::{
     fs::{copy, create_dir_all, write},
+    num::NonZeroUsize,
     path::{Path, PathBuf},
     time::{Duration, Instant},
 };
@@ -118,18 +119,16 @@ fn a_plugin_classifies_a_command_the_built_in_table_refuses() {
 #[test]
 fn parallel_plugin_hooks_match_their_serial_results() {
     let (_root, registry) = unsigned(&["zig", "scanner"]);
-    let parallelism = Parallelism::new(2).expect("create parallel plugin workers");
+    let parallelism = Parallelism::new(NonZeroUsize::new(2).expect("non-zero worker count"))
+        .expect("create parallel plugin workers");
 
     assert_eq!(
         registry.classify_parallel("zig build -Doptimize=ReleaseSafe", &parallelism),
         registry.classify("zig build -Doptimize=ReleaseSafe")
     );
     assert_eq!(
-        registry.scan_source_parallel(
-            "fixture.toy",
-            "read /etc/toy.conf\nnetwork\n",
-            &parallelism,
-        ),
+        registry
+            .scan_source_parallel("fixture.toy", "read /etc/toy.conf\nnetwork\n", &parallelism,),
         registry.scan_source("fixture.toy", "read /etc/toy.conf\nnetwork\n")
     );
 }

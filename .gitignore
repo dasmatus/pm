@@ -9,9 +9,8 @@
 *.sig
 examples/.demo-config
 
-# Built plugin components and the wasm workspace target directory.
-# `plugins/build.sh` regenerates both; the checked-in copies live in
-# tests/fixtures/plugins/.
+# Local outputs from plugin builds. Integration-test components are generated
+# under Cargo's ignored /target directory rather than stored in the source tree.
 /plugins/target
 /plugins/dist
 # pm's build.rs builds the bundled plugins into its own OUT_DIR; nothing under

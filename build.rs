@@ -1,9 +1,9 @@
 //! Build pm's bundled plugins and test fixtures from `plugins/` and encode them as components.
 //!
-//! The components are not checked in. Every build of pm compiles them here, for
-//! `wasm32-unknown-unknown` in release mode, with a nested cargo invocation over the
-//! `plugins/` workspace. [`pm::plugin::bundled`] embeds the bundled results; test fixtures
-//! are written to `OUT_DIR` and never embedded in pm.
+//! The components are not checked in. Every build compiles the bundled plugins and test
+//! fixtures in release mode with a nested cargo invocation over the `plugins/` workspace.
+//! [`pm::plugin::bundled`] embeds only the bundled results; test fixtures are written to
+//! `OUT_DIR` and never embedded in pm.
 //! That needs two things a plain Rust build does not:
 //!
 //! - the `wasm32-unknown-unknown` and `wasm32-wasip2` targets;
@@ -49,7 +49,14 @@ const BUNDLED: [&str; 14] = [
 
 /// Example and adversarial plugins used by integration tests, not embedded in pm.
 const TEST_PLUGINS: [&str; 8] = [
-    "systemd", "sysext", "sysupdate", "zig", "greedy", "runaway", "nameless", "scanner",
+    "systemd",
+    "sysext",
+    "sysupdate",
+    "zig",
+    "greedy",
+    "runaway",
+    "nameless",
+    "scanner",
 ];
 
 /// Variables cargo sets for this build script that describe pm's own build. Passed
@@ -135,7 +142,7 @@ fn shared_target_dir(out: &Path) -> PathBuf {
         )
 }
 
-/// Run cargo over the `plugins/` workspace for every bundled crate.
+/// Build bundled plugins and integration-test components from the `plugins/` workspace.
 fn compile(plugins: &Path, target_dir: &Path) {
     let cargo = env::var_os("CARGO").unwrap_or_else(|| OsString::from("cargo"));
     let include = plugins.join("vendor/tree-sitter-language/wasm/include");
@@ -164,10 +171,10 @@ fn compile(plugins: &Path, target_dir: &Path) {
 
     let status = command
         .status()
-        .unwrap_or_else(|error| panic!("cannot run cargo to build the bundled plugins: {error}"));
+        .unwrap_or_else(|error| panic!("cannot run cargo to build the plugins: {error}"));
     assert!(
         status.success(),
-        "building pm's bundled plugins failed ({status}). They are WebAssembly: this needs \
+        "building pm's plugins failed ({status}). They are WebAssembly: this needs \
          `rustup target add {TARGET}` and clang on PATH for the C grammars"
     );
 }

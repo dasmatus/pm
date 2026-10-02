@@ -81,6 +81,7 @@ mod convert;
 mod engine;
 /// Bounded, channel-backed parallel work for plugin integrations.
 pub mod parallel;
+pub use parallel::Parallelism;
 /// The bindings generated from `wit/plugin.wit`.
 mod wit;
 
@@ -99,7 +100,6 @@ use wasmtime::component::Component;
 
 use self::{
     engine::Runtime,
-    parallel::Parallelism,
     wit::{WitSourceFile, WitVerdict},
 };
 use crate::{
@@ -691,9 +691,9 @@ impl Registry {
             .filter(|plugin| plugin.manifest.hooks.contains(&Hook::ClassifyCommand))
             .collect();
         let answers = match parallelism {
-            Some(parallelism) => parallelism.map(&plugins, |plugin| {
-                classify_one(runtime, plugin, command)
-            }),
+            Some(parallelism) => {
+                parallelism.map(&plugins, |plugin| classify_one(runtime, plugin, command))
+            }
             None => plugins
                 .iter()
                 .map(|plugin| classify_one(runtime, plugin, command))

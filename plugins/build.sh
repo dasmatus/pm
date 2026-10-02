@@ -12,9 +12,10 @@
 # pm's own bundled plugins (bundled/) are not built here: pm's build.rs builds them on
 # every `cargo build` of pm.
 #
-# Requires only a Rust toolchain with the wasm32-unknown-unknown target:
+# Requires a Rust toolchain with the wasm32-unknown-unknown target, and the
+# wasm32-wasip2 target when building every plugin:
 #
-#   rustup target add wasm32-unknown-unknown
+#   rustup target add wasm32-unknown-unknown wasm32-wasip2
 set -eu
 
 here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)

@@ -2,9 +2,9 @@
 name = "pm"
 version = "0.1.0"
 edition = "2024"
-# build.rs compiles the bundled plugins from plugins/, a separate workspace that
-# `cargo package` would leave out of the crate, so a published pm could not build. pm
-# ships as the binaries release.yml attaches to each tag.
+# build.rs compiles bundled plugins and test fixtures from plugins/, a separate workspace
+# that `cargo package` would leave out of the crate, so a published pm could not build.
+# pm ships as the binaries release.yml attaches to each tag.
 publish = false
 
 [[bench]]

@@ -5,9 +5,12 @@
 //! independent plugin calls: work may finish in any order, while results retain their
 //! input order.
 
-use std::sync::{
-    Arc,
-    mpsc::{self, Receiver, Sender},
+use std::{
+    num::NonZeroUsize,
+    sync::{
+        Arc,
+        mpsc::{self, Receiver, Sender},
+    },
 };
 
 use rayon::prelude::*;
@@ -24,14 +27,14 @@ pub struct Parallelism {
 }
 
 impl Parallelism {
-    /// Create a worker pool with exactly `threads` workers.
+    /// Create a worker pool with the requested non-zero number of workers.
     ///
     /// # Errors
     ///
-    /// Returns the Rayon pool construction error, including when `threads` is zero.
-    pub fn new(threads: usize) -> std::result::Result<Self, rayon::ThreadPoolBuildError> {
+    /// Returns the Rayon pool construction error.
+    pub fn new(threads: NonZeroUsize) -> std::result::Result<Self, rayon::ThreadPoolBuildError> {
         let pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(threads)
+            .num_threads(threads.get())
             .build()?;
         Ok(Self {
             pool: Arc::new(pool),
@@ -72,18 +75,20 @@ impl Parallelism {
         R: Send,
         F: Fn(&T) -> R + Sync + Send,
     {
-        self.pool
-            .install(|| items.par_iter().map(task).collect())
+        self.pool.install(|| items.par_iter().map(task).collect())
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::num::NonZeroUsize;
+
     use super::Parallelism;
 
     #[test]
     fn maps_in_parallel_and_keeps_input_order() {
-        let parallelism = Parallelism::new(2).expect("create worker pool");
+        let parallelism = Parallelism::new(NonZeroUsize::new(2).expect("non-zero worker count"))
+            .expect("create worker pool");
         let output = parallelism.map(&[3, 1, 2], |value| value * 2);
 
         assert_eq!(output, [6, 2, 4]);
@@ -91,9 +96,21 @@ mod tests {
 
     #[test]
     fn spawned_work_returns_its_result_over_a_channel() {
-        let parallelism = Parallelism::new(1).expect("create worker pool");
-        let result = parallelism.spawn(|| 42).recv().expect("task sends its result");
+        let parallelism = Parallelism::new(NonZeroUsize::new(1).expect("non-zero worker count"))
+            .expect("create worker pool");
+        let result = parallelism
+            .spawn(|| 42)
+            .recv()
+            .expect("task sends its result");
 
         assert_eq!(result, 42);
+    }
+
+    #[test]
+    fn exposes_a_multi_producer_channel() {
+        let (sender, receiver) = Parallelism::channel();
+        sender.send("result").expect("receiver is open");
+
+        assert_eq!(receiver.recv().expect("sender sent a value"), "result");
     }
 }
