@@ -8,6 +8,7 @@ use pm::{
     plugin::{Loader, Registry, Trust, default_plugin_dir},
     policy::{BuildPolicy, Capability, UNMATCHED},
     progress::Progress,
+    recipe,
     run::PackageRunner,
     sandbox::CONTAINER_WORKDIR,
     signing::{
@@ -204,21 +205,24 @@ enum Commands {
         #[arg(long)]
         relative: bool,
     },
-    /// Convert a YAML build file to a Starlark `.package` file.
+    /// Convert a Starlark `.package` or YAML build file to a Rhai `.rhai` recipe.
     ///
-    /// Build files are Starlark now; YAML is deprecated. The new file describes the
-    /// same package. It is not signed - run `pm sign` on it - and YAML comments are
-    /// not carried over. The YAML file is left in place.
+    /// Recipes are Rhai now; Starlark and YAML are deprecated and still load, with
+    /// a warning, until support for them is removed. The new file describes the
+    /// same package. It is not signed - run `pm sign` on it - and comments are not
+    /// carried over. Starlark is evaluated, so loops and functions come out as the
+    /// steps they produced. The old file is left in place.
     Migrate {
-        /// The YAML build file to convert.
+        /// The Starlark or YAML build file to convert.
         file: PathBuf,
-        /// Where to write the result. Defaults to the input with a `.package` extension.
+        /// Where to write the result. Defaults to the input with a `.rhai` extension.
         #[arg(short, long, value_name = "PATH", conflicts_with_all = ["stdout", "recursive"])]
         output: Option<PathBuf>,
         /// Print the result instead of writing it.
         #[arg(long)]
         stdout: bool,
-        /// Also convert every YAML build file it depends on, and rename those dependencies.
+        /// Also convert every Starlark or YAML build file it depends on, and rename
+        /// those dependencies.
         ///
         /// Relative dependency paths are resolved against the current directory,
         /// as `pm build` does.
@@ -230,8 +234,8 @@ enum Commands {
     },
     /// Write an example build file to the given path.
     ///
-    /// A path ending in `.package` gets a Starlark file; anything else gets the
-    /// deprecated YAML form.
+    /// A path ending in `.rhai` gets a Rhai recipe. Starlark is deprecated and is
+    /// not generated; any other path gets the deprecated YAML form.
     Generate {
         /// Path the example build file is written to.
         file: PathBuf,
@@ -1462,7 +1466,7 @@ fn sibling(path: &Path, suffix: &str) -> PathBuf {
     PathBuf::from(name)
 }
 
-/// `pm migrate`: convert YAML build files to Starlark and report what to do next.
+/// `pm migrate`: convert Starlark and YAML build files to Rhai and report what to do next.
 ///
 /// # Errors
 ///
@@ -1511,9 +1515,21 @@ fn migrate_command(
 ///
 /// Fails if `file` exists and `force` is false, or if it cannot be written.
 fn generate(file: &Path, force: bool) -> miette::Result<()> {
-    let example = if star::is_starlark(file) {
-        star::render(&BuildFile::generate())?
+    let example = if recipe::is_rhai(file) {
+        recipe::render(&BuildFile::generate())?
+    } else if star::is_starlark(file) {
+        return Err(miette!(
+            help = format!(
+                "Recipes are Rhai now: `pm generate {}`.",
+                file.with_extension(recipe::EXTENSION).display()
+            ),
+            "Starlark recipes are deprecated and are not generated."
+        ));
     } else {
+        warn!(
+            file = %file.display(),
+            "YAML build files are deprecated; name the file `.rhai` to get a Rhai recipe"
+        );
         to_string(&BuildFile::generate()).into_diagnostic()?
     };
 

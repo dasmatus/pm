@@ -14,14 +14,17 @@ fn frame(message: &Value) -> Vec<u8> {
 
 /// Runs a whole LSP session and returns everything the server wrote to stdout.
 fn session(text: &str) -> String {
-    let uri = "file:///tmp/pm-lsp-test/build.package";
+    session_at("file:///tmp/pm-lsp-test/build.rhai", text)
+}
+
+fn session_at(uri: &str, text: &str) -> String {
     let mut input = Vec::new();
     for message in [
         json!({"jsonrpc": "2.0", "id": 1, "method": "initialize",
                "params": {"capabilities": {}, "rootUri": "file:///tmp/pm-lsp-test"}}),
         json!({"jsonrpc": "2.0", "method": "initialized", "params": {}}),
         json!({"jsonrpc": "2.0", "method": "textDocument/didOpen",
-               "params": {"textDocument": {"uri": uri, "languageId": "pm", "version": 1, "text": text}}}),
+               "params": {"textDocument": {"uri": uri, "languageId": "rhai", "version": 1, "text": text}}}),
         json!({"jsonrpc": "2.0", "id": 2, "method": "textDocument/hover",
                "params": {"textDocument": {"uri": uri}, "position": {"line": 0, "character": 1}}}),
         json!({"jsonrpc": "2.0", "id": 3, "method": "shutdown"}),
@@ -47,9 +50,11 @@ fn session(text: &str) -> String {
 
 #[test]
 fn flags_undefined_names_and_documents_builtins() {
-    let out = session("package(name = \"a\", version = \"1\", steps = [stpe(1)])\n");
+    let out = session("package(#{ name: \"a\", version: \"1\", steps: [stpe(1)] });\n");
     assert!(out.contains("publishDiagnostics"), "{out}");
-    assert!(out.contains("undefined variable `stpe`"), "{out}");
+    assert!(out.contains("stpe"), "{out}");
+    // The error points at the call, not the start of the file.
+    assert!(out.contains("\"character\":44"), "{out}");
     assert!(
         out.contains("Declare the package this file builds"),
         "{out}"
@@ -64,7 +69,18 @@ fn reports_syntax_errors() {
 }
 
 #[test]
-fn known_builtins_are_not_flagged() {
-    let out = session("package(\"a\", \"1\", steps = [step(Prepare, \"x\", [])])\n");
-    assert!(!out.contains("undefined"), "{out}");
+fn a_valid_recipe_has_no_diagnostics() {
+    let out =
+        session("package(#{ name: \"a\", version: \"1\", steps: [step(Prepare, \"x\", [])] });\n");
+    assert!(out.contains("\"diagnostics\":[]"), "{out}");
+}
+
+#[test]
+fn starlark_files_are_flagged_as_deprecated() {
+    let out = session_at(
+        "file:///tmp/pm-lsp-test/build.package",
+        "package(name = \"a\", version = \"1\")\n",
+    );
+    assert!(out.contains("pm migrate"), "{out}");
+    assert!(out.contains("\"severity\":2"), "{out}");
 }

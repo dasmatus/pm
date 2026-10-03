@@ -38,17 +38,19 @@ clap = { version = "4.6.6", features = ["derive"] }
 dialoguer = "0.12.0"
 either = { version = "1.18.0", features = ["serde"] }
 hakoniwa = { version = "1.7.2", features = ["landlock"] }
+lsp-server = "0.10.0"
+lsp-types = "0.97.0"
 miette = { version = "7.6.0", features = ["fancy"] }
 minreq = { version = "3.0.0", features = ["https-rustls"] }
 nix = { version = "0.31.3", features = ["fs", "mount", "process", "ptrace", "reboot", "signal", "term"] }
 nom = "8.0.0"
 rayon = "1.12.0"
+rhai = { version = "1.26.1", features = ["no_module", "no_time", "only_i64", "serde"] }
 ring = "0.17.14"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 serde_yaml = "0.9.34"
 starlark = "0.14.2"
-starlark_lsp = "0.14.2"
 tempfile = "3.27.0"
 tracing = "0.1.44"
 tracing-subscriber = "0.3.23"

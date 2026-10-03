@@ -36,6 +36,7 @@ use crate::{
     plugin::Registry,
     policy::BuildPolicy,
     progress::{Progress, Task},
+    recipe,
     sandbox::BuildSandbox,
     signing::{TrustStore, verify_file},
     star,
@@ -179,8 +180,9 @@ impl BuildFile {
         }
     }
 
-    /// Parse a signed build file from disk: Starlark if it ends in `.package`,
-    /// otherwise (deprecated) YAML.
+    /// Parse a signed build file from disk: a Rhai recipe if it ends in `.rhai`,
+    /// otherwise (deprecated) Starlark if it ends in `.package`, otherwise
+    /// (deprecated) YAML.
     ///
     /// The detached signature at `<path>.sig` is verified against the local
     /// trust store **before** the file is parsed, and every dependency loaded
@@ -454,19 +456,28 @@ impl BuildFile {
         }
     }
 
-    /// Parse the build file at `path` - Starlark if it ends in `.package`, YAML
-    /// otherwise - recording where it came from and how far it was trusted.
+    /// Parse the build file at `path` - Rhai if it ends in `.rhai`, Starlark if
+    /// it ends in `.package`, YAML otherwise - recording where it came from and
+    /// how far it was trusted. The last two are deprecated and warn.
     fn parse(path: &Path, verification: Verification) -> miette::Result<Self> {
         let text = read_to_string(path)
             .into_diagnostic()
             .wrap_err_with(|| format!("cannot read build file {}", path.display()))?;
-        let mut build_file: Self = if star::is_starlark(path) {
+        let mut build_file: Self = if recipe::is_rhai(path) {
+            recipe::parse(&path.display().to_string(), text)
+                .wrap_err_with(|| format!("cannot evaluate recipe {}", path.display()))?
+        } else if star::is_starlark(path) {
+            warn!(
+                file = %path.display(),
+                "Starlark recipes are deprecated and will stop loading in a future release; \
+                 convert it to Rhai with `pm migrate`"
+            );
             star::parse(&path.display().to_string(), text)
                 .wrap_err_with(|| format!("cannot evaluate build file {}", path.display()))?
         } else {
             warn!(
                 file = %path.display(),
-                "YAML build files are deprecated; convert it with `pm migrate`"
+                "YAML build files are deprecated; convert it to Rhai with `pm migrate`"
             );
             from_str(&text)
                 .into_diagnostic()

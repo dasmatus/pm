@@ -27,7 +27,7 @@ on:
 # paths and a key.
 #
 # `examples/demo.sh` is NOT run here and stays a local gate. It builds the whole
-# `.package` example chain and then builds pm with pm, which means cargo resolving and
+# `.rhai` example chain and then builds pm with pm, which means cargo resolving and
 # downloading a dependency graph from inside the build jail. That is the most
 # valuable end-to-end check this repository has and also the one with the most
 # ways to fail for reasons that are not this crate's fault; it wants running by

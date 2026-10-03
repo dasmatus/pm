@@ -1,5 +1,5 @@
 return {
     cmd = { "pm-lsp" },
-    filetypes = { "pm" },
+    filetypes = { "rhai", "pm" },
     root_markers = { ".git" },
 }

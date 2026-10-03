@@ -1,51 +1,66 @@
 # pm
 
 Build signed recipes into `.cpkg` archives and run their entrypoints in a Linux
-sandbox. See [the examples](examples/README.md) for `.package` recipe syntax and signing.
+sandbox. See [the examples](examples/README.md) for `.rhai` recipe syntax and signing.
 
-## Build files are Starlark
+## Recipes are Rhai
 
-Recipes are [Starlark](https://github.com/bazelbuild/starlark) programs in
-`*.package` files that call `package(...)` once, with `step(...)` for each
-build step. Loops, functions and comprehensions generate steps and commands;
-evaluation is hermetic (no I/O, no `load()`) and happens before the policy is
+Recipes are [Rhai](https://rhai.rs) scripts in `*.rhai` files that call
+`package(#{ ... })` once, with `step(...)` for each build step. Rhai has no
+keyword arguments, so `package` takes an object map. Loops, functions and
+conditionals generate steps and commands; evaluation is hermetic (no I/O, no
+clock, no `import` or `eval`), runs under operation and size limits so a
+runaway loop is an error rather than a hang, and happens before the policy is
 derived and before anything runs.
 
-```python
-package(
-    name = "hello",
-    version = "1.0.0",
-    steps = [
+```rhai
+package(#{
+    name: "hello",
+    version: "1.0.0",
+    steps: [
         step(Install, "stage", ["install -Dm755 /usr/bin/echo /dest/usr/bin/hello"]),
     ],
-)
+});
 ```
 
-* `pm generate build.package` writes a starter file.
-* `pm migrate build.yaml` converts a YAML recipe (`-r` follows its YAML
-  dependencies). YAML recipes still load but are deprecated; migrated files are
-  unsigned, so run `pm sign` on them.
-* `pm-lsp` is a language server (diagnostics, completion, hover) for `.package`
-  files, and [`editors/`](editors/README.md) has tree-sitter queries and
-  Zed and Neovim integrations that use it.
+* `pm generate build.rhai` writes a starter file.
+* `pm-lsp` is a language server (diagnostics, completion, hover) for `.rhai`
+  recipes, and [`editors/`](editors/README.md) has Zed and Neovim integrations
+  that use it.
+
+### Moving off Starlark and YAML
+
+Recipes used to be Starlark `.package` files, and before that YAML. Both still
+load, so nothing breaks today, but each load logs a deprecation warning and
+support will be removed in a future release.
+
+* `pm migrate build.package` writes `build.rhai` next to it, describing the same
+  package. `pm migrate build.yaml` does the same for YAML. `-r` also converts
+  every Starlark or YAML recipe it depends on and points the dependency paths at
+  the new files; `--stdout` prints instead of writing.
+* The Starlark is evaluated, not translated, so loops and functions come out as
+  the steps they produced, written out literally. Comments are not carried over.
+* A signature covers one file's bytes, so sign the new file with `pm sign`.
+* The old file is left in place. Delete it, and its `.sig`, once the `.rhai`
+  file is signed and builds.
 
 ## Shipping a kernel
 
 A package can ship its own Linux kernel. Install the image into `DESTDIR` with
-the package's steps and name it in `package(...)`:
+the package's steps and name it in `package(#{ ... })`:
 
-```python
-package(
-    name = "hello",
-    version = "1.0.0",
-    steps = [
+```rhai
+package(#{
+    name: "hello",
+    version: "1.0.0",
+    steps: [
         step(Install, "stage", [
             "install -Dm644 /path/to/vmlinuz /dest/boot/vmlinuz",
             "install -Dm755 /path/to/hello /dest/usr/bin/hello",
         ]),
     ],
-    kernel = kernel(image = "boot/vmlinuz", cmdline = "mitigations=off"),
-)
+    kernel: kernel("boot/vmlinuz", "mitigations=off"),
+});
 ```
 
 `image` is relative to `DESTDIR`. The build fails if the steps did not install
