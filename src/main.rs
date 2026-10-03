@@ -282,6 +282,14 @@ enum Commands {
         /// read what it asked for.
         #[arg(long)]
         enforce: bool,
+        /// Run a package that ships its own kernel on the host's kernel.
+        ///
+        /// A package built with `kernel = kernel(image = ...)` normally boots that
+        /// kernel in a QEMU virtual machine and runs the program inside it. This
+        /// runs it in the usual namespace jail instead, ignoring its kernel. No
+        /// effect on a package that ships none.
+        #[arg(long)]
+        host_kernel: bool,
     },
     /// Print the permission profile recorded in a package.
     ///
@@ -403,6 +411,12 @@ enum Commands {
 }
 
 fn main() -> miette::Result<()> {
+    // Inside a package's virtual machine this binary is init, and nothing below -
+    // logging, argument parsing - applies to it.
+    if pm::vm::guest::is_guest_init() {
+        pm::vm::guest::run();
+    }
+
     // Logging is initialised before parsing so that argument-parsing failures
     // are logged too, which means `--verbose` has to be read off the raw
     // arguments: clap has not run yet and cannot be asked.
@@ -466,6 +480,7 @@ fn main() -> miette::Result<()> {
             network,
             audit,
             enforce,
+            host_kernel,
         } => {
             if !package.exists() {
                 return Err(miette!("The path {} does not exist.", package.display()));
@@ -500,7 +515,11 @@ fn main() -> miette::Result<()> {
             // the `exit` below, keeping the claim above literally true.
             let status = {
                 let mut runner = PackageRunner::new(package);
-                runner.allow_network(network).audit(audit).enforce(enforce);
+                runner
+                    .allow_network(network)
+                    .audit(audit)
+                    .enforce(enforce)
+                    .host_kernel(host_kernel);
                 runner.run(bin)?
             };
             if !status.success() {

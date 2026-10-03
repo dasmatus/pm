@@ -112,6 +112,9 @@ const CONTAINER_START_FAILURE: i32 = 125;
 /// silently shadow the more specific mount.
 const ROOTFS_ROOTS: [&str; 7] = ["/bin", "/etc", "/lib", "/lib32", "/lib64", "/sbin", "/usr"];
 
+/// The binary `pm run` looks for beside itself to run as a virtual machine's init.
+const GUEST_INIT: &str = "pm-vm-init";
+
 /// Package-root file a profile may be recorded in, when it is not inside the
 /// `metadata` member.
 ///
@@ -205,6 +208,12 @@ pub struct PackageRunner {
     audit: bool,
     /// Apply the recorded profile even when it is only in audit mode.
     enforce: bool,
+    /// Run a package that ships its own kernel in the jail on the host's kernel.
+    host_kernel: bool,
+    /// The binary that runs as the guest's init; see [`PackageRunner::guest_init`].
+    guest_init: Option<PathBuf>,
+    /// The QEMU to boot a package's kernel with; found on `PATH` when `None`.
+    qemu: Option<PathBuf>,
 }
 
 impl PackageRunner {
@@ -221,7 +230,39 @@ impl PackageRunner {
             trust_dir: None,
             audit: false,
             enforce: false,
+            host_kernel: false,
+            guest_init: None,
+            qemu: None,
         }
+    }
+
+    /// Run a package that ships its own kernel on the host's kernel instead.
+    ///
+    /// By default such a package boots its kernel in a virtual machine (see
+    /// [`crate::vm`]); with `true` it runs in the same namespace jail as any other
+    /// package, and its kernel image is ignored.
+    pub fn host_kernel(&mut self, host_kernel: bool) -> &mut Self {
+        self.host_kernel = host_kernel;
+        self
+    }
+
+    /// Use `binary` as the guest's init when booting a package's kernel.
+    ///
+    /// It must be a pm binary whose `main` hands over to
+    /// [`crate::vm::guest::run`] when [`crate::vm::guest::is_guest_init`] holds:
+    /// `pm-vm-init` or `pm`. The default is `pm-vm-init` beside the running
+    /// executable, or the running executable itself when there is none, which is
+    /// right for `pm`; a caller that is not `pm` - a test harness - has to name one.
+    pub fn guest_init(&mut self, binary: PathBuf) -> &mut Self {
+        self.guest_init = Some(binary);
+        self
+    }
+
+    /// Boot a package's kernel with this QEMU instead of `qemu-system-x86_64`
+    /// from `PATH`.
+    pub fn qemu(&mut self, qemu: PathBuf) -> &mut Self {
+        self.qemu = Some(qemu);
+        self
     }
 
     /// Lets the sandboxed entrypoint reach the network.
@@ -435,6 +476,17 @@ impl PackageRunner {
         // be handed the in-container path.
         let host_bin = package_root.join(&entrypoint);
 
+        if let Some(kernel) = metadata.kernel() {
+            if self.host_kernel {
+                info!(
+                    "the package ships its own kernel; --host-kernel runs it in the jail on \
+                     the host's kernel instead"
+                );
+            } else {
+                return self.run_in_vm(&metadata, kernel, &package_root, &entrypoint, &profile);
+            }
+        }
+
         if self.audit {
             if self.enforce {
                 warn!(
@@ -555,6 +607,70 @@ impl PackageRunner {
             status.code, status.reason
         );
         Ok(status)
+    }
+
+    /// Boot the package's own kernel and run `entrypoint` under it.
+    ///
+    /// Everything about the jail is replaced by the virtual machine, including the
+    /// landlock profile: the guest holds the package and the libraries its programs
+    /// link and nothing else, so there is nothing outside the profile for landlock
+    /// to deny. `--network` and `--audit` have no meaning there and are refused
+    /// rather than ignored.
+    fn run_in_vm(
+        &self,
+        metadata: &Metadata,
+        kernel: &crate::vm::Kernel,
+        package_root: &Path,
+        entrypoint: &Path,
+        profile: &Profile,
+    ) -> miette::Result<ExitStatus> {
+        if self.audit {
+            return Err(miette!(
+                help = "audit it on the host kernel with --host-kernel --audit",
+                "{} ships its own kernel; --audit traces a host process and cannot see \
+                 inside the virtual machine",
+                self.path.display()
+            ));
+        }
+        if self.network {
+            return Err(miette!(
+                help = "run it on the host kernel with --host-kernel --network",
+                "{} ships its own kernel, and its virtual machine has no network device",
+                self.path.display()
+            ));
+        }
+        if self.enforce || profile.enforcement.denies() {
+            info!(
+                grants = profile.permissions.len(),
+                "the virtual machine holds only the package and its libraries, so the \
+                 recorded profile has nothing left to deny and is not applied inside it"
+            );
+        }
+        let programs = metadata
+            .entrypoints()
+            .filter_map(|(path, _)| Self::resolve_entrypoint(package_root, path).ok())
+            .collect();
+        let init = match &self.guest_init {
+            Some(init) => init.clone(),
+            None => {
+                let exe = env::current_exe()
+                    .into_diagnostic()
+                    .wrap_err("cannot find pm's own binary to run as the guest's init")?;
+                // The dedicated init is a fraction of pm's size; pm itself works too.
+                exe.parent()
+                    .map(|dir| dir.join(GUEST_INIT))
+                    .filter(|init| init.is_file())
+                    .unwrap_or(exe)
+            }
+        };
+        crate::vm::boot(&crate::vm::Boot {
+            kernel,
+            package_root,
+            entrypoint,
+            programs,
+            init: &init,
+            qemu: self.qemu.as_deref(),
+        })
     }
 
     /// Reads the permission profile the package recorded, from the `metadata`

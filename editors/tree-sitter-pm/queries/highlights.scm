@@ -279,7 +279,7 @@
 ;; pm-specific builtins and keywords
 ((call
   function: (identifier) @function.builtin)
- (#any-of? @function.builtin "package" "step")
+ (#any-of? @function.builtin "package" "step" "kernel")
  (#set! "priority" 110))
 
 ((identifier) @constant.builtin
@@ -288,5 +288,5 @@
 
 ((keyword_argument
   name: (identifier) @property)
- (#any-of? @property "name" "stage" "run" "dl_urls" "version" "dependencies" "steps")
+ (#any-of? @property "name" "stage" "run" "dl_urls" "version" "dependencies" "steps" "kernel" "image" "cmdline")
  (#set! "priority" 110))

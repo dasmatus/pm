@@ -41,6 +41,7 @@ use crate::{
     star,
     step::{Stage, Step},
     text::comma_join,
+    vm::{ImageFormat, Kernel},
     workspace::Workspace,
 };
 
@@ -134,6 +135,10 @@ pub struct BuildFile {
     version: Vec<String>,
     dependencies: Vec<PathBuf>,
     steps: Vec<Step>,
+    /// The kernel the package ships, staged by its own steps. `None` runs the
+    /// package on the host's kernel.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    kernel: Option<Kernel>,
 
     /// Canonical path this build file was loaded from, used to seed cycle
     /// detection. Never serialised: it is a property of the file on disk, not
@@ -168,6 +173,7 @@ impl BuildFile {
                 name: "fetch".into(),
                 run: Vec::new(),
             }],
+            kernel: None,
             source: None,
             verification: Verification::Unverified,
         }
@@ -411,6 +417,12 @@ impl BuildFile {
         Ok(used)
     }
 
+    /// The kernel this package ships, if the build file declares one.
+    #[must_use]
+    pub fn kernel(&self) -> Option<&Kernel> {
+        self.kernel.as_ref()
+    }
+
     /// The build steps, in the order the file declares them.
     ///
     /// Sorting into execution order is [`BuildFile::execute_steps`]'s job; this
@@ -576,7 +588,15 @@ impl BuildFile {
 
         // Collect entrypoints BEFORE writing `metadata`, so the metadata file
         // does not end up listing itself as a runnable entrypoint.
-        let entrypoints = collect_entrypoints(&staging)?;
+        let mut entrypoints = collect_entrypoints(&staging)?;
+        if let Some(kernel) = &self.kernel {
+            let target = self.check_kernel(kernel, &staging)?;
+            // A kernel image is booted, never run as a program, even when the
+            // install step left an execute bit on it. When the declared path is a
+            // symlink, the file it points at is the image too.
+            entrypoints.remove(&kernel.image);
+            entrypoints.remove(&target);
+        }
         // A package with no entrypoints is legitimate - metadata-only and
         // data-only packages exist - but it is far more often a build whose
         // steps ran yet installed nothing into DESTDIR. Say so rather than
@@ -590,7 +610,7 @@ impl BuildFile {
         }
         let permissions =
             self.derive_permissions(env.options.plugins, &workdir, &staging, &entrypoints)?;
-        let metadata = Metadata::create(
+        let mut metadata = Metadata::create(
             self.name.clone(),
             self.version.clone(),
             dependency_entries,
@@ -602,6 +622,9 @@ impl BuildFile {
             // nothing on the build path may make it.
             Enforcement::Audit,
         );
+        if let Some(kernel) = &self.kernel {
+            metadata = metadata.with_kernel(kernel.clone());
+        }
         write(
             staging.join("metadata"),
             metadata_yaml(&metadata, env.policy.fingerprint())?,
@@ -615,6 +638,53 @@ impl BuildFile {
         // dependency (goblin/object + a patchelf-equivalent writer); the crate
         // has none and the contract forbids adding one.
         package(&staging, archive)
+    }
+
+    /// Check that the steps staged the kernel this package declares.
+    ///
+    /// The image must be a regular file inside `staging` - a symlink is followed, but
+    /// only as far as somewhere else in the package - and must carry a Linux kernel
+    /// image header. Checked here rather than when the package runs, so a recipe
+    /// that names the wrong file fails its own build instead of every machine that
+    /// later tries to boot it.
+    ///
+    /// Returns the path, relative to `staging`, of the file the image resolves to.
+    fn check_kernel(&self, kernel: &Kernel, staging: &Path) -> miette::Result<PathBuf> {
+        kernel
+            .validate()
+            .wrap_err_with(|| format!("{} declares an invalid kernel", self.name))?;
+        let staged = staging.join(&kernel.image);
+        let resolved = staged.canonicalize().into_diagnostic().wrap_err_with(|| {
+            format!(
+                "{} declares the kernel {}, but its steps did not install it into DESTDIR",
+                self.name,
+                kernel.image.display()
+            )
+        })?;
+        let root = staging.canonicalize().into_diagnostic()?;
+        let Ok(target) = resolved.strip_prefix(&root) else {
+            return Err(miette!(
+                "the kernel {} of {} resolves to {}, outside the package",
+                kernel.image.display(),
+                self.name,
+                resolved.display()
+            ));
+        };
+        if !resolved.is_file() {
+            return Err(miette!(
+                "the kernel {} of {} is not a regular file",
+                kernel.image.display(),
+                self.name
+            ));
+        }
+        let format = ImageFormat::of(&resolved)?;
+        info!(
+            package = %self.name,
+            image = %kernel.image.display(),
+            ?format,
+            "package ships its own kernel"
+        );
+        Ok(target.to_path_buf())
     }
 
     /// Derive the run-time permission profile of the package that was just staged.

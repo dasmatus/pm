@@ -51,6 +51,7 @@ that signed unit.
 | `version` | string **or** list of strings | `"0.1.0"` and `["0", "1", "0"]` are equivalent |
 | `dependencies` | list of **paths to build files or `.cpkg` archives** | no registry, no names, no version constraints |
 | `steps` | list of `step(...)` values | may be empty |
+| `kernel` | `kernel(image, cmdline = None)` or `None` | a kernel the package ships; see [Shipping a kernel](../README.md#shipping-a-kernel) |
 
 A step (`Step` in `src/step.rs`) is built with `step(...)`:
 

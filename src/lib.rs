@@ -37,6 +37,8 @@ pub mod star;
 pub mod step;
 /// Small text-formatting helpers shared by the library and the binaries.
 pub mod text;
+/// Packages that ship their own kernel, booted in a virtual machine.
+pub mod vm;
 /// Types and framing that cross the boundary between the daemon and its
 /// clients or its own worker.
 pub mod wire;
