@@ -124,6 +124,29 @@ fn a_declared_kernel_is_recorded_and_is_not_an_entrypoint() {
 }
 
 #[test]
+fn the_file_a_kernel_symlink_points_at_is_not_an_entrypoint_either() {
+    let work = tempdir().unwrap();
+    let image = work.path().join("vmlinuz");
+    fake_bzimage(&image);
+    let script = format!(
+        "set -eu\n\
+         install -Dm755 {} \"$DESTDIR/boot/vmlinuz-6.8\"\n\
+         ln -s vmlinuz-6.8 \"$DESTDIR/boot/vmlinuz\"\n\
+         mkdir -p \"$DESTDIR/usr/bin\"\n\
+         printf '#!/bin/sh\\nexit 0\\n' > \"$DESTDIR/usr/bin/hello\"\n\
+         chmod 755 \"$DESTDIR/usr/bin/hello\"\n",
+        image.display()
+    );
+    let archive = build(work.path(), "kernel(image = \"boot/vmlinuz\")", &script)
+        .expect("the build must succeed");
+    let dest = extract(&archive);
+    let metadata: Metadata =
+        from_str(&read_to_string(dest.path().join("metadata")).unwrap()).unwrap();
+    let entrypoints: Vec<_> = metadata.entrypoints().map(|(path, _)| path).collect();
+    assert_eq!(entrypoints, [Path::new("usr/bin/hello")]);
+}
+
+#[test]
 fn a_kernel_the_steps_never_installed_fails_the_build() {
     let work = tempdir().unwrap();
     let error = build(
@@ -219,17 +242,29 @@ fn kernelled_package(work: &Path, kernel: Kernel) -> PathBuf {
 
 /// A stand-in for `qemu-system-x86_64` that writes its arguments to
 /// `<out>/args`, keeps the initramfs as `<out>/initrd`, and reports `exit 7` on
-/// the status port the way pm's init would.
+/// the status socket the way pm's init would.
 fn fake_qemu(out: &Path) -> PathBuf {
     let script = out.join("qemu");
     write(
         &script,
         format!(
-            "#!/bin/sh\nset -eu\nout={}\nprintf '%s\\n' \"$@\" > \"$out/args\"\nprev=\nstatus=\n\
-             for a in \"$@\"; do\n  if [ \"$prev\" = -initrd ]; then cp \"$a\" \"$out/initrd\"; fi\n  \
-             case \"$a\" in file:*) status=\"${{a#file:}}\" ;; esac\n  prev=\"$a\"\ndone\n\
-             printf 'exit 7\\r\\n' > \"$status\"\n",
-            out.display()
+            r#"#!/usr/bin/env python3
+import shutil, socket, sys
+out = {out:?}
+args = sys.argv[1:]
+with open(out + "/args", "w") as f:
+    f.write("".join(a + "\n" for a in args))
+for flag, value in zip(args, args[1:]):
+    if flag == "-initrd":
+        shutil.copy(value, out + "/initrd")
+    if flag == "-chardev":
+        options = dict(o.split("=", 1) for o in value.replace(",,", "\0").split(",")[1:])
+        status = socket.socket(socket.AF_UNIX)
+        status.connect(options["path"].replace("\0", ","))
+        status.sendall(b"exit 7\r\n")
+        status.close()
+"#,
+            out = out.display().to_string()
         ),
     )
     .unwrap();
@@ -310,12 +345,11 @@ fn a_kernelled_package_boots_its_kernel_with_an_initramfs_of_itself() {
             + 1]
     };
     assert!(after("-kernel").ends_with("boot/vmlinuz"), "{args:?}");
+    // The package's parameters go before the ones pm relies on, so a repeated
+    // parameter cannot override them.
     let append = after("-append");
-    assert!(append.contains("rdinit=/init"), "{append}");
-    assert!(
-        append.contains("mitigations=off -- __pm-vm-init"),
-        "{append}"
-    );
+    assert!(append.contains("mitigations=off console=ttyS0"), "{append}");
+    assert!(append.ends_with("rdinit=/init -- __pm-vm-init"), "{append}");
     assert_eq!(after("-nic"), "none");
 
     let names = cpio_names(&read(work.path().join("initrd")).unwrap());
@@ -396,6 +430,25 @@ fn a_kernel_path_in_the_metadata_that_escapes_the_package_is_refused() {
         "{}",
         chain(&error)
     );
+    assert!(
+        !work.path().join("args").exists(),
+        "QEMU must not have started"
+    );
+}
+
+#[test]
+fn a_cmdline_in_the_metadata_that_picks_init_is_refused() {
+    let work = tempdir().unwrap();
+    let archive = kernelled_package(
+        work.path(),
+        Kernel {
+            image: PathBuf::from("boot/vmlinuz"),
+            cmdline: Some("rdinit=/pkg/usr/bin/hello".into()),
+        },
+    );
+    let qemu = fake_qemu(work.path());
+    let error = runner(archive, qemu).run(Some("hello".into())).unwrap_err();
+    assert!(chain(&error).contains("rdinit"), "{}", chain(&error));
     assert!(
         !work.path().join("args").exists(),
         "QEMU must not have started"

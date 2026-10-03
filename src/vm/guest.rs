@@ -42,10 +42,7 @@ pub const INIT_ARG: &str = "__pm-vm-init";
 /// parameter it does not recognise into an environment variable for init, so it
 /// holds whatever the package's command line said.
 const ENVIRONMENT: [(&str, &str); 4] = [
-    (
-        "PATH",
-        "/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bin:/sbin",
-    ),
+    ("PATH", super::GUEST_PATH),
     ("HOME", "/tmp"),
     ("TMPDIR", "/tmp"),
     ("LC_ALL", "C"),

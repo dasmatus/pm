@@ -57,11 +57,21 @@ use std::{
     collections::BTreeMap,
     env,
     ffi::OsString,
-    fs::{File, OpenOptions, read_to_string},
-    io::{BufWriter, Read},
-    os::unix::fs::PermissionsExt,
+    fs::{File, OpenOptions},
+    io::{BufWriter, ErrorKind, Read},
+    os::unix::{
+        ffi::{OsStrExt, OsStringExt},
+        fs::PermissionsExt,
+        net::UnixListener,
+    },
     path::{Component, Path, PathBuf},
     process::{Command, Stdio},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    thread,
+    time::Duration,
 };
 
 use hakoniwa::ExitStatus;
@@ -82,6 +92,21 @@ const GUEST_CONFIG: &str = "/pm-vm.json";
 
 /// The serial port init reports the entrypoint's exit on. `ttyS0` is the console.
 const STATUS_PORT: &str = "/dev/ttyS1";
+
+/// The `PATH` the entrypoint starts with, which is also where `#!/usr/bin/env
+/// program` scripts find `program` ([`closure`]).
+pub(crate) const GUEST_PATH: &str = "/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bin:/sbin";
+
+/// The most of init's report pm keeps. A report is one short line; the guest can
+/// write as much as it likes to the port, and everything past this is discarded.
+const MAX_REPORT: usize = 4096;
+
+/// `e_machine` of an x86-64 ELF file.
+const EM_X86_64: u16 = 62;
+
+/// Kernel parameters pm sets itself and a package cannot: they decide which
+/// program runs as init.
+const RESERVED_PARAMETERS: [&str; 2] = ["init", "rdinit"];
 
 /// The longest extra command line a package may ask for.
 ///
@@ -108,7 +133,8 @@ const NO_REPORT: i32 = 125;
 pub struct Kernel {
     /// The kernel image, relative to the package root, e.g. `boot/vmlinuz`.
     pub image: PathBuf,
-    /// Extra kernel command-line parameters, appended after pm's own.
+    /// Extra kernel command-line parameters. pm's own come after them, so where the
+    /// kernel takes the last of a repeated parameter, pm's wins.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cmdline: Option<String>,
 }
@@ -119,7 +145,8 @@ impl Kernel {
     /// The image has to be a plain package-relative path outside `deps/`, which
     /// belongs to other packages, and must not be the `metadata` member. The command
     /// line cannot contain `--`, after which the kernel hands everything to init,
-    /// nor a NUL or a line break, and is capped at [`MAX_CMDLINE`] bytes.
+    /// nor `init=` or `rdinit=`, which would replace pm's init, nor a NUL or a line
+    /// break, and is capped at [`MAX_CMDLINE`] bytes.
     ///
     /// Run at build time on the recipe and again at run time on the metadata, which
     /// is as untrusted as the rest of the archive.
@@ -167,6 +194,15 @@ impl Kernel {
                      pm's init"
                 ));
             }
+            if let Some(word) = cmdline.split_whitespace().find(|word| {
+                let name = word.split_once('=').map_or(*word, |(name, _)| name);
+                RESERVED_PARAMETERS.contains(&name)
+            }) {
+                return Err(miette!(
+                    "the kernel command line cannot set `{word}`: pm decides which program \
+                     runs as the guest's init"
+                ));
+            }
         }
         Ok(())
     }
@@ -177,8 +213,11 @@ impl Kernel {
 pub enum ImageFormat {
     /// An x86 `bzImage`, which is what `vmlinuz` usually is.
     BzImage,
-    /// An uncompressed ELF `vmlinux`.
-    Elf,
+    /// An uncompressed ELF `vmlinux` for the given `e_machine`.
+    Elf {
+        /// The ELF header's `e_machine`, e.g. 62 for x86-64.
+        machine: u16,
+    },
     /// An arm64 `Image`.
     Arm64,
     /// A RISC-V `Image`.
@@ -212,7 +251,18 @@ impl ImageFormat {
         let at =
             |offset: usize, magic: &[u8]| header.get(offset..offset + magic.len()) == Some(magic);
         if at(0, b"\x7fELF") {
-            Ok(Self::Elf)
+            // `e_machine` is at the same offset in both ELF classes; read it in the
+            // byte order `EI_DATA` names.
+            let machine = header.get(18..20).ok_or_else(|| {
+                miette!("{} is too short to be an ELF kernel image", path.display())
+            })?;
+            let machine = [machine[0], machine[1]];
+            let machine = if header.get(5) == Some(&2) {
+                u16::from_be_bytes(machine)
+            } else {
+                u16::from_le_bytes(machine)
+            };
+            Ok(Self::Elf { machine })
         } else if at(0x202, b"HdrS") {
             Ok(Self::BzImage)
         } else if at(0x38, b"ARM\x64") {
@@ -226,6 +276,14 @@ impl ImageFormat {
                 path.display()
             ))
         }
+    }
+}
+
+impl ImageFormat {
+    /// Whether QEMU's x86-64 `pc` machine can boot this image.
+    #[must_use]
+    pub fn boots_on_x86_64(self) -> bool {
+        matches!(self, Self::BzImage | Self::Elf { machine: EM_X86_64 })
     }
 }
 
@@ -280,7 +338,7 @@ pub fn boot(request: &Boot<'_>) -> miette::Result<ExitStatus> {
     let image = resolve_inside(request.package_root, &request.kernel.image)
         .wrap_err("the package's kernel image cannot be booted")?;
     let format = ImageFormat::of(&image)?;
-    if !matches!(format, ImageFormat::BzImage | ImageFormat::Elf) {
+    if !format.boots_on_x86_64() {
         return Err(miette!(
             help = "run it on the host kernel with --host-kernel",
             "the package's kernel is an {format:?} image, which an x86-64 host cannot boot"
@@ -300,13 +358,27 @@ pub fn boot(request: &Boot<'_>) -> miette::Result<ExitStatus> {
     // Declared before the child below, so it is removed only after QEMU is gone.
     let scratch = Workspace::new("vm")?;
     let initramfs = scratch.path().join("initramfs.cpio");
-    let status_file = scratch.path().join("status");
     let tree = Tree::assemble(request, &image)?;
     let size = tree.write(&initramfs)?;
     let memory = BASE_MEMORY_MIB + 3 * size.div_ceil(1024 * 1024);
 
+    // The status port goes to a socket pm reads, not to a file: the guest can write
+    // as much as it likes to the port, and only the last [`MAX_REPORT`] bytes are
+    // kept. QEMU connects to it as a client when it starts.
+    let socket = scratch.path().join("status.sock");
+    let listener = UnixListener::bind(&socket)
+        .into_diagnostic()
+        .wrap_err_with(|| format!("cannot listen on {}", socket.display()))?;
+    listener.set_nonblocking(true).into_diagnostic()?;
+    let mut status_device = OsString::from("socket,id=status,path=");
+    status_device.push(qemu_option_value(&socket));
+
+    // pm's defaults, then the package's parameters, then the ones pm relies on. The
+    // kernel keeps the last value of a repeated parameter, so a package can turn
+    // the log level up but cannot change `panic`, nor which console is
+    // `/dev/console`; `rdinit` it cannot set at all.
     let cmdline = format!(
-        "console=ttyS0 panic=-1 quiet loglevel=1 rdinit=/init {} -- {}",
+        "quiet loglevel=1 {} console=ttyS0 panic=-1 rdinit=/init -- {}",
         request.kernel.cmdline.as_deref().unwrap_or(""),
         guest::INIT_ARG
     );
@@ -327,8 +399,9 @@ pub fn boot(request: &Boot<'_>) -> miette::Result<ExitStatus> {
         .args(["-smp", &cpus.to_string()])
         .args(["-nic", "none"])
         .args(["-serial", "stdio"])
-        .arg("-serial")
-        .arg(prefixed("file:", &status_file))
+        .arg("-chardev")
+        .arg(status_device)
+        .args(["-serial", "chardev:status"])
         .arg("-kernel")
         .arg(&image)
         .arg("-initrd")
@@ -351,9 +424,16 @@ pub fn boot(request: &Boot<'_>) -> miette::Result<ExitStatus> {
         .wrap_err_with(|| format!("cannot start {program}"))?;
     // Declared after `scratch`, therefore dropped - and QEMU killed - before it.
     let child = HostChild::new(child, program.clone());
-    let exited = child.wait()?;
+    let done = Arc::new(AtomicBool::new(false));
+    let reader = {
+        let done = Arc::clone(&done);
+        thread::spawn(move || read_report(&listener, &done))
+    };
+    let exited = child.wait();
+    done.store(true, Ordering::Release);
+    let report = reader.join().unwrap_or_default();
+    let exited = exited?;
 
-    let report = read_to_string(&status_file).unwrap_or_default();
     let status = parse_report(&report);
     if status.is_none() && !exited.success() {
         return Err(miette!(
@@ -369,6 +449,79 @@ pub fn boot(request: &Boot<'_>) -> miette::Result<ExitStatus> {
                 .to_owned(),
         )
     }))
+}
+
+/// Accept QEMU's connection on the status socket and read it until QEMU closes it,
+/// keeping only the last [`MAX_REPORT`] bytes.
+///
+/// Gives up on accepting once `done` is set, which is after QEMU has exited: a QEMU
+/// that never connected is not going to.
+fn read_report(listener: &UnixListener, done: &AtomicBool) -> String {
+    let mut stream = loop {
+        match listener.accept() {
+            Ok((stream, _)) => break stream,
+            Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                if done.load(Ordering::Acquire) {
+                    return String::new();
+                }
+                thread::sleep(POLL);
+            }
+            Err(error) if error.kind() == ErrorKind::Interrupted => {}
+            Err(error) => {
+                warn!(%error, "cannot accept QEMU's status connection");
+                return String::new();
+            }
+        }
+    };
+    if stream.set_nonblocking(false).is_err() || stream.set_read_timeout(Some(POLL)).is_err() {
+        return String::new();
+    }
+    let mut kept = Vec::with_capacity(MAX_REPORT);
+    let mut buffer = [0u8; MAX_REPORT];
+    loop {
+        match stream.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(count) => {
+                kept.extend_from_slice(&buffer[..count]);
+                if kept.len() > MAX_REPORT {
+                    kept.drain(..kept.len() - MAX_REPORT);
+                }
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    ErrorKind::WouldBlock | ErrorKind::TimedOut | ErrorKind::Interrupted
+                ) =>
+            {
+                // Nothing arrived for a while. QEMU closes the socket when it exits,
+                // so this only stops a read that would otherwise outlive it.
+                if done.load(Ordering::Acquire) {
+                    break;
+                }
+            }
+            Err(error) => {
+                warn!(%error, "cannot read QEMU's status connection");
+                break;
+            }
+        }
+    }
+    String::from_utf8_lossy(&kept).into_owned()
+}
+
+/// How often the status reader checks whether QEMU has exited.
+const POLL: Duration = Duration::from_millis(50);
+
+/// `path` as a value inside a QEMU `key=value,...` option, where a literal comma is
+/// written twice.
+fn qemu_option_value(path: &Path) -> OsString {
+    let mut escaped = Vec::new();
+    for &byte in path.as_os_str().as_bytes() {
+        escaped.push(byte);
+        if byte == b',' {
+            escaped.push(b',');
+        }
+    }
+    OsString::from_vec(escaped)
 }
 
 /// `-accel kvm` when `/dev/kvm` can be opened, TCG emulation otherwise.
@@ -456,12 +609,6 @@ fn find_on_path(program: &str) -> Option<PathBuf> {
         .find(|candidate| candidate.is_file())
 }
 
-fn prefixed(prefix: &str, path: &Path) -> OsString {
-    let mut argument = OsString::from(prefix);
-    argument.push(path.as_os_str());
-    argument
-}
-
 /// One member of the initramfs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Member {
@@ -540,7 +687,13 @@ impl Tree {
             if file == init {
                 continue;
             }
-            tree.insert(relative(&file), Member::File(file, 0o755));
+            // `host_files` returns absolute, normalised paths, so this only drops
+            // the leading `/`.
+            let guest = relative(&closure::normalize(&file));
+            if guest.as_os_str().is_empty() {
+                continue;
+            }
+            tree.insert(guest, Member::File(file, 0o755));
         }
         Ok(tree)
     }
@@ -680,6 +833,60 @@ mod tests {
     }
 
     #[test]
+    fn a_cmdline_cannot_choose_init() {
+        for cmdline in ["rdinit=/pkg/bin/sh", "quiet init=/bin/sh", "rdinit"] {
+            assert!(
+                kernel("vmlinuz", Some(cmdline)).validate().is_err(),
+                "{cmdline}"
+            );
+        }
+        kernel("vmlinuz", Some("initcall_debug foo.rdinit=1"))
+            .validate()
+            .unwrap();
+    }
+
+    #[test]
+    fn a_comma_in_a_qemu_option_value_is_doubled() {
+        assert_eq!(
+            qemu_option_value(Path::new("/tmp/a,b/status.sock")),
+            OsString::from("/tmp/a,,b/status.sock")
+        );
+    }
+
+    #[test]
+    fn the_status_reader_keeps_only_the_end_of_a_flood() {
+        use std::{io::Write, os::unix::net::UnixStream};
+
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("status.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let done = Arc::new(AtomicBool::new(false));
+        let reader = {
+            let done = Arc::clone(&done);
+            thread::spawn(move || read_report(&listener, &done))
+        };
+        let mut guest = UnixStream::connect(&socket).unwrap();
+        for _ in 0..1024 {
+            guest.write_all(&[b'x'; 1024]).unwrap();
+        }
+        guest.write_all(b"\r\nexit 4\r\n").unwrap();
+        drop(guest);
+        let report = reader.join().unwrap();
+        assert_eq!(report.len(), MAX_REPORT);
+        assert_eq!(parse_report(&report).unwrap().exit_code, Some(4));
+    }
+
+    #[test]
+    fn the_status_reader_stops_when_qemu_never_connects() {
+        let dir = tempfile::tempdir().unwrap();
+        let listener = UnixListener::bind(dir.path().join("status.sock")).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let done = AtomicBool::new(true);
+        assert_eq!(read_report(&listener, &done), "");
+    }
+
+    #[test]
     fn a_cmdline_that_reaches_init_is_refused() {
         assert!(kernel("vmlinuz", Some("quiet -- sh")).validate().is_err());
         assert!(kernel("vmlinuz", Some("a\nb")).validate().is_err());
@@ -705,10 +912,20 @@ mod tests {
             ImageFormat::of(&write("bz", 0x202, b"HdrS")).unwrap(),
             ImageFormat::BzImage
         );
-        assert_eq!(
-            ImageFormat::of(&write("elf", 0, b"\x7fELF")).unwrap(),
-            ImageFormat::Elf
-        );
+        // ELFCLASS64, ELFDATA2LSB, then e_machine at 18.
+        let elf = |name: &str, machine: u16| {
+            let mut header = b"\x7fELF\x02\x01".to_vec();
+            header.resize(18, 0);
+            header.extend_from_slice(&machine.to_le_bytes());
+            write(name, 0, &header)
+        };
+        let x86 = ImageFormat::of(&elf("x86", EM_X86_64)).unwrap();
+        assert_eq!(x86, ImageFormat::Elf { machine: EM_X86_64 });
+        assert!(x86.boots_on_x86_64());
+        // EM_AARCH64: an arm64 vmlinux is an ELF too, and must not be booted.
+        let arm = ImageFormat::of(&elf("aarch64", 183)).unwrap();
+        assert_eq!(arm, ImageFormat::Elf { machine: 183 });
+        assert!(!arm.boots_on_x86_64());
         assert_eq!(
             ImageFormat::of(&write("arm", 0x38, b"ARM\x64")).unwrap(),
             ImageFormat::Arm64

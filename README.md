@@ -51,7 +51,9 @@ package(
 `image` is relative to `DESTDIR`. The build fails if the steps did not install
 it or if it is not a Linux kernel image (a bzImage, a vmlinux, or an arm64 or
 RISC-V `Image`), and the image is never offered as a program. `cmdline` is
-optional and is appended to the kernel command line.
+optional and goes on the kernel command line ahead of the parameters pm relies
+on (`console`, `panic`, `rdinit`), so it cannot override them; `init=` and
+`rdinit=` are refused.
 
 `pm run` boots such a package's kernel in a QEMU virtual machine instead of
 running it in the namespace jail on the host's kernel:

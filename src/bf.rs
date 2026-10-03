@@ -590,10 +590,12 @@ impl BuildFile {
         // does not end up listing itself as a runnable entrypoint.
         let mut entrypoints = collect_entrypoints(&staging)?;
         if let Some(kernel) = &self.kernel {
-            self.check_kernel(kernel, &staging)?;
+            let target = self.check_kernel(kernel, &staging)?;
             // A kernel image is booted, never run as a program, even when the
-            // install step left an execute bit on it.
+            // install step left an execute bit on it. When the declared path is a
+            // symlink, the file it points at is the image too.
             entrypoints.remove(&kernel.image);
+            entrypoints.remove(&target);
         }
         // A package with no entrypoints is legitimate - metadata-only and
         // data-only packages exist - but it is far more often a build whose
@@ -645,7 +647,9 @@ impl BuildFile {
     /// image header. Checked here rather than when the package runs, so a recipe
     /// that names the wrong file fails its own build instead of every machine that
     /// later tries to boot it.
-    fn check_kernel(&self, kernel: &Kernel, staging: &Path) -> miette::Result<()> {
+    ///
+    /// Returns the path, relative to `staging`, of the file the image resolves to.
+    fn check_kernel(&self, kernel: &Kernel, staging: &Path) -> miette::Result<PathBuf> {
         kernel
             .validate()
             .wrap_err_with(|| format!("{} declares an invalid kernel", self.name))?;
@@ -658,9 +662,17 @@ impl BuildFile {
             )
         })?;
         let root = staging.canonicalize().into_diagnostic()?;
-        if !resolved.starts_with(&root) || !resolved.is_file() {
+        let Ok(target) = resolved.strip_prefix(&root) else {
             return Err(miette!(
-                "the kernel {} of {} is not a regular file inside the package",
+                "the kernel {} of {} resolves to {}, outside the package",
+                kernel.image.display(),
+                self.name,
+                resolved.display()
+            ));
+        };
+        if !resolved.is_file() {
+            return Err(miette!(
+                "the kernel {} of {} is not a regular file",
                 kernel.image.display(),
                 self.name
             ));
@@ -672,7 +684,7 @@ impl BuildFile {
             ?format,
             "package ships its own kernel"
         );
-        Ok(())
+        Ok(target.to_path_buf())
     }
 
     /// Derive the run-time permission profile of the package that was just staged.
