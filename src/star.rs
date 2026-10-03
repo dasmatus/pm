@@ -18,12 +18,15 @@
 //!
 //! | name | meaning |
 //! |---|---|
-//! | `package(name, version, dependencies = [], steps = [])` | declares the package; call it exactly once |
+//! | `package(name, version, dependencies = [], steps = [], kernel = None)` | declares the package; call it exactly once |
 //! | `step(stage, name, run, dl_urls = None)` | one build step |
+//! | `kernel(image, cmdline = None)` | a kernel the package ships, see [`crate::vm`] |
 //! | `Prepare`, `Build`, `Install`, `Test` | the stage names, as strings |
 //!
 //! `version` is either a string (`"1.2.3"`, split on `.`) or a list of strings.
-//! `dl_urls` is a dict mapping URL to SHA-256.
+//! `dl_urls` is a dict mapping URL to SHA-256. `kernel(image = ...)` names a
+//! kernel image the steps install, relative to `DESTDIR`; `pm run` boots it and
+//! runs the package's entrypoint under it instead of the host's kernel.
 
 use std::{cell::RefCell, fmt::Write as _, path::Path};
 
@@ -106,6 +109,7 @@ fn pm_builtins(builder: &mut GlobalsBuilder) {
         version: Value<'v>,
         #[starlark(default = UnpackList::default())] dependencies: UnpackList<String>,
         #[starlark(default = UnpackList::default())] steps: UnpackList<Value<'v>>,
+        #[starlark(default = NoneOr::None)] kernel: NoneOr<Value<'v>>,
         eval: &mut Evaluator<'v, '_, '_>,
     ) -> starlark::Result<NoneType> {
         let version = version_components(version)?;
@@ -113,12 +117,15 @@ fn pm_builtins(builder: &mut GlobalsBuilder) {
         for step in &steps.items {
             rendered.push(step.to_json_value()?);
         }
-        let package = json!({
+        let mut package = json!({
             "name": name,
             "version": version,
             "dependencies": dependencies.items,
             "steps": rendered,
         });
+        if let NoneOr::Other(kernel) = kernel {
+            package["kernel"] = kernel.to_json_value()?;
+        }
         let collected = eval
             .extra
             .and_then(|extra| extra.downcast_ref::<Collected>())
@@ -155,6 +162,24 @@ fn pm_builtins(builder: &mut GlobalsBuilder) {
         if let NoneOr::Other(downloads) = dl_urls {
             let map = downloads.entries.into_iter().collect::<Vec<_>>();
             entries.push(("dl_urls", heap.alloc(AllocDict(map))));
+        }
+        Ok(heap.alloc(AllocDict(entries)))
+    }
+
+    /// A kernel the package ships: `pm run` boots it in a virtual machine and runs
+    /// the entrypoint under it, instead of on the host's kernel.
+    ///
+    /// `image` is the kernel image the steps install, relative to `DESTDIR`, such
+    /// as `"boot/vmlinuz"`. `cmdline` is appended to the kernel command line pm
+    /// boots it with.
+    fn kernel<'v>(
+        image: &str,
+        #[starlark(default = NoneOr::None)] cmdline: NoneOr<&str>,
+        heap: Heap<'v>,
+    ) -> starlark::Result<Value<'v>> {
+        let mut entries: Vec<(&str, Value<'v>)> = vec![("image", heap.alloc(image))];
+        if let NoneOr::Other(cmdline) = cmdline {
+            entries.push(("cmdline", heap.alloc(cmdline)));
         }
         Ok(heap.alloc(AllocDict(entries)))
     }
@@ -240,7 +265,7 @@ fn check_step_keys(package: &Json) -> miette::Result<()> {
 ///
 /// # Errors
 ///
-/// Fails if a dependency path is not valid UTF-8, which a Starlark string
+/// Fails if a dependency path or the kernel image is not valid UTF-8, which a Starlark string
 /// cannot represent.
 pub fn render(build: &BuildFile) -> miette::Result<String> {
     let mut out = String::new();
@@ -294,6 +319,19 @@ pub fn render(build: &BuildFile) -> miette::Result<String> {
             out.push_str("        ),\n");
         }
         out.push_str("    ],\n");
+    }
+    if let Some(kernel) = build.kernel() {
+        let image = kernel.image.to_str().ok_or_else(|| {
+            miette!(
+                "the kernel image {} is not valid UTF-8",
+                kernel.image.display()
+            )
+        })?;
+        let _ = write!(out, "    kernel = kernel(image = {}", quote(image));
+        if let Some(cmdline) = &kernel.cmdline {
+            let _ = write!(out, ", cmdline = {}", quote(cmdline));
+        }
+        out.push_str("),\n");
     }
     out.push_str(")\n");
     Ok(out)

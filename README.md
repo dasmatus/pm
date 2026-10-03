@@ -29,6 +29,53 @@ package(
   files, and [`editors/`](editors/README.md) has tree-sitter queries and
   Zed and Neovim integrations that use it.
 
+## Shipping a kernel
+
+A package can ship its own Linux kernel. Install the image into `DESTDIR` with
+the package's steps and name it in `package(...)`:
+
+```python
+package(
+    name = "hello",
+    version = "1.0.0",
+    steps = [
+        step(Install, "stage", [
+            "install -Dm644 /path/to/vmlinuz /dest/boot/vmlinuz",
+            "install -Dm755 /path/to/hello /dest/usr/bin/hello",
+        ]),
+    ],
+    kernel = kernel(image = "boot/vmlinuz", cmdline = "mitigations=off"),
+)
+```
+
+`image` is relative to `DESTDIR`. The build fails if the steps did not install
+it or if it is not a Linux kernel image (a bzImage, a vmlinux, or an arm64 or
+RISC-V `Image`), and the image is never offered as a program. `cmdline` is
+optional and is appended to the kernel command line.
+
+`pm run` boots such a package's kernel in a QEMU virtual machine instead of
+running it in the namespace jail on the host's kernel:
+
+* The guest's root filesystem is an initramfs pm assembles for each run. It
+  holds the package at `/pkg`, the host loader and shared libraries the
+  package's binaries link (at their host paths), and `pm-vm-init`, which runs
+  the entrypoint, reports its exit code to the host and powers the machine off.
+  Nothing else from the host is visible, the machine has no network device and
+  no disk, and the recorded landlock profile is not applied inside it.
+* The console is your terminal, so the program's output and input work as they
+  do in the jail. Its exit code is `pm run`'s exit code.
+* It needs `qemu-system-x86_64` on `PATH`, and uses KVM when `/dev/kvm` is
+  usable (emulation otherwise, which is slow). Only x86-64 hosts can boot a
+  package kernel today.
+* The kernel needs initramfs support, an 8250/16550 serial console and ELF
+  support built in, which distribution `generic` and `virtual` kernels have.
+* `--network` and `--audit` are refused, because the guest has no NIC and a
+  traced host process cannot see into a VM. `pm run --host-kernel` runs the
+  package in the usual jail and ignores its kernel.
+
+Install `pm-vm-init` beside `pm`: it is copied into every initramfs, and is
+much smaller than `pm`, which is used in its place when it is missing.
+
 ## Integration with distribution build tools
 
 Projects such as `dichhead/losos-desktop` generate recipes and assemble system

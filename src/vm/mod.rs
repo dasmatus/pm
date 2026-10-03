@@ -1,0 +1,762 @@
+//! Packages that ship their own kernel, and booting them in a virtual machine.
+//!
+//! A recipe can declare `kernel = kernel(image = "boot/vmlinuz")`. The build checks
+//! that its install steps staged a Linux kernel image at that package-relative
+//! path, and the package metadata records it as a [`Kernel`]. `pm run` then boots
+//! that kernel in a QEMU virtual machine and runs the chosen entrypoint as the
+//! guest's only program, instead of running it in the namespace jail on the host's
+//! kernel. `pm run --host-kernel` keeps the jail.
+//!
+//! # What the guest sees
+//!
+//! The guest's root filesystem is an initramfs pm assembles for each run ([`boot`]):
+//!
+//! * the extracted package at `/pkg`, minus the kernel image itself;
+//! * the host's loader and shared libraries the package's binaries link, at their
+//!   host paths, taken only from the system directories the run jail mirrors
+//!   ([`closure`]);
+//! * pm's guest [`init`](guest) - `pm-vm-init` from beside `pm`, or `pm` itself -
+//!   with its own libraries;
+//! * `/dev/console`, `/dev/null` and the two serial ports, and empty `/proc`,
+//!   `/sys` and `/tmp` that init mounts.
+//!
+//! Nothing else from the host is there: no `/etc`, no `/home`, no host `/tmp`. The
+//! machine has no network device and no disk. The landlock profile a package
+//! records is not applied inside the guest, because there is nothing outside the
+//! package and its libraries for it to deny; the VM boundary replaces it.
+//!
+//! # What this does not do
+//!
+//! * **Other architectures.** Only x86-64 hosts boot a package kernel today, with
+//!   two 16550 serial ports on QEMU's `pc` machine. Other hosts refuse with an
+//!   error; `--host-kernel` still runs the package.
+//! * **Network.** The guest has no NIC, and `--network` is refused rather than
+//!   silently ignored.
+//! * **Auditing.** `--audit` traces a host process with `ptrace`, which cannot see
+//!   into a VM, so it is refused too.
+//! * **Confining QEMU.** QEMU runs as the calling user, outside any jail. The
+//!   package's code only ever runs inside the guest.
+//! * **Trusting the exit status.** Init reports how the entrypoint exited on the
+//!   second serial port. Code running in the guest could write to that port too, so
+//!   the status is the package's claim about itself, not a measurement.
+//!
+//! # What the kernel needs
+//!
+//! An initramfs, an 8250/16550 serial console and ELF binaries for the host's
+//! architecture, all built in rather than as modules: nothing in the guest loads
+//! modules. Distribution "generic" and "virtual" kernels have all three.
+
+/// Finding the host files a program needs to start in the guest.
+pub mod closure;
+/// Writing the `newc` cpio archive the guest boots from.
+pub mod cpio;
+/// pm as the guest's init.
+pub mod guest;
+
+use std::{
+    collections::BTreeMap,
+    env,
+    ffi::OsString,
+    fs::{File, OpenOptions, read_to_string},
+    io::{BufWriter, Read},
+    os::unix::fs::PermissionsExt,
+    path::{Component, Path, PathBuf},
+    process::{Command, Stdio},
+};
+
+use hakoniwa::ExitStatus;
+use miette::{IntoDiagnostic, WrapErr, miette};
+use serde::{Deserialize, Serialize};
+use tracing::{debug, info, warn};
+use walkdir::WalkDir;
+
+use crate::workspace::{HostChild, Workspace};
+
+use cpio::Newc;
+
+/// Where the extracted package is in the guest.
+pub const GUEST_PACKAGE_ROOT: &str = "/pkg";
+
+/// The file init reads what to run from.
+const GUEST_CONFIG: &str = "/pm-vm.json";
+
+/// The serial port init reports the entrypoint's exit on. `ttyS0` is the console.
+const STATUS_PORT: &str = "/dev/ttyS1";
+
+/// The longest extra command line a package may ask for.
+///
+/// x86's boot protocol allows 2048 bytes in all, and pm's own parameters need a
+/// share of that.
+const MAX_CMDLINE: usize = 1024;
+
+/// Memory the guest gets on top of three times the initramfs: the kernel holds it
+/// once as the archive and once unpacked, and the unpacked copy lives in a tmpfs
+/// the kernel caps at half of memory.
+const BASE_MEMORY_MIB: u64 = 512;
+
+/// Most virtual CPUs a guest gets.
+const MAX_CPUS: usize = 4;
+
+/// Exit code reported when the guest stopped without saying how the entrypoint
+/// exited, the same "never ran to completion" code hakoniwa uses.
+const NO_REPORT: i32 = 125;
+
+/// A kernel a package ships, as a recipe declares it and the package metadata
+/// records it.
+#[derive(Serialize, Deserialize, PartialEq, Eq, Debug, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct Kernel {
+    /// The kernel image, relative to the package root, e.g. `boot/vmlinuz`.
+    pub image: PathBuf,
+    /// Extra kernel command-line parameters, appended after pm's own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cmdline: Option<String>,
+}
+
+impl Kernel {
+    /// Check the declaration on its own, without looking at any file.
+    ///
+    /// The image has to be a plain package-relative path outside `deps/`, which
+    /// belongs to other packages, and must not be the `metadata` member. The command
+    /// line cannot contain `--`, after which the kernel hands everything to init,
+    /// nor a NUL or a line break, and is capped at [`MAX_CMDLINE`] bytes.
+    ///
+    /// Run at build time on the recipe and again at run time on the metadata, which
+    /// is as untrusted as the rest of the archive.
+    ///
+    /// # Errors
+    ///
+    /// Describes the first rule the declaration breaks.
+    pub fn validate(&self) -> miette::Result<()> {
+        if self.image.as_os_str().is_empty() {
+            return Err(miette!("the kernel image path is empty"));
+        }
+        if let Some(component) = self
+            .image
+            .components()
+            .find(|component| !matches!(component, Component::Normal(_)))
+        {
+            return Err(miette!(
+                help = "name the image relative to DESTDIR, e.g. kernel(image = \"boot/vmlinuz\")",
+                "the kernel image {} must be a plain package-relative path, but it contains `{}`",
+                self.image.display(),
+                Path::new(component.as_os_str()).display()
+            ));
+        }
+        if self.image.starts_with("deps") || self.image == Path::new("metadata") {
+            return Err(miette!(
+                "the kernel image cannot be {}: that path belongs to pm",
+                self.image.display()
+            ));
+        }
+        if let Some(cmdline) = &self.cmdline {
+            if cmdline.len() > MAX_CMDLINE {
+                return Err(miette!(
+                    "the kernel command line is {} bytes; at most {MAX_CMDLINE} are allowed",
+                    cmdline.len()
+                ));
+            }
+            if cmdline.contains(['\0', '\n', '\r']) {
+                return Err(miette!(
+                    "the kernel command line contains a NUL or a line break"
+                ));
+            }
+            if cmdline.split_whitespace().any(|word| word == "--") {
+                return Err(miette!(
+                    "the kernel command line cannot contain `--`: everything after it goes to \
+                     pm's init"
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Which kind of kernel image a file is, from its header.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImageFormat {
+    /// An x86 `bzImage`, which is what `vmlinuz` usually is.
+    BzImage,
+    /// An uncompressed ELF `vmlinux`.
+    Elf,
+    /// An arm64 `Image`.
+    Arm64,
+    /// A RISC-V `Image`.
+    RiscV,
+}
+
+impl ImageFormat {
+    /// Read the header of `path` and say which kind of image it is.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the file cannot be read or carries none of the four headers.
+    pub fn of(path: &Path) -> miette::Result<Self> {
+        let mut header = [0u8; 0x210];
+        let mut file = File::open(path)
+            .into_diagnostic()
+            .wrap_err_with(|| format!("cannot open the kernel image {}", path.display()))?;
+        let mut read = 0;
+        while read < header.len() {
+            match file.read(&mut header[read..]) {
+                Ok(0) => break,
+                Ok(count) => read += count,
+                Err(error) => {
+                    return Err(error).into_diagnostic().wrap_err_with(|| {
+                        format!("cannot read the kernel image {}", path.display())
+                    });
+                }
+            }
+        }
+        let header = &header[..read];
+        let at =
+            |offset: usize, magic: &[u8]| header.get(offset..offset + magic.len()) == Some(magic);
+        if at(0, b"\x7fELF") {
+            Ok(Self::Elf)
+        } else if at(0x202, b"HdrS") {
+            Ok(Self::BzImage)
+        } else if at(0x38, b"ARM\x64") {
+            Ok(Self::Arm64)
+        } else if at(0x38, b"RSC\x05") {
+            Ok(Self::RiscV)
+        } else {
+            Err(miette!(
+                help = "stage a bzImage, a vmlinux, or an arm64 or RISC-V Image",
+                "{} is not a Linux kernel image pm recognises",
+                path.display()
+            ))
+        }
+    }
+}
+
+/// What init runs, written to [`GUEST_CONFIG`] in the initramfs.
+#[derive(Serialize, Deserialize, Debug)]
+struct GuestConfig {
+    entrypoint: PathBuf,
+    cwd: PathBuf,
+}
+
+/// Everything [`boot`] needs to start one entrypoint under a package's kernel.
+pub struct Boot<'a> {
+    /// The kernel as the package metadata declared it.
+    pub kernel: &'a Kernel,
+    /// The extracted package. Must be canonical.
+    pub package_root: &'a Path,
+    /// The entrypoint to run, relative to `package_root`.
+    pub entrypoint: &'a Path,
+    /// Every ELF and script in the package whose host dependencies the guest needs,
+    /// relative to `package_root`. Other programs the entrypoint starts need their
+    /// libraries too, not only the entrypoint.
+    pub programs: Vec<PathBuf>,
+    /// The binary that runs as the guest's init. Must be a pm binary whose `main`
+    /// starts with [`guest::is_guest_init`].
+    pub init: &'a Path,
+    /// The QEMU binary, or `None` to find `qemu-system-x86_64` on `PATH`.
+    pub qemu: Option<&'a Path>,
+}
+
+/// Boot the package's kernel in QEMU and run the entrypoint as its only program.
+///
+/// The console is this process's stdin and stdout, so the entrypoint reads and
+/// writes the terminal as it would in the jail. Returns how the entrypoint exited,
+/// as init reported it.
+///
+/// # Errors
+///
+/// Fails on a non-x86-64 host, when the kernel image is missing, escapes the package
+/// or is not an x86 image, when no QEMU is found, when the initramfs cannot be
+/// written, or when QEMU cannot be started. A guest that stops without init
+/// reporting anything - a kernel panic, a kernel without a serial console - is not
+/// an error: it comes back as exit code 125 with the reason.
+pub fn boot(request: &Boot<'_>) -> miette::Result<ExitStatus> {
+    if env::consts::ARCH != "x86_64" {
+        return Err(miette!(
+            help = "run it on the host kernel with --host-kernel",
+            "booting a package's own kernel is only supported on x86-64 hosts; this one is {}",
+            env::consts::ARCH
+        ));
+    }
+    request.kernel.validate()?;
+    let image = resolve_inside(request.package_root, &request.kernel.image)
+        .wrap_err("the package's kernel image cannot be booted")?;
+    let format = ImageFormat::of(&image)?;
+    if !matches!(format, ImageFormat::BzImage | ImageFormat::Elf) {
+        return Err(miette!(
+            help = "run it on the host kernel with --host-kernel",
+            "the package's kernel is an {format:?} image, which an x86-64 host cannot boot"
+        ));
+    }
+    let qemu = match request.qemu {
+        Some(qemu) => qemu.to_path_buf(),
+        None => find_on_path("qemu-system-x86_64").ok_or_else(|| {
+            miette!(
+                help = "install QEMU, or run it on the host kernel with --host-kernel",
+                "this package ships its own kernel, and booting it needs qemu-system-x86_64, \
+                 which is not on PATH"
+            )
+        })?,
+    };
+
+    // Declared before the child below, so it is removed only after QEMU is gone.
+    let scratch = Workspace::new("vm")?;
+    let initramfs = scratch.path().join("initramfs.cpio");
+    let status_file = scratch.path().join("status");
+    let tree = Tree::assemble(request, &image)?;
+    let size = tree.write(&initramfs)?;
+    let memory = BASE_MEMORY_MIB + 3 * size.div_ceil(1024 * 1024);
+
+    let cmdline = format!(
+        "console=ttyS0 panic=-1 quiet loglevel=1 rdinit=/init {} -- {}",
+        request.kernel.cmdline.as_deref().unwrap_or(""),
+        guest::INIT_ARG
+    );
+    let cpus = std::thread::available_parallelism().map_or(1, |n| n.get().min(MAX_CPUS));
+
+    let mut command = Command::new(&qemu);
+    command
+        .args([
+            "-nodefaults",
+            "-no-user-config",
+            "-no-reboot",
+            "-display",
+            "none",
+        ])
+        .args(["-machine", "pc"])
+        .args(accelerator())
+        .args(["-m", &format!("{memory}M")])
+        .args(["-smp", &cpus.to_string()])
+        .args(["-nic", "none"])
+        .args(["-serial", "stdio"])
+        .arg("-serial")
+        .arg(prefixed("file:", &status_file))
+        .arg("-kernel")
+        .arg(&image)
+        .arg("-initrd")
+        .arg(&initramfs)
+        .args(["-append", &cmdline])
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit());
+    debug!(?command, "starting QEMU");
+    info!(
+        kernel = %request.kernel.image.display(),
+        memory_mib = memory,
+        "booting the package's own kernel in a virtual machine"
+    );
+
+    let program = qemu.display().to_string();
+    let child = command
+        .spawn()
+        .into_diagnostic()
+        .wrap_err_with(|| format!("cannot start {program}"))?;
+    // Declared after `scratch`, therefore dropped - and QEMU killed - before it.
+    let child = HostChild::new(child, program.clone());
+    let exited = child.wait()?;
+
+    let report = read_to_string(&status_file).unwrap_or_default();
+    let status = parse_report(&report);
+    if status.is_none() && !exited.success() {
+        return Err(miette!(
+            "{program} exited with {exited} before the guest reported anything"
+        ));
+    }
+    Ok(status.unwrap_or_else(|| {
+        exit_status(
+            NO_REPORT,
+            None,
+            "the guest stopped without reporting how the entrypoint exited; the kernel may \
+             have panicked, or lacks a built-in serial console or initramfs support"
+                .to_owned(),
+        )
+    }))
+}
+
+/// `-accel kvm` when `/dev/kvm` can be opened, TCG emulation otherwise.
+fn accelerator() -> Vec<&'static str> {
+    if OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/kvm")
+        .is_ok()
+    {
+        vec!["-accel", "kvm", "-cpu", "host"]
+    } else {
+        warn!("/dev/kvm is not available; the guest is emulated and will be slow");
+        vec!["-accel", "tcg"]
+    }
+}
+
+/// Turn init's report into an exit status.
+fn parse_report(report: &str) -> Option<ExitStatus> {
+    let line = report
+        .lines()
+        .map(str::trim)
+        .rfind(|line| !line.is_empty())?;
+    let (kind, value) = line.split_once(' ')?;
+    match kind {
+        "exit" => {
+            let code = value.parse().ok()?;
+            Some(exit_status(
+                code,
+                Some(code),
+                format!("entrypoint exited with code {code} in the guest"),
+            ))
+        }
+        "signal" => {
+            let signal: i32 = value.parse().ok()?;
+            Some(exit_status(
+                128 + signal,
+                None,
+                format!("entrypoint was killed by signal {signal} in the guest"),
+            ))
+        }
+        "error" => Some(exit_status(
+            NO_REPORT,
+            None,
+            format!("the guest's init failed: {value}"),
+        )),
+        _ => None,
+    }
+}
+
+fn exit_status(code: i32, exit_code: Option<i32>, reason: String) -> ExitStatus {
+    ExitStatus {
+        code,
+        reason,
+        exit_code,
+        rusage: None,
+        proc_pid_smaps_rollup: None,
+        proc_pid_status: None,
+    }
+}
+
+/// `relative` joined to `root`, canonicalised and required to stay inside it.
+fn resolve_inside(root: &Path, relative: &Path) -> miette::Result<PathBuf> {
+    let joined = root.join(relative);
+    let resolved = joined
+        .canonicalize()
+        .into_diagnostic()
+        .wrap_err_with(|| format!("{} does not exist in the package", relative.display()))?;
+    if !resolved.starts_with(root) {
+        return Err(miette!(
+            "{} resolves to {}, outside the package",
+            relative.display(),
+            resolved.display()
+        ));
+    }
+    if !resolved.is_file() {
+        return Err(miette!("{} is not a regular file", relative.display()));
+    }
+    Ok(resolved)
+}
+
+fn find_on_path(program: &str) -> Option<PathBuf> {
+    env::split_paths(&env::var_os("PATH")?)
+        .map(|dir| dir.join(program))
+        .find(|candidate| candidate.is_file())
+}
+
+fn prefixed(prefix: &str, path: &Path) -> OsString {
+    let mut argument = OsString::from(prefix);
+    argument.push(path.as_os_str());
+    argument
+}
+
+/// One member of the initramfs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Member {
+    Directory,
+    /// A host file, copied with these permission bits.
+    File(PathBuf, u32),
+    Bytes(Vec<u8>, u32),
+    Symlink(PathBuf),
+    CharacterDevice(u32, u32),
+}
+
+/// The guest's root filesystem, keyed by path relative to `/`.
+///
+/// A sorted map, because the kernel needs every directory before what is in it,
+/// and [`Path`] orders a parent before its children.
+#[derive(Default)]
+struct Tree(BTreeMap<PathBuf, Member>);
+
+impl Tree {
+    /// Lay out everything the guest gets; see the module documentation.
+    fn assemble(request: &Boot<'_>, image: &Path) -> miette::Result<Self> {
+        let mut tree = Self::default();
+        for directory in ["dev", "proc", "sys", "tmp"] {
+            tree.insert(PathBuf::from(directory), Member::Directory);
+        }
+        for (name, major, minor) in [
+            ("console", 5, 1),
+            ("null", 1, 3),
+            ("zero", 1, 5),
+            ("random", 1, 8),
+            ("urandom", 1, 9),
+            ("tty", 5, 0),
+            ("ttyS0", 4, 64),
+            ("ttyS1", 4, 65),
+        ] {
+            tree.insert(
+                Path::new("dev").join(name),
+                Member::CharacterDevice(major, minor),
+            );
+        }
+
+        let init = request
+            .init
+            .canonicalize()
+            .into_diagnostic()
+            .wrap_err_with(|| {
+                format!("cannot find pm's own binary at {}", request.init.display())
+            })?;
+        tree.insert(PathBuf::from("init"), Member::File(init.clone(), 0o755));
+
+        let entrypoint = Path::new(GUEST_PACKAGE_ROOT).join(request.entrypoint);
+        let config = serde_json::to_vec(&GuestConfig {
+            entrypoint,
+            cwd: PathBuf::from(GUEST_PACKAGE_ROOT),
+        })
+        .into_diagnostic()?;
+        tree.insert(
+            relative(Path::new(GUEST_CONFIG)),
+            Member::Bytes(config, 0o644),
+        );
+
+        tree.add_package(request.package_root, image)?;
+
+        let roots = std::iter::once(init.clone())
+            .chain(std::iter::once(
+                request.package_root.join(request.entrypoint),
+            ))
+            .chain(
+                request
+                    .programs
+                    .iter()
+                    .map(|program| request.package_root.join(program)),
+            );
+        for file in closure::host_files(roots, request.package_root, &init) {
+            // init itself is already in the tree, at `/init`.
+            if file == init {
+                continue;
+            }
+            tree.insert(relative(&file), Member::File(file, 0o755));
+        }
+        Ok(tree)
+    }
+
+    /// Add the extracted package under [`GUEST_PACKAGE_ROOT`], leaving out `image`.
+    fn add_package(&mut self, package_root: &Path, image: &Path) -> miette::Result<()> {
+        let base = relative(Path::new(GUEST_PACKAGE_ROOT));
+        for entry in WalkDir::new(package_root).follow_links(false) {
+            let entry = entry
+                .into_diagnostic()
+                .wrap_err_with(|| format!("cannot walk {}", package_root.display()))?;
+            let path = entry.path();
+            if path == image {
+                continue;
+            }
+            let Ok(inside) = path.strip_prefix(package_root) else {
+                continue;
+            };
+            // `join("")` would add a trailing slash to the package root itself.
+            let guest = if inside.as_os_str().is_empty() {
+                base.clone()
+            } else {
+                base.join(inside)
+            };
+            let file_type = entry.file_type();
+            let member = if file_type.is_dir() {
+                Member::Directory
+            } else if file_type.is_symlink() {
+                let target = std::fs::read_link(path)
+                    .into_diagnostic()
+                    .wrap_err_with(|| format!("cannot read the link {}", path.display()))?;
+                Member::Symlink(target)
+            } else if file_type.is_file() {
+                let mode = entry
+                    .metadata()
+                    .into_diagnostic()
+                    .wrap_err_with(|| format!("cannot stat {}", path.display()))?
+                    .permissions()
+                    .mode();
+                Member::File(path.to_path_buf(), mode & 0o7777)
+            } else {
+                debug!(path = %path.display(), "leaving a special file out of the guest");
+                continue;
+            };
+            self.insert(guest, member);
+        }
+        Ok(())
+    }
+
+    /// Add `member` at `path`, and every missing directory above it.
+    fn insert(&mut self, path: PathBuf, member: Member) {
+        for ancestor in path.ancestors().skip(1) {
+            if ancestor.as_os_str().is_empty() {
+                break;
+            }
+            self.0
+                .entry(ancestor.to_path_buf())
+                .or_insert(Member::Directory);
+        }
+        self.0.insert(path, member);
+    }
+
+    /// Write the tree as a `newc` archive at `path` and return its size in bytes.
+    fn write(&self, path: &Path) -> miette::Result<u64> {
+        let file = File::create(path)
+            .into_diagnostic()
+            .wrap_err_with(|| format!("cannot create {}", path.display()))?;
+        let mut archive = Newc::new(BufWriter::new(file));
+        archive.directory(Path::new("."), 0o755)?;
+        for (name, member) in &self.0 {
+            match member {
+                Member::Directory => {
+                    let permissions = if name == Path::new("tmp") {
+                        0o1777
+                    } else {
+                        0o755
+                    };
+                    archive.directory(name, permissions)?;
+                }
+                Member::File(source, permissions) => archive.file(name, *permissions, source)?,
+                Member::Bytes(data, permissions) => archive.bytes(name, *permissions, data)?,
+                Member::Symlink(target) => archive.symlink(name, target)?,
+                Member::CharacterDevice(major, minor) => {
+                    archive.character_device(name, 0o666, *major, *minor)?;
+                }
+            }
+        }
+        let size = archive
+            .finish()?
+            .into_inner()
+            .map_err(|error| miette!("cannot finish writing the initramfs: {error}"))?
+            .metadata()
+            .into_diagnostic()?
+            .len();
+        debug!(members = self.0.len(), bytes = size, "wrote the initramfs");
+        Ok(size)
+    }
+}
+
+/// `path` without its leading `/`.
+fn relative(path: &Path) -> PathBuf {
+    path.components()
+        .filter(|component| matches!(component, Component::Normal(_)))
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn kernel(image: &str, cmdline: Option<&str>) -> Kernel {
+        Kernel {
+            image: PathBuf::from(image),
+            cmdline: cmdline.map(str::to_owned),
+        }
+    }
+
+    #[test]
+    fn a_plain_relative_image_is_valid() {
+        kernel("boot/vmlinuz", Some("quiet mitigations=off"))
+            .validate()
+            .unwrap();
+    }
+
+    #[test]
+    fn an_image_outside_the_package_or_in_pms_paths_is_refused() {
+        for image in [
+            "",
+            "/boot/vmlinuz",
+            "../vmlinuz",
+            "boot/../vmlinuz",
+            "deps/x",
+            "metadata",
+        ] {
+            assert!(kernel(image, None).validate().is_err(), "{image}");
+        }
+    }
+
+    #[test]
+    fn a_cmdline_that_reaches_init_is_refused() {
+        assert!(kernel("vmlinuz", Some("quiet -- sh")).validate().is_err());
+        assert!(kernel("vmlinuz", Some("a\nb")).validate().is_err());
+        assert!(
+            kernel("vmlinuz", Some(&"x".repeat(MAX_CMDLINE + 1)))
+                .validate()
+                .is_err()
+        );
+        kernel("vmlinuz", Some("foo--bar")).validate().unwrap();
+    }
+
+    #[test]
+    fn image_formats_are_read_from_their_headers() {
+        let dir = tempfile::tempdir().unwrap();
+        let write = |name: &str, offset: usize, magic: &[u8]| {
+            let mut bytes = vec![0u8; 0x300];
+            bytes[offset..offset + magic.len()].copy_from_slice(magic);
+            let path = dir.path().join(name);
+            std::fs::write(&path, bytes).unwrap();
+            path
+        };
+        assert_eq!(
+            ImageFormat::of(&write("bz", 0x202, b"HdrS")).unwrap(),
+            ImageFormat::BzImage
+        );
+        assert_eq!(
+            ImageFormat::of(&write("elf", 0, b"\x7fELF")).unwrap(),
+            ImageFormat::Elf
+        );
+        assert_eq!(
+            ImageFormat::of(&write("arm", 0x38, b"ARM\x64")).unwrap(),
+            ImageFormat::Arm64
+        );
+        assert_eq!(
+            ImageFormat::of(&write("rv", 0x38, b"RSC\x05")).unwrap(),
+            ImageFormat::RiscV
+        );
+        assert!(ImageFormat::of(&write("junk", 0, b"junk")).is_err());
+        let short = dir.path().join("short");
+        std::fs::write(&short, b"\x7fEL").unwrap();
+        assert!(ImageFormat::of(&short).is_err());
+    }
+
+    #[test]
+    fn reports_become_exit_statuses() {
+        let exit = parse_report("exit 3\r\n").unwrap();
+        assert_eq!((exit.code, exit.exit_code), (3, Some(3)));
+        let signal = parse_report("signal 9\n").unwrap();
+        assert_eq!((signal.code, signal.exit_code), (137, None));
+        assert_eq!(
+            parse_report("error cannot start /pkg/x").unwrap().code,
+            NO_REPORT
+        );
+        assert!(parse_report("").is_none());
+        assert!(parse_report("garbage").is_none());
+    }
+
+    #[test]
+    fn the_tree_has_every_parent_before_its_children() {
+        let mut tree = Tree::default();
+        tree.insert(
+            PathBuf::from("usr/lib/x/libc.so.6"),
+            Member::Bytes(vec![], 0o755),
+        );
+        tree.insert(PathBuf::from("dev/console"), Member::CharacterDevice(5, 1));
+        let paths: Vec<_> = tree.0.keys().cloned().collect();
+        assert_eq!(
+            paths,
+            [
+                "dev",
+                "dev/console",
+                "usr",
+                "usr/lib",
+                "usr/lib/x",
+                "usr/lib/x/libc.so.6"
+            ]
+            .map(PathBuf::from)
+        );
+    }
+}

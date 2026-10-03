@@ -14,7 +14,10 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
-use crate::perms::{Enforcement, Permissions};
+use crate::{
+    perms::{Enforcement, Permissions},
+    vm::Kernel,
+};
 
 /// The profile handed out for a package that recorded none.
 ///
@@ -52,6 +55,11 @@ pub struct Metadata {
     /// with no recorded mode is audited, exactly like a freshly derived profile.
     #[serde(default)]
     enforcement: Enforcement,
+    /// The kernel the package ships, which `pm run` boots it under. Absent for a
+    /// package that runs on the host's kernel, which is every package built before
+    /// this field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    kernel: Option<Kernel>,
 }
 
 /// What a single entrypoint inside the package is.
@@ -112,7 +120,27 @@ impl Metadata {
             entrypoints,
             permissions: Some(permissions),
             enforcement,
+            kernel: None,
         }
+    }
+
+    /// Record that the package ships `kernel`.
+    ///
+    /// Separate from [`Metadata::create`] because most packages ship none. The
+    /// caller is responsible for having checked that the image exists in the
+    /// package; see [`crate::bf::BuildFile`].
+    #[must_use]
+    pub fn with_kernel(mut self, kernel: Kernel) -> Self {
+        self.kernel = Some(kernel);
+        self
+    }
+
+    /// The kernel the package ships, if any.
+    ///
+    /// Read out of an archive, this is as untrusted as the rest of the metadata;
+    /// [`Kernel::validate`] is what checks it.
+    pub fn kernel(&self) -> Option<&Kernel> {
+        self.kernel.as_ref()
     }
 
     /// The package name.

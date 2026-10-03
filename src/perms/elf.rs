@@ -212,6 +212,40 @@ pub fn interpreter(path: &Path) -> miette::Result<Option<String>> {
     Ok(inspect(path)?.and_then(|inspection| inspection.interpreter))
 }
 
+/// How an object links: its loader, its libraries and where it looks for them.
+#[derive(Debug, Default)]
+pub(crate) struct Linkage {
+    /// `PT_INTERP`.
+    pub(crate) interpreter: Option<String>,
+    /// `DT_NEEDED`, in dynamic-array order.
+    pub(crate) needed: Vec<String>,
+    /// `DT_RUNPATH` then `DT_RPATH`, raw; see [`runpath`].
+    pub(crate) runpath: Vec<String>,
+}
+
+/// [`interpreter`], [`needed_libraries`] and [`runpath`] in one read.
+///
+/// `own` lifts the [`MAX_FILE_BYTES`] cap, for one of pm's own binaries only: the cap
+/// keeps a package from making pm read a machine's worth of RAM, and an unoptimised
+/// pm with its debug info is larger than it. Every file a package supplies keeps the
+/// cap. `Ok(None)` for a file that is not an ELF.
+///
+/// # Errors
+///
+/// See [`analyse`].
+pub(crate) fn linkage(path: &Path, own: bool) -> miette::Result<Option<Linkage>> {
+    let cap = if own { u64::MAX } else { MAX_FILE_BYTES };
+    Ok(inspect_capped(path, cap)?.map(|inspection| Linkage {
+        interpreter: inspection.interpreter,
+        needed: inspection.needed,
+        runpath: inspection
+            .search_paths
+            .into_iter()
+            .map(|(_, value)| value)
+            .collect(),
+    }))
+}
+
 /// Everything the four public functions need, read in one pass.
 #[derive(Debug, Default)]
 struct Inspection {
@@ -229,12 +263,17 @@ struct Inspection {
 ///
 /// See [`analyse`].
 fn inspect(path: &Path) -> miette::Result<Option<Inspection>> {
+    inspect_capped(path, MAX_FILE_BYTES)
+}
+
+/// [`inspect`] with a size cap of `cap` bytes instead of [`MAX_FILE_BYTES`].
+fn inspect_capped(path: &Path, cap: u64) -> miette::Result<Option<Inspection>> {
     let metadata = fs::metadata(path)
         .into_diagnostic()
         .wrap_err_with(|| format!("cannot stat {}", path.display()))?;
-    if metadata.len() > MAX_FILE_BYTES {
+    if metadata.len() > cap {
         return Err(miette!(
-            "{}: {} bytes is too large to parse as an ELF object (cap is {MAX_FILE_BYTES})",
+            "{}: {} bytes is too large to parse as an ELF object (cap is {cap})",
             path.display(),
             metadata.len(),
         ));

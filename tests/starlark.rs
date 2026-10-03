@@ -197,6 +197,46 @@ fn the_generated_skeleton_round_trips() {
 }
 
 #[test]
+fn a_kernel_is_declared_with_kernel_and_round_trips() {
+    let build = eval(
+        r#"package(
+    name = "k",
+    version = "1",
+    kernel = kernel(image = "boot/vmlinuz", cmdline = "quiet \"x\""),
+)"#,
+    )
+    .expect("evaluates");
+    let kernel = build.kernel().expect("a kernel was declared");
+    assert_eq!(kernel.image, Path::new("boot/vmlinuz"));
+    assert_eq!(kernel.cmdline.as_deref(), Some("quiet \"x\""));
+
+    let text = star::render(&build).expect("renders");
+    assert_eq!(
+        json(&eval(&text).expect("evaluates")),
+        json(&build),
+        "{text}"
+    );
+
+    let bare = eval(r#"package(name = "k", version = "1", kernel = kernel(image = "vmlinuz"))"#)
+        .expect("evaluates");
+    assert_eq!(bare.kernel().expect("declared").cmdline, None);
+    let text = star::render(&bare).expect("renders");
+    assert!(
+        text.contains("kernel = kernel(image = \"vmlinuz\"),"),
+        "{text}"
+    );
+}
+
+#[test]
+fn a_misspelt_kernel_key_is_rejected() {
+    let Err(error) = eval(r#"package(name = "k", version = "1", kernel = {"imgae": "vmlinuz"})"#)
+    else {
+        panic!("a misspelt key must not be ignored");
+    };
+    assert!(format!("{error:?}").contains("imgae"), "{error:?}");
+}
+
+#[test]
 fn target_paths() {
     assert_eq!(
         migrate::target_path(Path::new("a/build.yaml")),

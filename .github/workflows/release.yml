@@ -13,8 +13,8 @@ on:
 #
 # Host tools only. pm is a Linux sandbox for recipe builds; its own release
 # artifacts are the first-party binaries Cargo.toml declares (pm, pm-lsp, pm-trace,
-# pmd) built for the platform the release is run on. Cross-compiled tarballs and
-# a GHCR image are deliberately out of scope until the project asks for them.
+# pm-vm-init, pmd) built for the platform the release is run on. Cross-compiled
+# tarballs and a GHCR image are deliberately out of scope until the project asks for them.
 
 permissions:
   contents: write
@@ -59,7 +59,7 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p dist
-          for bin in pm pm-lsp pm-trace pmd; do
+          for bin in pm pm-lsp pm-trace pm-vm-init pmd; do
             install -Dm755 "target/release/$bin" "dist/${bin}-${GITHUB_REF_NAME}-x86_64-unknown-linux-gnu"
           done
           ( cd dist && sha256sum * > SHA256SUMS )
