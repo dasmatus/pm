@@ -130,6 +130,38 @@ contain a literal `%{` that *is* shaped like a reference.
 Symbols are not substituted into `dl_urls`. A download's identity is its URL and its
 hash, both of which the build file states; and `%` already means something in a URL.
 
+## Recipe functions
+
+A plugin built against the **`recipe-plugin`** world, rather than `plugin`, also
+adds functions to Rhai recipes. It exports everything a plugin does, plus:
+
+```wit
+export recipe-functions: func() -> list<recipe-function>;
+export call-recipe-function: func(name: string, args: list<string>) -> result<string, string>;
+```
+
+`recipe-functions` is called once, at load, like `describe`. Each entry names a
+function, its parameters (their number is its arity), what it returns and a line
+of documentation. A recipe calls it as `<plugin>::<name>(...)`, with any `-` in
+the plugin's name written `_`; the plugin's symbols are constants in the same
+module.
+
+Arguments arrive as one JSON text each, a `Step`, `Kernel` or `Package` as the
+object map it stands for. The answer is JSON too, of the kind `returns` names:
+`any` (plain data; no floating point, since recipes have none), `step`, `steps`,
+`kernel` or `package`. pm checks a typed answer exactly as it checks what a
+recipe writes, so a step with a misspelt key or an unknown stage fails the
+recipe at the call. An `err` fails it with the plugin's message.
+
+A call runs like a hook: in a fresh instance, metered, with only `log`. The
+answer is therefore a function of the arguments alone, so a recipe that calls
+a plugin still evaluates to the same package wherever the same plugin is
+installed, and the plugin's file hash is already part of the policy digest.
+Names must be `[a-z0-9_]`, at most 32 characters and not a Rhai keyword; at
+most six parameters; a plugin built against plain `plugin` loads exactly as
+before. The `systemd` plugin here adds `install_unit(file)` and
+`install_units(files)`; see its source.
+
 ## Trust
 
 **A plugin must be signed**, by a key in the same trust store that governs build

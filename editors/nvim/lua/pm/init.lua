@@ -1,6 +1,17 @@
 local M = {}
 
-local parser_revision = "a453dbf3ba433db0e5ec621a38a7e59d72e4dc69"
+-- Recipes are Rhai. `.package` files are deprecated Starlark recipes, still
+-- highlighted with the Starlark parser until pm stops loading them.
+local parsers_wanted = {
+    rhai = {
+        url = "https://github.com/elkowar/tree-sitter-rhai",
+        revision = "4ac7384d487ffcb54e746ef1569585a749370c5b",
+    },
+    starlark = {
+        url = "https://github.com/tree-sitter-grammars/tree-sitter-starlark",
+        revision = "a453dbf3ba433db0e5ec621a38a7e59d72e4dc69",
+    },
+}
 
 local function register_parser()
     if not (vim.treesitter and vim.treesitter.language and vim.treesitter.language.register) then
@@ -15,25 +26,25 @@ local function register_parser()
     end
 
     local configs = parsers.get_parser_configs()
-    if configs.starlark then
-        return
+    for name, source in pairs(parsers_wanted) do
+        if not configs[name] then
+            configs[name] = {
+                install_info = {
+                    url = source.url,
+                    branch = "master",
+                    revision = source.revision,
+                    files = { "src/parser.c" },
+                },
+                filetype = name,
+            }
+        end
     end
-
-    configs.starlark = {
-        install_info = {
-            url = "https://github.com/tree-sitter-grammars/tree-sitter-starlark",
-            branch = "master",
-            revision = parser_revision,
-            files = { "src/parser.c" },
-        },
-        filetype = "starlark",
-    }
 end
 
 local function lsp_config()
     return {
         cmd = { "pm-lsp" },
-        filetypes = { "pm" },
+        filetypes = { "rhai", "pm" },
         root_markers = { ".git" },
     }
 end
@@ -58,7 +69,7 @@ local function enable_lsp()
     local group = vim.api.nvim_create_augroup("pm_lsp", { clear = true })
     vim.api.nvim_create_autocmd("FileType", {
         group = group,
-        pattern = "pm",
+        pattern = { "rhai", "pm" },
         callback = function(args)
             if vim.b[args.buf].pm_lsp_started then
                 return

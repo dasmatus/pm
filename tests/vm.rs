@@ -35,16 +35,16 @@ fn fake_bzimage(path: &Path) {
     write(path, bytes).expect("write the fake kernel");
 }
 
-/// Build a Starlark recipe whose install step runs `script`, unsandboxed.
+/// Build a Rhai recipe whose install step runs `script`, unsandboxed.
 fn build(work: &Path, kernel: &str, script: &str) -> miette::Result<PathBuf> {
     let script_path = work.join("stage.sh");
     write(&script_path, script).expect("write the staging script");
-    let recipe = work.join("build.package");
+    let recipe = work.join("build.rhai");
     write(
         &recipe,
         format!(
-            "package(\n    name = \"kernelled\",\n    version = \"0.1.0\",\n    steps = [\n        \
-             step(Install, \"stage\", [\"/bin/sh {}\"]),\n    ],\n    kernel = {kernel},\n)\n",
+            "package(#{{\n    name: \"kernelled\",\n    version: \"0.1.0\",\n    steps: [\n        \
+             step(Install, \"stage\", [\"/bin/sh {}\"]),\n    ],\n    kernel: {kernel},\n}});\n",
             script_path.display()
         ),
     )
@@ -102,7 +102,7 @@ fn a_declared_kernel_is_recorded_and_is_not_an_entrypoint() {
     let script = stage_script(work.path());
     let archive = build(
         work.path(),
-        "kernel(image = \"boot/vmlinuz\", cmdline = \"mitigations=off\")",
+        "kernel(\"boot/vmlinuz\", \"mitigations=off\")",
         &script,
     )
     .expect("the build must succeed");
@@ -137,8 +137,8 @@ fn the_file_a_kernel_symlink_points_at_is_not_an_entrypoint_either() {
          chmod 755 \"$DESTDIR/usr/bin/hello\"\n",
         image.display()
     );
-    let archive = build(work.path(), "kernel(image = \"boot/vmlinuz\")", &script)
-        .expect("the build must succeed");
+    let archive =
+        build(work.path(), "kernel(\"boot/vmlinuz\")", &script).expect("the build must succeed");
     let dest = extract(&archive);
     let metadata: Metadata =
         from_str(&read_to_string(dest.path().join("metadata")).unwrap()).unwrap();
@@ -151,7 +151,7 @@ fn a_kernel_the_steps_never_installed_fails_the_build() {
     let work = tempdir().unwrap();
     let error = build(
         work.path(),
-        "kernel(image = \"boot/vmlinuz\")",
+        "kernel(\"boot/vmlinuz\")",
         "mkdir -p \"$DESTDIR/boot\"\n",
     )
     .expect_err("a missing kernel must fail the build");
@@ -167,7 +167,7 @@ fn a_file_that_is_not_a_kernel_fails_the_build() {
     let work = tempdir().unwrap();
     let error = build(
         work.path(),
-        "kernel(image = \"boot/vmlinuz\")",
+        "kernel(\"boot/vmlinuz\")",
         "mkdir -p \"$DESTDIR/boot\"\necho not a kernel > \"$DESTDIR/boot/vmlinuz\"\n",
     )
     .expect_err("a non-kernel must fail the build");
@@ -181,7 +181,7 @@ fn a_file_that_is_not_a_kernel_fails_the_build() {
 #[test]
 fn a_kernel_outside_destdir_is_refused() {
     let work = tempdir().unwrap();
-    let error = build(work.path(), "kernel(image = \"/boot/vmlinuz\")", "true\n")
+    let error = build(work.path(), "kernel(\"/boot/vmlinuz\")", "true\n")
         .expect_err("an absolute kernel path must fail the build");
     assert!(
         chain(&error).contains("package-relative"),
@@ -194,7 +194,7 @@ fn a_kernel_outside_destdir_is_refused() {
 fn a_package_without_a_kernel_records_none() {
     let work = tempdir().unwrap();
     let script = "mkdir -p \"$DESTDIR/usr/bin\"\nprintf '#!/bin/sh\\n' > \"$DESTDIR/usr/bin/x\"\n";
-    let archive = build(work.path(), "None", script).expect("the build must succeed");
+    let archive = build(work.path(), "()", script).expect("the build must succeed");
     let dest = extract(&archive);
     let text = read_to_string(dest.path().join("metadata")).unwrap();
     assert!(!text.contains("\nkernel:"), "{text}");

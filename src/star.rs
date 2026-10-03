@@ -1,5 +1,9 @@
 //! Build files written in [Starlark](https://github.com/bazelbuild/starlark).
 //!
+//! **Deprecated.** Recipes are written in Rhai now (see [`crate::recipe`]).
+//! Starlark files still load, with a warning, for a deprecation period, and
+//! `pm migrate` converts them. This module goes away when that period ends.
+//!
 //! A `.package` build file is a small, deterministic program that calls
 //! `package(...)` exactly once. Evaluating it yields the same [`BuildFile`] a
 //! YAML file describes, so everything downstream - signature checks, policy
@@ -28,7 +32,7 @@
 //! kernel image the steps install, relative to `DESTDIR`; `pm run` boots it and
 //! runs the package's entrypoint under it instead of the host's kernel.
 
-use std::{cell::RefCell, fmt::Write as _, path::Path};
+use std::{cell::RefCell, path::Path};
 
 use miette::{IntoDiagnostic, WrapErr, miette};
 use serde_json::{Value as Json, json};
@@ -46,7 +50,7 @@ use starlark::{
     },
 };
 
-use crate::{bf::BuildFile, step::Stage};
+use crate::{bf::BuildFile, recipe, step::Stage};
 
 /// File extension of a Starlark build file, without the dot.
 pub const EXTENSION: &str = "package";
@@ -85,8 +89,6 @@ pub fn globals() -> Globals {
 struct Collected {
     package: RefCell<Option<Json>>,
 }
-
-const STEP_KEYS: [&str; 4] = ["stage", "name", "run", "dl_urls"];
 
 #[starlark_module]
 #[allow(non_snake_case)]
@@ -225,149 +227,8 @@ pub fn parse(file: &str, text: String) -> miette::Result<BuildFile> {
             "{file} never calls package()"
         )
     })?;
-    check_step_keys(&package)?;
+    recipe::check_step_keys(&package)?;
     serde_json::from_value(package)
         .into_diagnostic()
         .wrap_err_with(|| format!("{file} does not describe a valid build file"))
-}
-
-/// Reject a step dict with a missing or unrecognised key.
-///
-/// `step()` always produces a well-formed dict, but a plain `{...}` literal in
-/// `steps` is allowed too, and serde would silently ignore a misspelt key.
-fn check_step_keys(package: &Json) -> miette::Result<()> {
-    let steps = package["steps"].as_array().into_iter().flatten();
-    for (index, step) in steps.enumerate() {
-        let Some(map) = step.as_object() else {
-            return Err(miette!(
-                "steps[{index}] is not a step; build it with step(...)"
-            ));
-        };
-        if let Some(unknown) = map.keys().find(|key| !STEP_KEYS.contains(&key.as_str())) {
-            return Err(miette!(
-                "steps[{index}] has an unknown key `{unknown}`; a step has {}",
-                STEP_KEYS.join(", ")
-            ));
-        }
-        for required in ["stage", "name", "run"] {
-            if !map.contains_key(required) {
-                return Err(miette!("steps[{index}] is missing `{required}`"));
-            }
-        }
-    }
-    Ok(())
-}
-
-/// Render `build` as a Starlark build file that evaluates back to the same package.
-///
-/// Output is deterministic: download maps are sorted by URL, and every value is
-/// written as a literal, so a migrated file reads like one written by hand.
-///
-/// # Errors
-///
-/// Fails if a dependency path or the kernel image is not valid UTF-8, which a Starlark string
-/// cannot represent.
-pub fn render(build: &BuildFile) -> miette::Result<String> {
-    let mut out = String::new();
-    out.push_str("package(\n");
-    let _ = writeln!(out, "    name = {},", quote(build.name()));
-    let version = build.version();
-    if version
-        .iter()
-        .all(|part| !part.is_empty() && !part.contains('.'))
-    {
-        let _ = writeln!(out, "    version = {},", quote(&version.join(".")));
-    } else {
-        let _ = writeln!(out, "    version = {},", list(version, 1));
-    }
-    let dependencies = build
-        .dependencies()
-        .map(|path| {
-            path.to_str()
-                .map(str::to_owned)
-                .ok_or_else(|| miette!("the dependency {} is not valid UTF-8", path.display()))
-        })
-        .collect::<miette::Result<Vec<_>>>()?;
-    let _ = writeln!(out, "    dependencies = {},", list(&dependencies, 1));
-    if build.steps().is_empty() {
-        out.push_str("    steps = [],\n");
-    } else {
-        out.push_str("    steps = [\n");
-        for step in build.steps() {
-            out.push_str("        step(\n");
-            let _ = writeln!(out, "            stage = {:?},", step.stage);
-            let _ = writeln!(out, "            name = {},", quote(&step.name));
-            let _ = writeln!(out, "            run = {},", list(&step.run, 3));
-            if let Some(downloads) = &step.dl_urls {
-                let mut sorted = downloads.iter().collect::<Vec<_>>();
-                sorted.sort_by(|a, b| a.0.as_str().cmp(b.0.as_str()));
-                if sorted.is_empty() {
-                    out.push_str("            dl_urls = {},\n");
-                } else {
-                    out.push_str("            dl_urls = {\n");
-                    for (url, sha) in sorted {
-                        let _ = writeln!(
-                            out,
-                            "                {}: {},",
-                            quote(url.as_str()),
-                            quote(sha)
-                        );
-                    }
-                    out.push_str("            },\n");
-                }
-            }
-            out.push_str("        ),\n");
-        }
-        out.push_str("    ],\n");
-    }
-    if let Some(kernel) = build.kernel() {
-        let image = kernel.image.to_str().ok_or_else(|| {
-            miette!(
-                "the kernel image {} is not valid UTF-8",
-                kernel.image.display()
-            )
-        })?;
-        let _ = write!(out, "    kernel = kernel(image = {}", quote(image));
-        if let Some(cmdline) = &kernel.cmdline {
-            let _ = write!(out, ", cmdline = {}", quote(cmdline));
-        }
-        out.push_str("),\n");
-    }
-    out.push_str(")\n");
-    Ok(out)
-}
-
-/// A Starlark list literal; empty and single-line when there is nothing in it.
-fn list<S: AsRef<str>>(items: &[S], depth: usize) -> String {
-    if items.is_empty() {
-        return "[]".to_owned();
-    }
-    let indent = "    ".repeat(depth);
-    let mut out = String::from("[\n");
-    for item in items {
-        let _ = writeln!(out, "{indent}    {},", quote(item.as_ref()));
-    }
-    let _ = write!(out, "{indent}]");
-    out
-}
-
-/// A double-quoted Starlark string literal for `text`.
-fn quote(text: &str) -> String {
-    let mut out = String::with_capacity(text.len() + 2);
-    out.push('"');
-    for c in text.chars() {
-        match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            c if c.is_ascii_control() => {
-                let _ = write!(out, "\\x{:02x}", u32::from(c));
-            }
-            c => out.push(c),
-        }
-    }
-    out.push('"');
-    out
 }

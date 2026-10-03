@@ -36,6 +36,7 @@ use crate::{
     plugin::Registry,
     policy::BuildPolicy,
     progress::{Progress, Task},
+    recipe,
     sandbox::BuildSandbox,
     signing::{TrustStore, verify_file},
     star,
@@ -179,8 +180,9 @@ impl BuildFile {
         }
     }
 
-    /// Parse a signed build file from disk: Starlark if it ends in `.package`,
-    /// otherwise (deprecated) YAML.
+    /// Parse a signed build file from disk: a Rhai recipe if it ends in `.rhai`,
+    /// otherwise (deprecated) Starlark if it ends in `.package`, otherwise
+    /// (deprecated) YAML.
     ///
     /// The detached signature at `<path>.sig` is verified against the local
     /// trust store **before** the file is parsed, and every dependency loaded
@@ -195,7 +197,17 @@ impl BuildFile {
     /// does not verify against the file, if `path` cannot be read, or if it
     /// does not contain a valid build file.
     pub fn load(path: &Path) -> miette::Result<Self> {
-        Self::load_in(&BuildContext::from_env()?, path)
+        Self::load_with(path, Registry::none())
+    }
+
+    /// As [`BuildFile::load`], with the modules `plugins` add to Rhai recipes in
+    /// scope (see [`crate::recipe`]).
+    ///
+    /// # Errors
+    ///
+    /// As [`BuildFile::load`].
+    pub fn load_with(path: &Path, plugins: &Registry) -> miette::Result<Self> {
+        Self::load_in_with(&BuildContext::from_env()?, path, plugins)
     }
 
     /// As [`BuildFile::load`], verifying the signature against `ctx.trust_dir`
@@ -210,8 +222,22 @@ impl BuildFile {
     ///
     /// As [`BuildFile::load`].
     pub fn load_in(ctx: &BuildContext, path: &Path) -> miette::Result<Self> {
+        Self::load_in_with(ctx, path, Registry::none())
+    }
+
+    /// As [`BuildFile::load_in`], with the modules `plugins` add to Rhai recipes in
+    /// scope.
+    ///
+    /// # Errors
+    ///
+    /// As [`BuildFile::load`].
+    pub fn load_in_with(
+        ctx: &BuildContext,
+        path: &Path,
+        plugins: &Registry,
+    ) -> miette::Result<Self> {
         verify_signature(path, &ctx.trust_dir)?;
-        Self::parse(path, Verification::Signed)
+        Self::parse(path, Verification::Signed, plugins)
     }
 
     /// Parse a build file **without checking its signature**.
@@ -227,12 +253,22 @@ impl BuildFile {
     ///
     /// Fails if `path` cannot be read or does not contain a valid build file.
     pub fn load_unverified(path: &Path) -> miette::Result<Self> {
+        Self::load_unverified_with(path, Registry::none())
+    }
+
+    /// As [`BuildFile::load_unverified`], with the modules `plugins` add to Rhai
+    /// recipes in scope.
+    ///
+    /// # Errors
+    ///
+    /// As [`BuildFile::load_unverified`].
+    pub fn load_unverified_with(path: &Path, plugins: &Registry) -> miette::Result<Self> {
         warn!(
             file = %path.display(),
             "loading a build file WITHOUT verifying its signature; the commands in it, and in \
              every dependency it names, will run without anyone having vouched for them"
         );
-        Self::parse(path, Verification::Unverified)
+        Self::parse(path, Verification::Unverified, plugins)
     }
 
     /// Build every dependency, build this package, and package the result.
@@ -454,19 +490,28 @@ impl BuildFile {
         }
     }
 
-    /// Parse the build file at `path` - Starlark if it ends in `.package`, YAML
-    /// otherwise - recording where it came from and how far it was trusted.
-    fn parse(path: &Path, verification: Verification) -> miette::Result<Self> {
+    /// Parse the build file at `path` - Rhai if it ends in `.rhai`, Starlark if
+    /// it ends in `.package`, YAML otherwise - recording where it came from and
+    /// how far it was trusted. The last two are deprecated and warn.
+    fn parse(path: &Path, verification: Verification, plugins: &Registry) -> miette::Result<Self> {
         let text = read_to_string(path)
             .into_diagnostic()
             .wrap_err_with(|| format!("cannot read build file {}", path.display()))?;
-        let mut build_file: Self = if star::is_starlark(path) {
+        let mut build_file: Self = if recipe::is_rhai(path) {
+            recipe::parse_with(&path.display().to_string(), text, plugins)
+                .wrap_err_with(|| format!("cannot evaluate recipe {}", path.display()))?
+        } else if star::is_starlark(path) {
+            warn!(
+                file = %path.display(),
+                "Starlark recipes are deprecated and will stop loading in a future release; \
+                 convert it to Rhai with `pm migrate`"
+            );
             star::parse(&path.display().to_string(), text)
                 .wrap_err_with(|| format!("cannot evaluate build file {}", path.display()))?
         } else {
             warn!(
                 file = %path.display(),
-                "YAML build files are deprecated; convert it with `pm migrate`"
+                "YAML build files are deprecated; convert it to Rhai with `pm migrate`"
             );
             from_str(&text)
                 .into_diagnostic()

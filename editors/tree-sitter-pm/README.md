@@ -1,5 +1,7 @@
 # tree-sitter-pm
 
+**Deprecated.** pm recipes are Rhai `.rhai` files now; these queries cover the old Starlark `.package` files until pm stops loading them. For `.rhai` recipes, use [`tree-sitter-rhai`](https://github.com/elkowar/tree-sitter-rhai) with the queries under `../zed/languages/pm-recipe/` or `../nvim/queries/rhai/`.
+
 `pm` build files are plain Starlark with the `.package` extension, so this package intentionally reuses the upstream Starlark grammar instead of defining a new parser.
 
 - Upstream grammar: <https://github.com/tree-sitter-grammars/tree-sitter-starlark>

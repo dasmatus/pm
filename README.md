@@ -1,51 +1,125 @@
 # pm
 
 Build signed recipes into `.cpkg` archives and run their entrypoints in a Linux
-sandbox. See [the examples](examples/README.md) for `.package` recipe syntax and signing.
+sandbox. See [the examples](examples/README.md) for `.rhai` recipe syntax and signing.
 
-## Build files are Starlark
+## Recipes are Rhai
 
-Recipes are [Starlark](https://github.com/bazelbuild/starlark) programs in
-`*.package` files that call `package(...)` once, with `step(...)` for each
-build step. Loops, functions and comprehensions generate steps and commands;
-evaluation is hermetic (no I/O, no `load()`) and happens before the policy is
+Recipes are [Rhai](https://rhai.rs) scripts in `*.rhai` files that call
+`package(#{ ... })` once, with `step(...)` for each build step. Rhai has no
+keyword arguments, so `package` takes an object map. Loops, functions and
+conditionals generate steps and commands; evaluation is hermetic (no I/O, no
+clock, no `import` or `eval`), runs under operation and size limits so a
+runaway loop is an error rather than a hang, and happens before the policy is
 derived and before anything runs.
 
-```python
-package(
-    name = "hello",
-    version = "1.0.0",
-    steps = [
+```rhai
+package(#{
+    name: "hello",
+    version: "1.0.0",
+    steps: [
         step(Install, "stage", ["install -Dm755 /usr/bin/echo /dest/usr/bin/hello"]),
     ],
-)
+});
 ```
 
-* `pm generate build.package` writes a starter file.
-* `pm migrate build.yaml` converts a YAML recipe (`-r` follows its YAML
-  dependencies). YAML recipes still load but are deprecated; migrated files are
-  unsigned, so run `pm sign` on them.
-* `pm-lsp` is a language server (diagnostics, completion, hover) for `.package`
-  files, and [`editors/`](editors/README.md) has tree-sitter queries and
-  Zed and Neovim integrations that use it.
+* `pm generate build.rhai` writes a starter file.
+* `pm-lsp` is a language server (diagnostics, completion, hover) for `.rhai`
+  recipes, and [`editors/`](editors/README.md) has Zed and Neovim integrations
+  that use it. `pm-lsp --definitions` prints a Rhai definitions file for editors
+  that run a Rhai language server of their own.
+
+### Objects
+
+`step(...)`, `kernel(...)` and `Package(name, version)` return objects with
+properties and methods, so a package can be built up before it is declared.
+Recipes can also define their own objects as object maps with closures, where
+`this` is the map:
+
+```rhai
+let autotools = #{
+    prefix: "/usr",
+    build: |name| step(Build, name, [`./configure --prefix=${this.prefix}`, "make"]),
+};
+
+let p = Package("hello", "1.0.0");
+p += autotools.build("compile");
+p += step(Install, "stage", []).push("make install DESTDIR=/dest");
+p.depends_on("../libc/build.rhai");
+package(p);
+```
+
+`Step` has `stage`, `name`, `run` and `dl_urls`, plus `push(command)`,
+`download(url, sha256)` and `+= command`. `Package` has `name`, `version`,
+`dependencies`, `steps` and `kernel`, plus `depends_on`, `add_step`,
+`add_steps`, `with_kernel`, `+= step` and `for step in package`. Setting a
+property is checked on the spot, so `s.stage = "Deploy"` fails on that line.
+
+### Plugins in recipes
+
+An installed plugin is a Rhai module under its own name. Its symbols are
+constants and, when it is built against the `recipe-plugin` world, its recipe
+functions are functions that return pm's own types, checked as if the recipe
+had built them:
+
+```rhai
+let p = Package("units", "1");
+p += systemd::install_unit("units/foo.service");   // a Step
+p += step(Test, "unitdir", [`test -d /dest${systemd::unitdir}`]);
+package(p);
+```
+
+`pm plugins` lists what each plugin adds. See
+[`plugins/README.md`](plugins/README.md#recipe-functions).
+
+### How recipes run
+
+Recipes are compiled with Rhai's full optimiser (constant folding and inlining
+of pure calls) and fast operators, lowered to bytecode and run on Rhai's Grain
+VM. The engine is built once per thread, so a dependency graph of many recipes
+pays for it once. Strict variables and strict map properties catch misspellings
+before anything runs.
+
+Some Rhai features are deliberately left out: floating point (`no_float`; a
+package has no use for it and it makes evaluation platform-dependent), the
+clock (`no_time`), `import` and `eval` (a signature covers one file as
+written), the `unchecked` build (it removes the operation and size limits),
+and an on-disk bytecode cache (the bytes that run would no longer be the bytes
+that were signed).
+
+### Moving off Starlark and YAML
+
+Recipes used to be Starlark `.package` files, and before that YAML. Both still
+load, so nothing breaks today, but each load logs a deprecation warning and
+support will be removed in a future release.
+
+* `pm migrate build.package` writes `build.rhai` next to it, describing the same
+  package. `pm migrate build.yaml` does the same for YAML. `-r` also converts
+  every Starlark or YAML recipe it depends on and points the dependency paths at
+  the new files; `--stdout` prints instead of writing.
+* The Starlark is evaluated, not translated, so loops and functions come out as
+  the steps they produced, written out literally. Comments are not carried over.
+* A signature covers one file's bytes, so sign the new file with `pm sign`.
+* The old file is left in place. Delete it, and its `.sig`, once the `.rhai`
+  file is signed and builds.
 
 ## Shipping a kernel
 
 A package can ship its own Linux kernel. Install the image into `DESTDIR` with
-the package's steps and name it in `package(...)`:
+the package's steps and name it in `package(#{ ... })`:
 
-```python
-package(
-    name = "hello",
-    version = "1.0.0",
-    steps = [
+```rhai
+package(#{
+    name: "hello",
+    version: "1.0.0",
+    steps: [
         step(Install, "stage", [
             "install -Dm644 /path/to/vmlinuz /dest/boot/vmlinuz",
             "install -Dm755 /path/to/hello /dest/usr/bin/hello",
         ]),
     ],
-    kernel = kernel(image = "boot/vmlinuz", cmdline = "mitigations=off"),
-)
+    kernel: kernel("boot/vmlinuz", "mitigations=off"),
+});
 ```
 
 `image` is relative to `DESTDIR`. The build fails if the steps did not install

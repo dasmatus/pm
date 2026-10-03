@@ -124,6 +124,47 @@ interface types {
         summary: string,
     }
 
+    /// What a recipe function returns, so pm can check it and hand it to the
+    /// recipe as the matching pm type rather than as loose data.
+    ///
+    /// Values cross the boundary as JSON text. Every kind but `any` is an object
+    /// with exactly the keys a recipe would write by hand, and pm refuses one with
+    /// a key missing, misspelt or of the wrong type - the same checks a recipe's own
+    /// `step(#{ ... })` gets - so a plugin cannot hand a recipe something the recipe
+    /// could not have written itself.
+    enum recipe-value {
+        /// Any JSON value: a string, an integer, a boolean, an array, an object or
+        /// `null` (which a recipe sees as `()`). Floating-point numbers are refused,
+        /// because recipes have none.
+        any,
+        /// A build step: `{"stage", "name", "run", "dl_urls"?}`. The recipe gets a
+        /// `Step`.
+        step,
+        /// An array of build steps. The recipe gets an array of `Step`.
+        steps,
+        /// A kernel: `{"image", "cmdline"?}`. The recipe gets a `Kernel`.
+        kernel,
+        /// A whole package: `{"name", "version", "dependencies"?, "steps"?,
+        /// "kernel"?}`. The recipe gets a `Package` it can extend and then declare.
+        %package,
+    }
+
+    /// A function a plugin adds to Rhai recipes, under the plugin's own name:
+    /// `systemd::install_unit("foo.service")`.
+    record recipe-function {
+        /// How a recipe calls it, after `<plugin>::` (with any `-` in the plugin's
+        /// name written `_`). 1-32 characters of `[a-z0-9_]`, not starting with a
+        /// digit.
+        name: string,
+        /// Its parameters' names, for documentation. Their number is the
+        /// function's arity: pm only calls it with exactly that many arguments.
+        params: list<string>,
+        /// What it returns.
+        returns: recipe-value,
+        /// What it does, in Markdown, shown by `pm plugins` and by `pm-lsp`.
+        doc: string,
+    }
+
     /// A hook a plugin implements.
     ///
     /// pm calls a hook only if the manifest lists it. The exports are all
@@ -222,4 +263,31 @@ world bundled {
     /// them. pm lists these when a command matches nothing, and recognises them when it
     /// reads back a serialised build policy.
     export fingerprints: func() -> list<string>;
+}
+
+/// The world of a plugin that also adds functions to Rhai recipes.
+///
+/// Everything `plugin` exports, plus a list of functions and the one entry point that
+/// runs them. pm notices the extra exports when it loads the component; a plugin built
+/// against plain `plugin` loads exactly as before.
+///
+/// A recipe function runs like every other call: in a fresh instance, metered, with
+/// nothing but `log` to talk to. Its answer is a function of its arguments alone, which
+/// is what lets a recipe that calls it still evaluate to the same package everywhere.
+/// The plugin's file hash is already part of the build policy digest, so a recipe
+/// function that changes changes that digest too.
+world recipe-plugin {
+    include plugin;
+
+    use types.{recipe-function};
+
+    /// Every function this plugin adds to recipes. Called once, at load.
+    export recipe-functions: func() -> list<recipe-function>;
+
+    /// Run the recipe function called `name`.
+    ///
+    /// `args` holds one JSON text per parameter. The answer is JSON text of the kind
+    /// the function's `returns` names, or a message for the recipe's author, which
+    /// fails the recipe with that message.
+    export call-recipe-function: func(name: string, args: list<string>) -> result<string, string>;
 }

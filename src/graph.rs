@@ -594,8 +594,8 @@ impl Resolver<'_> {
         // A dependency is loaded exactly as strictly as the root was:
         // signatures are checked all the way down, or not at all.
         let build = match self.verification {
-            Verification::Signed => BuildFile::load_in(self.ctx, &key),
-            Verification::Unverified => BuildFile::load_unverified(&key),
+            Verification::Signed => BuildFile::load_in_with(self.ctx, &key, self.plugins),
+            Verification::Unverified => BuildFile::load_unverified_with(&key, self.plugins),
         }
         .wrap_err_with(|| format!("dependency {} failed", key.display()))?;
 
