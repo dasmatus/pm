@@ -26,7 +26,66 @@ package(#{
 * `pm generate build.rhai` writes a starter file.
 * `pm-lsp` is a language server (diagnostics, completion, hover) for `.rhai`
   recipes, and [`editors/`](editors/README.md) has Zed and Neovim integrations
-  that use it.
+  that use it. `pm-lsp --definitions` prints a Rhai definitions file for editors
+  that run a Rhai language server of their own.
+
+### Objects
+
+`step(...)`, `kernel(...)` and `Package(name, version)` return objects with
+properties and methods, so a package can be built up before it is declared.
+Recipes can also define their own objects as object maps with closures, where
+`this` is the map:
+
+```rhai
+let autotools = #{
+    prefix: "/usr",
+    build: |name| step(Build, name, [`./configure --prefix=${this.prefix}`, "make"]),
+};
+
+let p = Package("hello", "1.0.0");
+p += autotools.build("compile");
+p += step(Install, "stage", []).push("make install DESTDIR=/dest");
+p.depends_on("../libc/build.rhai");
+package(p);
+```
+
+`Step` has `stage`, `name`, `run` and `dl_urls`, plus `push(command)`,
+`download(url, sha256)` and `+= command`. `Package` has `name`, `version`,
+`dependencies`, `steps` and `kernel`, plus `depends_on`, `add_step`,
+`add_steps`, `with_kernel`, `+= step` and `for step in package`. Setting a
+property is checked on the spot, so `s.stage = "Deploy"` fails on that line.
+
+### Plugins in recipes
+
+An installed plugin is a Rhai module under its own name. Its symbols are
+constants and, when it is built against the `recipe-plugin` world, its recipe
+functions are functions that return pm's own types, checked as if the recipe
+had built them:
+
+```rhai
+let p = Package("units", "1");
+p += systemd::install_unit("units/foo.service");   // a Step
+p += step(Test, "unitdir", [`test -d /dest${systemd::unitdir}`]);
+package(p);
+```
+
+`pm plugins` lists what each plugin adds. See
+[`plugins/README.md`](plugins/README.md#recipe-functions).
+
+### How recipes run
+
+Recipes are compiled with Rhai's full optimiser (constant folding and inlining
+of pure calls) and fast operators, lowered to bytecode and run on Rhai's Grain
+VM. The engine is built once per thread, so a dependency graph of many recipes
+pays for it once. Strict variables and strict map properties catch misspellings
+before anything runs.
+
+Some Rhai features are deliberately left out: floating point (`no_float`; a
+package has no use for it and it makes evaluation platform-dependent), the
+clock (`no_time`), `import` and `eval` (a signature covers one file as
+written), the `unchecked` build (it removes the operation and size limits),
+and an on-disk bytecode cache (the bytes that run would no longer be the bytes
+that were signed).
 
 ### Moving off Starlark and YAML
 

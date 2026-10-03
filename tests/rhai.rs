@@ -590,3 +590,190 @@ package(#{
     .expect("evaluates");
     assert_eq!(build.steps()[0].run, ["test ! -w /usr", "test ! -w /etc"]);
 }
+
+#[test]
+fn a_package_can_be_built_up_as_an_object() {
+    let build = eval(
+        r#"
+let p = Package("obj", "1.2");
+p += step(Prepare, "fetch", []).download("https://example.org/a.tar.xz", "00");
+p += step(Build, "compile", []).push("make").push("make check");
+let install = step(Install, "stage", []);
+install += "make install DESTDIR=/dest";
+p.add_step(install);
+p.depends_on("../lib.rhai");
+p.kernel = kernel("boot/vmlinuz");
+p.name = p.name + "-renamed";
+let names = [];
+for s in p { names.push(s.name); }
+if names != ["fetch", "compile", "stage"] { throw `iterated ${names}`; }
+if p.len() != 3 { throw "len"; }
+package(p);
+"#,
+    )
+    .expect("evaluates");
+    assert_eq!(build.name(), "obj-renamed");
+    assert_eq!(build.version_string(), "1.2");
+    let steps = build.steps();
+    assert_eq!(steps[1].run, ["make", "make check"]);
+    assert_eq!(steps[2].run, ["make install DESTDIR=/dest"]);
+    assert_eq!(steps[0].dl_urls.as_ref().map(|urls| urls.len()), Some(1));
+    assert_eq!(
+        build.dependencies().collect::<Vec<_>>(),
+        [Path::new("../lib.rhai")]
+    );
+    assert!(build.kernel().is_some());
+}
+
+#[test]
+fn step_and_kernel_properties_are_checked_when_set() {
+    let message = error(
+        "let s = step(Build, \"x\", []);\ns.stage = \"Deploy\";\npackage(#{ name: \"p\", version: \"1\", steps: [s] });",
+    );
+    assert!(message.contains("unknown stage"), "{message}");
+    assert!(message.contains("line 2"), "{message}");
+
+    let message = error("let p = Package(\"p\", 1);\npackage(p);");
+    assert!(message.contains("version must be"), "{message}");
+
+    let message = error("let p = Package(\"p\", \"1\");\np.add_step(42);\npackage(p);");
+    assert!(message.contains("a step must be"), "{message}");
+}
+
+#[test]
+fn typed_and_map_spellings_mix() {
+    let typed = eval(
+        r#"
+let p = Package(#{ name: "m", version: "1", steps: [#{ stage: Build, name: "a", run: ["x"] }] });
+p += step(#{ stage: Test, name: "b", run: [] });
+package(#{ name: p.name, version: p.version, steps: p.steps, kernel: kernel(#{ image: "k" }) });
+"#,
+    )
+    .expect("evaluates");
+    let names: Vec<_> = typed.steps().iter().map(|s| s.name.as_str()).collect();
+    assert_eq!(names, ["a", "b"]);
+    let s = eval(
+        r#"let s = step(Build, "x", ["a"]); let m = s.to_map(); m.run.push("b"); package(#{ name: "p", version: "1", steps: [m] });"#,
+    )
+    .expect("evaluates");
+    assert_eq!(s.steps()[0].run, ["a", "b"]);
+}
+
+#[test]
+fn object_maps_with_closures_are_objects_too() {
+    let build = eval(
+        r#"
+let autotools = #{
+    prefix: "/usr",
+    configure: |name| step(Build, name, [`./configure --prefix=${this.prefix}`, "make"]),
+};
+autotools.prefix = "/opt";
+package(#{ name: "oop", version: "1", steps: [autotools.configure("compile")] });
+"#,
+    )
+    .expect("evaluates");
+    assert_eq!(build.steps()[0].run, ["./configure --prefix=/opt", "make"]);
+}
+
+#[test]
+fn reading_a_missing_map_property_is_an_error() {
+    let message = error("let m = #{ name: \"p\" };\npackage(#{ name: m.nmae, version: \"1\" });");
+    assert!(message.contains("nmae"), "{message}");
+}
+
+#[test]
+fn global_constants_work_inside_functions() {
+    // Grain cannot yet resolve `global::` from inside a function; such a recipe runs
+    // on the tree walker instead, with the same result.
+    let build = eval(
+        r#"
+const PREFIX = "/usr";
+fn configure() { step(Build, "configure", [`./configure --prefix=${global::PREFIX}`]) }
+package(#{ name: "g", version: "1", steps: [configure()] });
+"#,
+    )
+    .expect("evaluates");
+    assert_eq!(build.steps()[0].run, ["./configure --prefix=/usr"]);
+}
+
+#[test]
+fn errors_inside_functions_point_into_them() {
+    let message = error(
+        "fn probe(stage) {\n    step(stage, \"x\", [])\n}\npackage(#{ name: \"p\", version: \"1\", steps: [probe(\"Deploy\")] });",
+    );
+    assert!(message.contains("unknown stage"), "{message}");
+    assert!(message.contains("probe"), "{message}");
+    assert!(message.contains("line 2"), "{message}");
+}
+
+#[test]
+fn import_is_refused_when_the_recipe_is_compiled() {
+    // Refused by the parser, before any module resolver could look for a file.
+    let Err(error) =
+        recipe::evaluate("import \"other\" as o;\npackage(#{ name: \"p\", version: \"1\" });")
+    else {
+        panic!("import is refused");
+    };
+    assert_eq!(error.position.map(|(line, _)| line), Some(1), "{error:?}");
+    assert!(error.help.is_some_and(|help| help.contains("import")));
+}
+
+#[test]
+fn constant_folding_keeps_package_where_it_was_written() {
+    // `package` is volatile: even with every argument constant, the optimiser must
+    // not run it at compile time, or a recipe that throws before it would still
+    // declare a package.
+    let message = error("throw \"stop\";\npackage(#{ name: \"p\", version: \"1\" });");
+    assert!(message.contains("stop"), "{message}");
+}
+
+#[test]
+fn definitions_describe_pm_s_types() {
+    let definitions = recipe::definitions(pm::plugin::Registry::none());
+    for needle in [
+        "fn step(",
+        "fn kernel(",
+        "fn Package(",
+        "fn push(",
+        "Prepare",
+    ] {
+        assert!(
+            definitions.contains(needle),
+            "{needle} missing from:\n{definitions}"
+        );
+    }
+}
+
+#[test]
+fn the_documented_object_examples_evaluate() {
+    // Mirrors the examples under "Objects" in README.md and in examples/README.md.
+    let build = eval(
+        r#"
+let autotools = #{
+    prefix: "/usr",
+    build: |name| step(Build, name, [`./configure --prefix=${this.prefix}`, "make"]),
+};
+
+let p = Package("hello", "1.0.0");
+p += autotools.build("compile");
+p += step(Install, "stage", []).push("make install DESTDIR=/dest");
+p.depends_on("../libc/build.rhai");
+package(p);
+"#,
+    )
+    .expect("evaluates");
+    assert_eq!(build.steps()[0].run, ["./configure --prefix=/usr", "make"]);
+    assert_eq!(build.steps()[1].run, ["make install DESTDIR=/dest"]);
+
+    let build = eval(
+        r#"
+let p = Package("demo", "0.1.0");
+for path in ["/usr", "/etc"] {
+    p += step(Prepare, `confine ${path}`, [`test ! -w ${path}`]);
+}
+package(p);
+"#,
+    )
+    .expect("evaluates");
+    assert_eq!(build.steps()[1].run, ["test ! -w /etc"]);
+}

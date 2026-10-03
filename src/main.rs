@@ -581,7 +581,7 @@ fn build(
         return Err(miette!("The path {} does not exist.", file.display()));
     }
 
-    let mut build_file = BuildFile::load(file)?;
+    let mut build_file = BuildFile::load_with(file, plugins)?;
     // The graph expands every package again as it resolves it; this copy exists so the
     // policy logged below is the one the top-level package will actually build under.
     build_file.expand(plugins)?;
@@ -720,6 +720,28 @@ fn list_plugins(plugins: &Registry, digests: bool) -> miette::Result<()> {
                 );
             }
         }
+        if !manifest.recipe_functions.is_empty() {
+            println!(
+                "{:<LABEL_WIDTH$}{}",
+                "recipes:",
+                manifest.recipe_functions.len()
+            );
+            let namespace = manifest.name.replace('-', "_");
+            for function in manifest.recipe_functions.values() {
+                let summary = function.doc.lines().next().unwrap_or_default();
+                let summary = if summary.is_empty() {
+                    String::new()
+                } else {
+                    format!("  ({summary})")
+                };
+                println!(
+                    "  {namespace}::{}({}) -> {}{summary}",
+                    function.name,
+                    function.params.join(", "),
+                    function.returns.label()
+                );
+            }
+        }
         println!("{:<LABEL_WIDTH$}{}", "file:", plugin.path().display());
         if digests {
             println!("{:<LABEL_WIDTH$}{}", "sha256:", plugin.sha256());
@@ -798,7 +820,7 @@ fn explain(
         return Err(miette!("The path {} does not exist.", file.display()));
     }
 
-    let mut build_file = BuildFile::load(file)?;
+    let mut build_file = BuildFile::load_with(file, plugins)?;
     // Expanded first, so the table below prints the commands that would run rather than
     // the ones the file was written with. Which symbols did that is printed too.
     let symbols = build_file.expand(plugins)?;

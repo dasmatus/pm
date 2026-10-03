@@ -7,6 +7,17 @@
 //! builtin, a missing `package(...)`, or a package that is not a valid build
 //! file. It also completes pm's builtins and documents them on hover.
 //!
+//! Recipes are evaluated with the installed plugins' modules in scope, as `pm
+//! build` would: `systemd::install_unit(...)` resolves, and completes, when the
+//! systemd plugin is installed. Plugins load from `<config>/pm/plugins` with their
+//! signatures checked, or from `--plugin-dir DIR`; `--allow-unsigned-plugins` and
+//! `--no-plugins` mean what they mean to `pm`. A plugin directory that does not
+//! load is reported once and the server carries on without plugins.
+//!
+//! `pm-lsp --definitions` prints a Rhai definitions file (`.d.rhai`) for pm's
+//! builtins, types and plugin modules instead of serving, for editors that run a
+//! Rhai language server of their own.
+//!
 //! Deprecated Starlark `.package` files get a warning pointing at `pm migrate`,
 //! plus any error evaluating them.
 
@@ -26,9 +37,46 @@ use lsp_types::{
     request::{Completion, HoverRequest, Request as _},
 };
 use miette::IntoDiagnostic;
-use pm::{recipe, star};
+use pm::{
+    plugin::{Loader, Registry, default_plugin_dir},
+    recipe, star,
+};
 
 fn main() -> miette::Result<()> {
+    let mut args = std::env::args().skip(1);
+    let mut definitions = false;
+    let mut no_plugins = false;
+    let mut allow_unsigned = false;
+    let mut plugin_dir = None;
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--definitions" => definitions = true,
+            "--no-plugins" => no_plugins = true,
+            "--allow-unsigned-plugins" => allow_unsigned = true,
+            "--plugin-dir" => plugin_dir = args.next().map(std::path::PathBuf::from),
+            "--version" => {
+                println!("pm-lsp {}", env!("CARGO_PKG_VERSION"));
+                return Ok(());
+            }
+            other => {
+                return Err(miette::miette!(
+                    help = "Usage: pm-lsp [--definitions] [--plugin-dir DIR] \
+                            [--allow-unsigned-plugins] [--no-plugins]",
+                    "unknown argument {other:?}"
+                ));
+            }
+        }
+    }
+    let plugins = if no_plugins {
+        Registry::empty()
+    } else {
+        load_plugins(plugin_dir, allow_unsigned)
+    };
+    if definitions {
+        print!("{}", recipe::definitions(&plugins));
+        return Ok(());
+    }
+
     let (connection, io_threads) = Connection::stdio();
     let capabilities = ServerCapabilities {
         text_document_sync: Some(TextDocumentSyncCapability::Kind(TextDocumentSyncKind::FULL)),
@@ -39,21 +87,34 @@ fn main() -> miette::Result<()> {
     connection
         .initialize(serde_json::to_value(capabilities).into_diagnostic()?)
         .into_diagnostic()?;
-    serve(&connection)?;
+    serve(&connection, &plugins)?;
     drop(connection);
     io_threads.join().into_diagnostic()
 }
 
+/// The installed plugins, or none when they do not load: an editor is better served
+/// by a server that checks recipes without plugin modules than by none at all.
+fn load_plugins(dir: Option<std::path::PathBuf>, allow_unsigned: bool) -> Registry {
+    let loaded = dir
+        .map_or_else(default_plugin_dir, Ok)
+        .and_then(|dir| Loader::new(dir).allow_unsigned(allow_unsigned).load());
+    loaded.unwrap_or_else(|report| {
+        eprintln!("pm-lsp: carrying on without plugins: {report:?}");
+        Registry::empty()
+    })
+}
+
 /// Answer requests until the client shuts the server down.
-fn serve(connection: &Connection) -> miette::Result<()> {
-    let mut documents = HashMap::<Uri, String>::new();
+fn serve(connection: &Connection, plugins: &Registry) -> miette::Result<()> {
+    // Keyed by the URI's text: `Uri` caches parts of itself, so it is a poor key.
+    let mut documents = HashMap::<String, String>::new();
     for message in &connection.receiver {
         match message {
             Message::Request(request) => {
                 if connection.handle_shutdown(&request).into_diagnostic()? {
                     return Ok(());
                 }
-                let response = respond(&documents, request);
+                let response = respond(&documents, plugins, request);
                 connection
                     .sender
                     .send(Message::Response(response))
@@ -61,7 +122,7 @@ fn serve(connection: &Connection) -> miette::Result<()> {
             }
             Message::Notification(notification) => {
                 if let Some((uri, text)) = update(&mut documents, notification) {
-                    let diagnostics = text.as_deref().map(|text| check(&uri, text));
+                    let diagnostics = text.as_deref().map(|text| check(&uri, text, plugins));
                     let params = PublishDiagnosticsParams {
                         uri,
                         diagnostics: diagnostics.unwrap_or_default(),
@@ -85,7 +146,7 @@ fn serve(connection: &Connection) -> miette::Result<()> {
 /// Apply a document notification. Returns the document it touched and its new
 /// text, `None` once it is closed.
 fn update(
-    documents: &mut HashMap<Uri, String>,
+    documents: &mut HashMap<String, String>,
     notification: Notification,
 ) -> Option<(Uri, Option<String>)> {
     match notification.method.as_str() {
@@ -93,7 +154,7 @@ fn update(
             let params: DidOpenTextDocumentParams =
                 notification.extract(DidOpenTextDocument::METHOD).ok()?;
             let document = params.text_document;
-            documents.insert(document.uri.clone(), document.text.clone());
+            documents.insert(document.uri.as_str().to_owned(), document.text.clone());
             Some((document.uri, Some(document.text)))
         }
         DidChangeTextDocument::METHOD => {
@@ -102,20 +163,20 @@ fn update(
             // Full sync: the last change is the whole document.
             let text = params.content_changes.into_iter().last()?.text;
             let uri = params.text_document.uri;
-            documents.insert(uri.clone(), text.clone());
+            documents.insert(uri.as_str().to_owned(), text.clone());
             Some((uri, Some(text)))
         }
         DidCloseTextDocument::METHOD => {
             let params: DidCloseTextDocumentParams =
                 notification.extract(DidCloseTextDocument::METHOD).ok()?;
-            documents.remove(&params.text_document.uri);
+            documents.remove(params.text_document.uri.as_str());
             Some((params.text_document.uri, None))
         }
         _ => None,
     }
 }
 
-fn respond(documents: &HashMap<Uri, String>, request: Request) -> Response {
+fn respond(documents: &HashMap<String, String>, plugins: &Registry, request: Request) -> Response {
     let id = request.id.clone();
     match request.method.as_str() {
         HoverRequest::METHOD => {
@@ -124,12 +185,12 @@ fn respond(documents: &HashMap<Uri, String>, request: Request) -> Response {
                 .ok()
                 .and_then(|(_, params)| {
                     let position = params.text_document_position_params;
-                    let text = documents.get(&position.text_document.uri)?;
-                    hover(text, position.position)
+                    let text = documents.get(position.text_document.uri.as_str())?;
+                    hover(text, position.position, plugins)
                 });
             Response::new_ok(id, hover)
         }
-        Completion::METHOD => Response::new_ok(id, completions()),
+        Completion::METHOD => Response::new_ok(id, completions(plugins)),
         _ => Response::new_err(
             id,
             lsp_server::ErrorCode::MethodNotFound as i32,
@@ -139,7 +200,7 @@ fn respond(documents: &HashMap<Uri, String>, request: Request) -> Response {
 }
 
 /// Every problem with the document at `uri`.
-fn check(uri: &Uri, text: &str) -> Vec<Diagnostic> {
+fn check(uri: &Uri, text: &str, plugins: &Registry) -> Vec<Diagnostic> {
     if uri.as_str().ends_with(&format!(".{}", star::EXTENSION)) {
         let mut diagnostics = vec![Diagnostic {
             range: Range::default(),
@@ -161,7 +222,7 @@ fn check(uri: &Uri, text: &str) -> Vec<Diagnostic> {
         }
         return diagnostics;
     }
-    let Err(error) = recipe::evaluate(text) else {
+    let Err(error) = recipe::evaluate_with(text, plugins) else {
         return Vec::new();
     };
     let start = error
@@ -171,7 +232,7 @@ fn check(uri: &Uri, text: &str) -> Vec<Diagnostic> {
         });
     let mut message = error.message;
     if let Some(help) = error.help {
-        message.push_str("\n");
+        message.push('\n');
         message.push_str(&help);
     }
     vec![Diagnostic {
@@ -197,10 +258,12 @@ fn lsp_position(text: &str, line: usize, column: usize) -> Position {
     }
 }
 
-/// The documentation of the builtin under `position`, if there is one.
-fn hover(text: &str, position: Position) -> Option<Hover> {
+/// The documentation of the builtin or plugin function under `position`, if there is
+/// one.
+fn hover(text: &str, position: Position, plugins: &Registry) -> Option<Hover> {
     let line = text.lines().nth(usize::try_from(position.line).ok()?)?;
-    // Walk to the UTF-16 offset, then widen to the identifier around it.
+    // Walk to the UTF-16 offset, then widen to the identifier around it, taking in a
+    // `plugin::` path in front of it.
     let mut units = 0;
     let at = line
         .char_indices()
@@ -209,42 +272,105 @@ fn hover(text: &str, position: Position) -> Option<Hover> {
             units > position.character as usize
         })
         .map_or(line.len(), |(offset, _)| offset);
-    let is_ident = |c: char| c.is_alphanumeric() || c == '_';
+    let is_ident = |c: char| c.is_alphanumeric() || c == '_' || c == ':';
     let start = line[..at]
         .rfind(|c: char| !is_ident(c))
         .map_or(0, |offset| offset + 1);
     let end = line[at..]
         .find(|c: char| !is_ident(c))
         .map_or(line.len(), |offset| at + offset);
-    let word = &line[start..end];
-    let builtin = recipe::BUILTINS
-        .iter()
-        .find(|builtin| builtin.name == word)?;
+    let word = line[start..end].trim_matches(':');
+    let (signature, doc) = match word.split_once("::") {
+        Some(_) => plugin_items(plugins)
+            .into_iter()
+            .find(|item| item.label == word)
+            .map(|item| (item.signature, item.doc))?,
+        None => recipe::BUILTINS
+            .iter()
+            .find(|builtin| builtin.name == word)
+            .map(|builtin| (builtin.signature.to_owned(), builtin.doc.to_owned()))?,
+    };
     Some(Hover {
         contents: HoverContents::Markup(MarkupContent {
             kind: MarkupKind::Markdown,
-            value: format!("```rhai\n{}\n```\n\n{}", builtin.signature, builtin.doc),
+            value: format!("```rhai\n{signature}\n```\n\n{doc}"),
         }),
         range: None,
     })
 }
 
-fn completions() -> Vec<CompletionItem> {
-    recipe::BUILTINS
-        .iter()
-        .map(|builtin| CompletionItem {
-            label: builtin.name.to_owned(),
-            kind: Some(if recipe::STAGES.contains(&builtin.name) {
+/// One thing a plugin adds to recipes, as completion and hover describe it.
+struct PluginItem {
+    label: String,
+    signature: String,
+    doc: String,
+    constant: bool,
+}
+
+/// Every recipe function and symbol constant the plugins add.
+fn plugin_items(plugins: &Registry) -> Vec<PluginItem> {
+    let mut items = Vec::new();
+    for module in plugins.recipe_modules() {
+        let namespace = module.namespace();
+        for function in module.functions() {
+            items.push(PluginItem {
+                label: format!("{namespace}::{}", function.name),
+                signature: format!(
+                    "{namespace}::{}({}) -> {}",
+                    function.name,
+                    function.params.join(", "),
+                    function.returns.label()
+                ),
+                doc: function.doc.clone(),
+                constant: false,
+            });
+        }
+        for symbol in module.symbols() {
+            let name = symbol.name.replace('-', "_");
+            items.push(PluginItem {
+                label: format!("{namespace}::{name}"),
+                signature: format!("const {namespace}::{name} = {:?}", symbol.value),
+                doc: symbol.summary.clone(),
+                constant: true,
+            });
+        }
+    }
+    items
+}
+
+fn completions(plugins: &Registry) -> Vec<CompletionItem> {
+    let markdown = |value: String| {
+        Some(lsp_types::Documentation::MarkupContent(MarkupContent {
+            kind: MarkupKind::Markdown,
+            value,
+        }))
+    };
+    let builtins = recipe::BUILTINS.iter().map(|builtin| CompletionItem {
+        label: builtin.name.to_owned(),
+        kind: Some(if recipe::STAGES.contains(&builtin.name) {
+            CompletionItemKind::CONSTANT
+        } else if !builtin.signature.starts_with(builtin.name) {
+            // `step.push(command)`: called on a value.
+            CompletionItemKind::METHOD
+        } else {
+            CompletionItemKind::FUNCTION
+        }),
+        detail: Some(builtin.signature.to_owned()),
+        documentation: markdown(builtin.doc.to_owned()),
+        ..CompletionItem::default()
+    });
+    let from_plugins = plugin_items(plugins)
+        .into_iter()
+        .map(|item| CompletionItem {
+            label: item.label,
+            kind: Some(if item.constant {
                 CompletionItemKind::CONSTANT
             } else {
                 CompletionItemKind::FUNCTION
             }),
-            detail: Some(builtin.signature.to_owned()),
-            documentation: Some(lsp_types::Documentation::MarkupContent(MarkupContent {
-                kind: MarkupKind::Markdown,
-                value: builtin.doc.to_owned(),
-            })),
+            detail: Some(item.signature),
+            documentation: markdown(item.doc),
             ..CompletionItem::default()
-        })
-        .collect()
+        });
+    builtins.chain(from_plugins).collect()
 }

@@ -53,7 +53,9 @@ use wasmtime::{
     component::{Component, Linker},
 };
 
-use super::wit::{Bindings, LogHost, TypesHost, WitLevel, bundled::BundledBindings};
+use super::wit::{
+    Bindings, LogHost, TypesHost, WitLevel, bundled::BundledBindings, recipe::RecipeBindings,
+};
 
 /// Instructions one call may execute before it traps.
 ///
@@ -197,13 +199,56 @@ impl Runtime {
         component: &Component,
         call: impl FnOnce(&Bindings, &mut Store<State>) -> wasmtime::Result<T>,
     ) -> Result<T> {
+        self.enter_as(
+            plugin,
+            component,
+            |store, component, linker| Bindings::instantiate(store, component, linker),
+            call,
+        )
+    }
+
+    /// [`Runtime::enter`] for a plugin built against the `recipe-plugin` world, to call
+    /// the exports that world adds.
+    ///
+    /// # Errors
+    ///
+    /// As [`Runtime::enter`].
+    pub(super) fn enter_recipe<T>(
+        &self,
+        plugin: &str,
+        component: &Component,
+        call: impl FnOnce(&RecipeBindings, &mut Store<State>) -> wasmtime::Result<T>,
+    ) -> Result<T> {
+        self.enter_as(
+            plugin,
+            component,
+            |store, component, linker| RecipeBindings::instantiate(store, component, linker),
+            call,
+        )
+    }
+
+    /// Whether `component` exports what the `recipe-plugin` world adds, so
+    /// [`Runtime::enter_recipe`] can instantiate it.
+    pub(super) fn has_recipe_functions(component: &Component) -> bool {
+        ["recipe-functions", "call-recipe-function"]
+            .into_iter()
+            .all(|export| component.get_export_index(None, export).is_some())
+    }
+
+    fn enter_as<B, T>(
+        &self,
+        plugin: &str,
+        component: &Component,
+        instantiate: impl FnOnce(&mut Store<State>, &Component, &Linker<State>) -> wasmtime::Result<B>,
+        call: impl FnOnce(&B, &mut Store<State>) -> wasmtime::Result<T>,
+    ) -> Result<T> {
         let mut store = Store::new(&self.engine, State::new(plugin));
         store.limiter(|state| &mut state.limits);
         store
             .set_fuel(FUEL)
             .map_err(|error| miette!("cannot meter the plugin {plugin}: {error:?}"))?;
 
-        let bindings = Bindings::instantiate(&mut store, component, &self.linker)
+        let bindings = instantiate(&mut store, component, &self.linker)
             .map_err(|error| describe(plugin, "instantiate", FUEL, &mut store, &error))?;
 
         let outcome = call(&bindings, &mut store);

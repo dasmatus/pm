@@ -88,6 +88,19 @@ package(#{
 });
 ```
 
+`package` also takes a `Package` object, built up with methods and `+=` before
+it is declared, and an installed plugin's functions and constants are reachable
+as `<plugin>::<name>`; see [Objects](../README.md#objects) and
+[Plugins in recipes](../README.md#plugins-in-recipes).
+
+```rhai
+let p = Package("demo", "0.1.0");
+for path in ["/usr", "/etc"] {
+    p += step(Prepare, `confine ${path}`, [`test ! -w ${path}`]);
+}
+package(p);
+```
+
 ### Migrating from Starlark or YAML
 
 Starlark `.package` files and YAML build files still load, but they are

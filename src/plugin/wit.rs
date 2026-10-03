@@ -23,8 +23,9 @@ pub(super) use self::{
         host::{Host as LogHost, Level as WitLevel},
         types::{
             Capability as WitCapability, Grant as WitGrant, Hook as WitHook, Host as TypesHost,
-            Manifest as WitManifest, Permission as WitPermission, SourceFile as WitSourceFile,
-            Symbol as WitSymbol, Verdict as WitVerdict,
+            Manifest as WitManifest, Permission as WitPermission,
+            RecipeFunction as WitRecipeFunction, RecipeValue as WitRecipeValue,
+            SourceFile as WitSourceFile, Symbol as WitSymbol, Verdict as WitVerdict,
         },
     },
 };
@@ -48,4 +49,24 @@ pub(super) mod bundled {
     });
 
     pub(in crate::plugin) use self::Bundled as BundledBindings;
+}
+
+/// The bindings for the `recipe-plugin` world: everything a plugin exports, plus the
+/// functions it adds to Rhai recipes.
+///
+/// Mapped onto the same shared interfaces as [`bundled`], so one linker serves all
+/// three worlds.
+pub(super) mod recipe {
+    #![allow(clippy::all, clippy::pedantic, missing_docs, unreachable_pub)]
+
+    wasmtime::component::bindgen!({
+        path: "wit",
+        world: "recipe-plugin",
+        with: {
+            "pm:plugin/types": super::pm::plugin::types,
+            "pm:plugin/host": super::pm::plugin::host,
+        },
+    });
+
+    pub(in crate::plugin) use self::RecipePlugin as RecipeBindings;
 }

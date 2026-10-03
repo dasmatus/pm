@@ -20,8 +20,11 @@ use std::{
 use tracing::warn;
 
 use super::{
-    Hook, Manifest, Symbol,
-    wit::{WitCapability, WitGrant, WitHook, WitManifest, WitPermission, WitSymbol, WitVerdict},
+    Hook, Manifest, RecipeFunction, RecipeValue, Symbol,
+    wit::{
+        WitCapability, WitGrant, WitHook, WitManifest, WitPermission, WitRecipeFunction,
+        WitRecipeValue, WitSymbol, WitVerdict,
+    },
 };
 use crate::{
     perms::{Grant, Permission, Provenance},
@@ -63,6 +66,16 @@ const SYMBOL_VALUE_MAX: usize = 1024;
 /// `pm plugins` prints every one of them, and a list nobody reads is a list nobody is
 /// holding the plugin to.
 const SYMBOLS_MAX: usize = 64;
+
+/// How many recipe functions one plugin may add. As with symbols, `pm plugins` prints
+/// them all.
+const RECIPE_FUNCTIONS_MAX: usize = 64;
+
+/// Most parameters a recipe function may take.
+pub(crate) const RECIPE_PARAMS_MAX: usize = 6;
+
+/// Longest the documentation of a recipe function may be.
+const DOC_MAX: usize = 2000;
 
 /// How many grants one `scan-source` call may contribute.
 ///
@@ -133,7 +146,79 @@ pub(super) fn manifest(from: WitManifest, file: &str) -> Result<Manifest, String
         grants_at_most,
         source_extensions,
         symbols,
+        recipe_functions: BTreeMap::new(),
     })
+}
+
+/// Read the functions a plugin adds to recipes, dropping the ones a recipe could not
+/// call.
+///
+/// The name has to be one Rhai parses as a function name (so not a keyword), at most
+/// [`NAME_MAX`] characters of `a-z`, `0-9` and `_`; the arity at most
+/// [`RECIPE_PARAMS_MAX`]. A second function with a name already taken is dropped too:
+/// a recipe function is called by name and arity, and two with the same name would
+/// make which one runs depend on how many arguments a typo supplied.
+pub(super) fn recipe_functions(
+    from: Vec<WitRecipeFunction>,
+    plugin: &str,
+) -> BTreeMap<String, RecipeFunction> {
+    let offered = from.len();
+    let mut kept = BTreeMap::new();
+    for raw in from {
+        let usable = !raw.name.is_empty()
+            && raw.name.len() <= NAME_MAX
+            && raw
+                .name
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+            && rhai::is_valid_function_name(&raw.name);
+        if !usable {
+            warn!(plugin, function = %raw.name, "not a usable recipe function name; ignoring it");
+            continue;
+        }
+        if raw.params.len() > RECIPE_PARAMS_MAX {
+            warn!(
+                plugin,
+                function = %raw.name,
+                params = raw.params.len(),
+                "takes more than {RECIPE_PARAMS_MAX} parameters; ignoring it"
+            );
+            continue;
+        }
+        if kept.contains_key(&raw.name) {
+            warn!(plugin, function = %raw.name, "is listed twice; ignoring the second");
+            continue;
+        }
+        if kept.len() == RECIPE_FUNCTIONS_MAX {
+            warn!(
+                plugin,
+                offered, "adds more recipe functions than pm records; the rest were dropped"
+            );
+            break;
+        }
+        let returns = match raw.returns {
+            WitRecipeValue::Any => RecipeValue::Any,
+            WitRecipeValue::Step => RecipeValue::Step,
+            WitRecipeValue::Steps => RecipeValue::Steps,
+            WitRecipeValue::Kernel => RecipeValue::Kernel,
+            WitRecipeValue::Package => RecipeValue::Package,
+        };
+        let params = raw
+            .params
+            .into_iter()
+            .map(|param| clip(param, NAME_MAX))
+            .collect();
+        kept.insert(
+            raw.name.clone(),
+            RecipeFunction {
+                name: raw.name,
+                params,
+                returns,
+                doc: clip(raw.doc, DOC_MAX),
+            },
+        );
+    }
+    kept
 }
 
 /// Read the named constants a plugin publishes, dropping the ones pm will not
