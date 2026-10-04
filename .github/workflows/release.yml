@@ -30,7 +30,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 40
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       # Same toolchain rule as ci.yml: Cargo.toml sets edition = "2024", which an
       # older stable cannot parse, so update rather than trusting the image pin.
       - id: toolchain
@@ -42,7 +42,7 @@ jobs:
           rustup target add wasm32-unknown-unknown wasm32-wasip2
           rustc -vV
           echo "ver=$(rustc -V | tr -d ' ()' )" >> "$GITHUB_OUTPUT"
-      - uses: actions/cache@v4
+      - uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry/index

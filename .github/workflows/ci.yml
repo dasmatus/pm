@@ -54,7 +54,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 25
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       # rustup comes with the runner image, so no toolchain action is needed.
       # `rustup update stable` rather than trusting whatever the image pinned:
       # Cargo.toml sets edition = "2024", which an older stable cannot parse,
@@ -69,7 +69,7 @@ jobs:
           rustup target add wasm32-unknown-unknown wasm32-wasip2
           rustc -vV
           echo "ver=$(rustc -V | tr -d ' ()' )" >> "$GITHUB_OUTPUT"
-      - uses: actions/cache@v4
+      - uses: actions/cache@v6
         with:
           # registry/src is left out on purpose: cargo re-extracts it from
           # registry/cache, so carrying both stores the same crates twice.
@@ -100,7 +100,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - id: toolchain
         run: |
           set -euo pipefail
@@ -109,7 +109,7 @@ jobs:
           rustup target add wasm32-unknown-unknown wasm32-wasip2
           rustc -vV
           echo "ver=$(rustc -V | tr -d ' ()' )" >> "$GITHUB_OUTPUT"
-      - uses: actions/cache@v4
+      - uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry/index
@@ -161,7 +161,7 @@ jobs:
     # `continue-on-error: true` here — but do it deliberately, not by letting a
     # skip hide it.
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - id: toolchain
         run: |
           set -euo pipefail
@@ -170,7 +170,7 @@ jobs:
           rustup target add wasm32-unknown-unknown wasm32-wasip2
           rustc -vV
           echo "ver=$(rustc -V | tr -d ' ()' )" >> "$GITHUB_OUTPUT"
-      - uses: actions/cache@v4
+      - uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry/index
