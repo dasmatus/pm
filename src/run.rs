@@ -546,7 +546,13 @@ impl PackageRunner {
             .rootfs("/")
             .into_diagnostic()?
             .devfsmount("/dev")
-            .mount(host_root, CONTAINER_PACKAGE_ROOT, "", package_mount_flags())
+            .mount(
+                host_root,
+                CONTAINER_PACKAGE_ROOT,
+                "",
+                package_mount_flags(),
+                None,
+            )
             .runctl(Runctl::MountFallback);
 
         // `rootfs("/")` mirrors only `/bin /etc /lib* /sbin /usr`. On a
@@ -560,7 +566,7 @@ impl PackageRunner {
         // immutable by construction, so read-only exposure costs no
         // confinement, and landlock still decides what the package may open.
         if Path::new(NIX_STORE).is_dir() {
-            container.mount(NIX_STORE, NIX_STORE, "", package_mount_flags());
+            container.mount(NIX_STORE, NIX_STORE, "", package_mount_flags(), None);
             debug!("exposed {NIX_STORE} read-only for a store-linked entrypoint");
         }
 
@@ -1146,8 +1152,15 @@ impl PackageRunner {
                 EXTRACT_ARCHIVE_MOUNT,
                 "",
                 package_mount_flags(),
+                None,
             )
-            .mount(dest_str, EXTRACT_DEST_MOUNT, "", extraction_dest_flags())
+            .mount(
+                dest_str,
+                EXTRACT_DEST_MOUNT,
+                "",
+                extraction_dest_flags(),
+                None,
+            )
             .runctl(Runctl::MountFallback)
             .unshare(Namespace::Network);
 
@@ -1171,13 +1184,13 @@ impl PackageRunner {
                     tar_dir.display()
                 )
             })?;
-            container.mount(tar_dir_str, tar_dir_str, "", package_mount_flags());
+            container.mount(tar_dir_str, tar_dir_str, "", package_mount_flags(), None);
         }
 
         // Same reasoning as the run jail: a Nix-provisioned `tar` and its
         // dynamic loader live under the store, not under `/usr`.
         if Path::new(NIX_STORE).is_dir() {
-            container.mount(NIX_STORE, NIX_STORE, "", package_mount_flags());
+            container.mount(NIX_STORE, NIX_STORE, "", package_mount_flags(), None);
         }
 
         let output = container
