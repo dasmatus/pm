@@ -227,15 +227,15 @@ impl BuildSandbox {
 
         // The only two writable mounts in the whole jail.
         container
-            .mount(as_utf8(&workdir)?, CONTAINER_WORKDIR, "", rw_flags())
-            .mount(as_utf8(&destdir)?, CONTAINER_DESTDIR, "", rw_flags());
+            .mount(as_utf8(&workdir)?, CONTAINER_WORKDIR, "", rw_flags(), None)
+            .mount(as_utf8(&destdir)?, CONTAINER_DESTDIR, "", rw_flags(), None);
 
         let mut visible: Vec<PathBuf> = ROOTFS_ROOTS.iter().map(PathBuf::from).collect();
 
         for root in toolchain_roots(ctx) {
             let root_str = as_utf8(&root)?;
             debug!(path = %root_str, "mounting toolchain directory read-only");
-            container.mount(root_str, root_str, "", ro_flags());
+            container.mount(root_str, root_str, "", ro_flags(), None);
             visible.push(root);
         }
 
@@ -248,7 +248,7 @@ impl BuildSandbox {
             })?;
             let path_str = as_utf8(&path)?;
             debug!(path = %path_str, "mounting caller-supplied path read-only");
-            container.mount(path_str, path_str, "", ro_flags());
+            container.mount(path_str, path_str, "", ro_flags(), None);
             visible.push(path);
         }
 
