@@ -1,6 +1,6 @@
 //! A pm plugin that teaches pm about systemd.
 //!
-//! Two jobs, and the second is the interesting one:
+//! Three jobs, and the second is the interesting one:
 //!
 //! * [`classify_command`] recognises the systemd tools a build file actually invokes -
 //!   `systemd-tmpfiles --create --root=$DESTDIR`, `systemd-sysusers`, `systemctl
@@ -8,6 +8,10 @@
 //!   fingerprint table knows.
 //! * [`scan_source`] reads the unit files a package installs and records what they say
 //!   the program will do at run time.
+//! * It adds recipe functions to Rhai recipes: `systemd::install_unit("foo.service")`
+//!   is the `Install` step that puts a unit file where systemd looks for it, and
+//!   `systemd::install_units([...])` is one such step per file. Built against the
+//!   `recipe-plugin` world for that; see [`RECIPE_FUNCTIONS`].
 //!
 //! # Why unit files are a better signal than source code
 //!
@@ -34,11 +38,11 @@
 //! unclassified command is a diagnostic naming it, and for these that is the better
 //! outcome.
 
-wit_bindgen::generate!({ path: "../../wit", world: "plugin" });
+wit_bindgen::generate!({ path: "../../wit", world: "recipe-plugin" });
 
 use pm::plugin::{
     host::{Level, log},
-    types::{Capability, Hook, Permission, Symbol},
+    types::{Capability, Hook, Permission, RecipeValue, Symbol},
 };
 use unitfile::{Directive, absolute_path, is_templated, parse, undecorate, words};
 
@@ -76,6 +80,146 @@ const TOOLS: &[(&[&str], &str)] = &[
         "ctl",
     ),
 ];
+
+/// The functions this plugin adds to Rhai recipes: name, parameters, what each
+/// returns, and its documentation.
+const RECIPE_FUNCTIONS: &[(&str, &[&str], RecipeValue, &str)] = &[
+    (
+        "install_unit",
+        &["file"],
+        RecipeValue::Step,
+        "The `Install` step that installs the unit file `file` (a path in the build \
+         tree) where systemd looks for system units, mode 0644.",
+    ),
+    (
+        "install_units",
+        &["files"],
+        RecipeValue::Steps,
+        "`install_unit` for each of an array of unit files.",
+    ),
+];
+
+/// Unit file suffixes `install_unit` accepts.
+const UNIT_SUFFIXES: &[&str] = &[
+    ".automount",
+    ".device",
+    ".mount",
+    ".path",
+    ".scope",
+    ".service",
+    ".slice",
+    ".socket",
+    ".swap",
+    ".target",
+    ".timer",
+];
+
+/// The step installing one unit file, as JSON.
+///
+/// The destination is under `/dest`, pm's `DESTDIR` inside the build jail, at
+/// `unitdir`: a recipe gets exactly the step it would have written by hand, so the
+/// command is classified and signed-off like any other.
+fn install_unit(file: &str) -> Result<String, String> {
+    let unit = file.rsplit('/').next().unwrap_or(file);
+    if unit.is_empty() || file.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return Err(format!("{file:?} is not a usable unit file path"));
+    }
+    if !UNIT_SUFFIXES.iter().any(|suffix| unit.ends_with(suffix)) {
+        return Err(format!(
+            "{unit:?} is not a unit file; it must end in one of {}",
+            UNIT_SUFFIXES.join(", ")
+        ));
+    }
+    let unitdir = SYMBOLS
+        .iter()
+        .find(|(name, ..)| *name == "unitdir")
+        .map_or("/usr/lib/systemd/system", |(_, value, _)| value);
+    // `--`, so a path starting with `-` is still the file to install.
+    let command = format!("install -Dm644 -- {file} /dest{unitdir}/{unit}");
+    Ok(format!(
+        r#"{{"stage":"Install","name":{},"run":[{}]}}"#,
+        json::quote(&format!("install {unit}")),
+        json::quote(&command)
+    ))
+}
+
+/// Just enough JSON for recipe function arguments and answers: strings and arrays of
+/// strings. A plugin is small and the component is compiled on every pm run, so this
+/// is a few dozen lines rather than a JSON library.
+mod json {
+    /// `text` as a JSON string literal.
+    pub fn quote(text: &str) -> String {
+        let mut out = String::with_capacity(text.len() + 2);
+        out.push('"');
+        for c in text.chars() {
+            match c {
+                '"' => out.push_str("\\\""),
+                '\\' => out.push_str("\\\\"),
+                '\n' => out.push_str("\\n"),
+                c if u32::from(c) < 0x20 => out.push_str(&format!("\\u{:04x}", u32::from(c))),
+                c => out.push(c),
+            }
+        }
+        out.push('"');
+        out
+    }
+
+    /// The string a JSON string literal holds.
+    pub fn string(text: &str) -> Option<String> {
+        let (value, rest) = parse_string(text.trim())?;
+        rest.trim().is_empty().then_some(value)
+    }
+
+    /// The strings a JSON array of string literals holds.
+    pub fn strings(text: &str) -> Option<Vec<String>> {
+        let mut rest = text.trim().strip_prefix('[')?.trim_start();
+        let mut out = Vec::new();
+        if let Some(after) = rest.strip_prefix(']') {
+            return after.trim().is_empty().then_some(out);
+        }
+        loop {
+            let (value, after) = parse_string(rest)?;
+            out.push(value);
+            let after = after.trim_start();
+            if let Some(after) = after.strip_prefix(',') {
+                rest = after.trim_start();
+            } else {
+                let after = after.strip_prefix(']')?;
+                return after.trim().is_empty().then_some(out);
+            }
+        }
+    }
+
+    /// One string literal at the start of `text`, and what follows it.
+    fn parse_string(text: &str) -> Option<(String, &str)> {
+        let mut chars = text.strip_prefix('"')?.char_indices();
+        let mut out = String::new();
+        while let Some((index, c)) = chars.next() {
+            match c {
+                '"' => return Some((out, &text[index + 2..])),
+                '\\' => match chars.next()?.1 {
+                    '"' => out.push('"'),
+                    '\\' => out.push('\\'),
+                    '/' => out.push('/'),
+                    'n' => out.push('\n'),
+                    't' => out.push('\t'),
+                    'r' => out.push('\r'),
+                    'b' => out.push('\u{8}'),
+                    'f' => out.push('\u{c}'),
+                    'u' => {
+                        let hex: String = (0..4)
+                            .filter_map(|_| chars.next().map(|(_, c)| c))
+                            .collect();
+                        out.push(char::from_u32(u32::from_str_radix(&hex, 16).ok()?)?);
+                    }
+                    _ => return None,
+                },
+                c => out.push(c),
+            }
+        }
+        None
+    }
+}
 
 /// Tools that run something else, and are therefore refused rather than classified.
 ///
@@ -251,6 +395,40 @@ impl Guest for Systemd {
                     summary: (*summary).into(),
                 })
                 .collect(),
+        }
+    }
+
+    fn recipe_functions() -> Vec<RecipeFunction> {
+        RECIPE_FUNCTIONS
+            .iter()
+            .map(|(name, params, returns, doc)| RecipeFunction {
+                name: (*name).into(),
+                params: params.iter().map(|&param| param.into()).collect(),
+                returns: *returns,
+                doc: (*doc).into(),
+            })
+            .collect()
+    }
+
+    fn call_recipe_function(name: String, args: Vec<String>) -> Result<String, String> {
+        match (name.as_str(), args.as_slice()) {
+            ("install_unit", [file]) => {
+                let file = json::string(file).ok_or("the unit file must be a string")?;
+                install_unit(&file)
+            }
+            ("install_units", [files]) => {
+                let files =
+                    json::strings(files).ok_or("the unit files must be an array of strings")?;
+                let steps = files
+                    .iter()
+                    .map(|file| install_unit(file))
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(format!("[{}]", steps.join(",")))
+            }
+            _ => Err(format!(
+                "no recipe function {name} taking {} arguments",
+                args.len()
+            )),
         }
     }
 

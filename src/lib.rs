@@ -14,7 +14,7 @@ pub mod download;
 pub mod graph;
 /// Package metadata written into each archive.
 pub mod metadata;
-/// Converting YAML build files to Starlark.
+/// Converting YAML and Starlark build files to Rhai recipes.
 pub mod migrate;
 /// Inferring the permissions a package actually needs, from its source, its
 /// built objects and a traced execution.
@@ -25,13 +25,15 @@ pub mod plugin;
 pub mod policy;
 /// A live, redrawable region that reports what a build is doing right now.
 pub mod progress;
+/// Recipes written in Rhai.
+pub mod recipe;
 /// Extracting and running a built package inside a sandbox.
 pub mod run;
 /// The hakoniwa jail that build steps run inside.
 pub mod sandbox;
 /// Ed25519 signing and verification of build files and packages.
 pub mod signing;
-/// Build files written in Starlark.
+/// Build files written in Starlark, deprecated in favour of [`recipe`].
 pub mod star;
 /// Individual build steps and their stages.
 pub mod step;

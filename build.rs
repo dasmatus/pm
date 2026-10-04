@@ -48,7 +48,7 @@ const BUNDLED: [&str; 14] = [
 ];
 
 /// Example and adversarial plugins used by integration tests, not embedded in pm.
-const TEST_PLUGINS: [&str; 8] = [
+const TEST_PLUGINS: [&str; 9] = [
     "systemd",
     "sysext",
     "sysupdate",
@@ -57,6 +57,7 @@ const TEST_PLUGINS: [&str; 8] = [
     "runaway",
     "nameless",
     "scanner",
+    "recipes",
 ];
 
 /// Variables cargo sets for this build script that describe pm's own build. Passed

@@ -90,7 +90,7 @@ use std::{
     fmt,
     fs::{read, read_dir},
     path::{Path, PathBuf},
-    sync::LazyLock,
+    sync::{Arc, LazyLock},
 };
 
 use miette::{IntoDiagnostic, Result, WrapErr, miette};
@@ -216,6 +216,127 @@ pub struct Manifest {
     /// Not gated on a hook: nothing calls back into the plugin to read these, they are
     /// data pm took once at load and keeps. Most plugins publish none.
     pub symbols: BTreeMap<String, Symbol>,
+    /// Functions the plugin adds to Rhai recipes, keyed by name.
+    ///
+    /// Only a plugin built against the `recipe-plugin` world has any; see
+    /// [`RecipeFunction`].
+    pub recipe_functions: BTreeMap<String, RecipeFunction>,
+}
+
+/// What a [`RecipeFunction`] returns, which decides what a recipe receives.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum RecipeValue {
+    /// Plain data: a string, an integer, a boolean, an array, an object map or `()`.
+    Any,
+    /// A `Step`.
+    Step,
+    /// An array of `Step`.
+    Steps,
+    /// A `Kernel`.
+    Kernel,
+    /// A `Package`.
+    Package,
+}
+
+impl RecipeValue {
+    /// How a recipe's documentation names the type: `Step`, `array`, and so on.
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Any => "Dynamic",
+            Self::Step => "Step",
+            Self::Steps => "array",
+            Self::Kernel => "Kernel",
+            Self::Package => "Package",
+        }
+    }
+}
+
+/// A function a plugin adds to Rhai recipes.
+///
+/// A recipe calls it as `<plugin>::<name>(...)`, where `<plugin>` is the plugin's name
+/// with every `-` written `_`. The arguments cross into the plugin as JSON and the
+/// answer comes back the same way, checked against [`RecipeFunction::returns`]; see
+/// [`crate::recipe`] for what a recipe sees.
+///
+/// Like a symbol, the list is the plugin's own claim, read once at load and printed by
+/// `pm plugins`. Unlike a symbol, calling one runs plugin code - in a fresh, metered
+/// instance, exactly like a hook - so a recipe that calls one evaluates to the same
+/// package wherever the same plugin is installed, and the plugin's file hash, which is
+/// already in [`Registry::digest`], pins which answers those are.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecipeFunction {
+    /// What a recipe calls it, after the plugin's name.
+    pub name: String,
+    /// Its parameters' names. Their number is its arity.
+    pub params: Vec<String>,
+    /// What it returns.
+    pub returns: RecipeValue,
+    /// What it does, in Markdown.
+    pub doc: String,
+}
+
+/// A way to call one plugin's recipe functions that outlives the borrow of the
+/// [`Registry`] it came from, for a recipe engine to keep.
+///
+/// Cheap to clone: the runtime and the compiled component are both shared.
+#[derive(Clone)]
+pub struct RecipeModule {
+    runtime: Arc<Runtime>,
+    plugin: String,
+    component: Component,
+    functions: Vec<RecipeFunction>,
+    symbols: Vec<Symbol>,
+}
+
+impl RecipeModule {
+    /// The plugin's name, as `pm plugins` prints it.
+    #[must_use]
+    pub fn plugin(&self) -> &str {
+        &self.plugin
+    }
+
+    /// The name a recipe reaches it under: the plugin's, with `-` written `_`.
+    #[must_use]
+    pub fn namespace(&self) -> String {
+        self.plugin.replace('-', "_")
+    }
+
+    /// The functions it adds, sorted by name.
+    #[must_use]
+    pub fn functions(&self) -> &[RecipeFunction] {
+        &self.functions
+    }
+
+    /// The symbols it publishes, sorted by name, which a recipe sees as constants.
+    #[must_use]
+    pub fn symbols(&self) -> &[Symbol] {
+        &self.symbols
+    }
+
+    /// Call the recipe function `name` with one JSON text per argument.
+    ///
+    /// # Errors
+    ///
+    /// Fails with the plugin's own message when it refuses the call, and with a
+    /// description of the fault when it traps, runs out of fuel or exceeds a limit.
+    pub fn call(&self, name: &str, args: &[String]) -> Result<String> {
+        let answer =
+            self.runtime
+                .enter_recipe(&self.plugin, &self.component, |bindings, store| {
+                    bindings.call_call_recipe_function(store, name, args)
+                })?;
+        answer.map_err(|message| miette!("{}::{name}: {message}", self.namespace()))
+    }
+}
+
+impl fmt::Debug for RecipeModule {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RecipeModule")
+            .field("plugin", &self.plugin)
+            .field("functions", &self.functions)
+            .finish_non_exhaustive()
+    }
 }
 
 /// How a plugin came to be loaded.
@@ -407,7 +528,7 @@ impl Loader {
         let digest = digest(&plugins);
         debug!(plugins = plugins.len(), %digest, "plugin registry ready");
         Ok(Registry {
-            runtime: Some(runtime),
+            runtime: Some(Arc::new(runtime)),
             plugins,
             digest,
         })
@@ -457,7 +578,7 @@ impl Loader {
 pub struct Registry {
     /// `None` exactly when there are no plugins, so a pm with none installed never
     /// builds an engine for them (the bundled tier keeps its own).
-    runtime: Option<Runtime>,
+    runtime: Option<Arc<Runtime>>,
     plugins: Vec<Plugin>,
     digest: String,
 }
@@ -550,6 +671,28 @@ impl Registry {
                 .values()
                 .map(move |symbol| (format!("{}:{}", plugin.manifest.name, symbol.name), symbol))
         })
+    }
+
+    /// What each plugin adds to Rhai recipes: its recipe functions, and its symbols as
+    /// constants. Plugins that add nothing are left out.
+    #[must_use]
+    pub fn recipe_modules(&self) -> Vec<RecipeModule> {
+        let Some(runtime) = &self.runtime else {
+            return Vec::new();
+        };
+        self.plugins
+            .iter()
+            .filter(|plugin| {
+                !plugin.manifest.recipe_functions.is_empty() || !plugin.manifest.symbols.is_empty()
+            })
+            .map(|plugin| RecipeModule {
+                runtime: Arc::clone(runtime),
+                plugin: plugin.manifest.name.clone(),
+                component: plugin.component.clone(),
+                functions: plugin.manifest.recipe_functions.values().cloned().collect(),
+                symbols: recipe_symbols(plugin),
+            })
+            .collect()
     }
 
     /// Substitute `%{<plugin>:<name>}` references in `text`.
@@ -841,6 +984,34 @@ impl PartialEq for Registry {
 
 impl Eq for Registry {}
 
+/// The symbols of `plugin` a recipe can reach as constants.
+///
+/// A recipe names one with `-` written `_`, so `unit-dir` and `unit_dir` would be the
+/// same constant. Only the first of such a pair (in name order) is kept, and the other
+/// is logged, rather than letting one silently stand for both.
+fn recipe_symbols(plugin: &Plugin) -> Vec<Symbol> {
+    let mut seen = BTreeSet::new();
+    plugin
+        .manifest
+        .symbols
+        .values()
+        .filter(|symbol| {
+            let constant = symbol.name.replace('-', "_");
+            if seen.insert(constant.clone()) {
+                return true;
+            }
+            warn!(
+                plugin = %plugin.manifest.name,
+                symbol = %symbol.name,
+                "is the recipe constant `{constant}` too, which another of the plugin's symbols \
+                 already is; recipes cannot reach it (`%{{...}}` references still can)"
+            );
+            false
+        })
+        .cloned()
+        .collect()
+}
+
 /// Read, verify, compile and interrogate one plugin file.
 fn load_one(runtime: &Runtime, path: &Path, trust: Option<&TrustStore>) -> Result<Plugin> {
     let bytes = read(path)
@@ -876,7 +1047,18 @@ fn load_one(runtime: &Runtime, path: &Path, trust: Option<&TrustStore>) -> Resul
         })
         .wrap_err_with(|| format!("the plugin {file} could not describe itself"))?;
 
-    let manifest = convert::manifest(described, &file).map_err(|reason| miette!("{reason}"))?;
+    let mut manifest = convert::manifest(described, &file).map_err(|reason| miette!("{reason}"))?;
+
+    // A plugin built against `recipe-plugin` lists its recipe functions once, here,
+    // for the same reason `describe` is asked only once.
+    if Runtime::has_recipe_functions(&component) {
+        let offered = runtime
+            .enter_recipe(&manifest.name, &component, |bindings, store| {
+                bindings.call_recipe_functions(store)
+            })
+            .wrap_err_with(|| format!("the plugin {file} could not list its recipe functions"))?;
+        manifest.recipe_functions = convert::recipe_functions(offered, &manifest.name);
+    }
 
     Ok(Plugin {
         manifest,

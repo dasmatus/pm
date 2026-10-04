@@ -1,17 +1,21 @@
-//! Converting YAML build files to Starlark (`pm migrate`).
+//! Converting deprecated YAML and Starlark build files to Rhai recipes (`pm migrate`).
 //!
-//! The conversion is mechanical: the YAML is parsed exactly as `pm build` would
-//! parse it and the resulting package is written back out as a `package(...)`
-//! call by [`crate::star::render`]. The new file evaluates to the same package,
-//! but three things do not carry over and are the caller's to handle:
+//! The conversion is mechanical: the old file is read exactly as `pm build`
+//! would read it - YAML parsed, Starlark evaluated - and the resulting package is
+//! written back out as a `package(#{ ... })` call by [`crate::recipe::render`].
+//! The new file evaluates to the same package, but some things do not carry over
+//! and are the caller's to handle:
 //!
-//! * **Signatures.** A signature covers one file's bytes, so the `.package` file has
+//! * **Signatures.** A signature covers one file's bytes, so the `.rhai` file has
 //!   to be signed afresh with `pm sign`.
 //! * **Comments.** They are not part of the parsed data and are dropped.
+//! * **Starlark logic.** Loops, functions and conditionals are evaluated, and the
+//!   recipe gets the values they produced, written out literally. A Starlark
+//!   file that generated its steps comes out longer, but means the same thing.
 //! * **Dependency paths.** They are copied verbatim unless `recursive` is set, in
-//!   which case YAML dependencies are converted too and their paths renamed.
-//!   Relative paths are resolved against the current directory, as `pm build`
-//!   resolves them.
+//!   which case YAML and Starlark dependencies are converted too and their paths
+//!   renamed. Relative paths are resolved against the current directory, as
+//!   `pm build` resolves them.
 
 use std::{
     collections::HashSet,
@@ -22,16 +26,16 @@ use std::{
 
 use miette::{IntoDiagnostic, WrapErr, miette};
 
-use crate::{bf::BuildFile, star};
+use crate::{bf::BuildFile, recipe, star};
 
 /// One converted build file.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Converted {
-    /// The YAML file that was read.
+    /// The YAML or Starlark file that was read.
     pub source: PathBuf,
-    /// Where the Starlark file belongs.
+    /// Where the Rhai recipe belongs.
     pub target: PathBuf,
-    /// The Starlark text.
+    /// The Rhai text.
     pub text: String,
 }
 
@@ -42,42 +46,53 @@ fn is_yaml(path: &Path) -> bool {
 }
 
 fn is_convertible_dependency(path: &Path) -> bool {
-    !star::is_starlark(path) && !path.extension().is_some_and(|ext| ext == "cpkg")
+    !recipe::is_rhai(path) && !path.extension().is_some_and(|ext| ext == "cpkg")
 }
 
-/// The path of the Starlark file `source` converts to: `.yaml` and `.yml` become
-/// `.package`, and anything else gets `.package` appended.
+/// The path of the recipe `source` converts to: `.yaml`, `.yml` and `.package`
+/// become `.rhai`, and anything else gets `.rhai` appended.
 #[must_use]
 pub fn target_path(source: &Path) -> PathBuf {
-    if is_yaml(source) {
-        source.with_extension(star::EXTENSION)
+    if is_yaml(source) || star::is_starlark(source) {
+        source.with_extension(recipe::EXTENSION)
     } else {
         let mut name = source.as_os_str().to_owned();
         name.push(".");
-        name.push(star::EXTENSION);
+        name.push(recipe::EXTENSION);
         PathBuf::from(name)
     }
 }
 
-/// Convert YAML build-file text to Starlark.
+/// Convert YAML build-file text to a Rhai recipe.
 ///
 /// # Errors
 ///
 /// Fails if `yaml` is not a valid build file, or a dependency path is not UTF-8.
 pub fn convert_text(yaml: &str) -> miette::Result<String> {
-    star::render(&BuildFile::from_yaml(yaml)?)
+    recipe::render(&BuildFile::from_yaml(yaml)?)
 }
 
-/// Convert the YAML build file at `source`, and with `recursive` every YAML
-/// build file in its dependency closure, rewriting those dependency paths to
-/// their `.package` counterparts. The first element is `source` itself.
+/// Convert Starlark build-file text to a Rhai recipe, by evaluating it.
+///
+/// # Errors
+///
+/// Fails if `starlark` does not evaluate to a valid build file, or a dependency
+/// path is not UTF-8.
+pub fn convert_starlark(starlark: &str) -> miette::Result<String> {
+    recipe::render(&star::parse("build.package", starlark.to_owned())?)
+}
+
+/// Convert the YAML or Starlark build file at `source`, and with `recursive`
+/// every YAML or Starlark build file in its dependency closure, rewriting those
+/// dependency paths to their `.rhai` counterparts. The first element is `source`
+/// itself.
 ///
 /// Nothing is written; see [`write_converted`].
 ///
 /// # Errors
 ///
-/// Fails if a file cannot be read or is not a valid YAML build file. A
-/// dependency that is already Starlark, or a `.cpkg`, is left alone.
+/// Fails if a file cannot be read or is not a valid build file, or is already a
+/// Rhai recipe. A dependency that is already Rhai, or a `.cpkg`, is left alone.
 pub fn convert_file(source: &Path, recursive: bool) -> miette::Result<Vec<Converted>> {
     let mut done = Vec::new();
     let mut seen = HashSet::new();
@@ -124,17 +139,19 @@ fn convert_into(
     if !seen.insert(key) {
         return Ok(());
     }
-    if star::is_starlark(source) {
-        return Err(miette!(
-            "{} is already a Starlark build file",
-            source.display()
-        ));
+    if recipe::is_rhai(source) {
+        return Err(miette!("{} is already a Rhai recipe", source.display()));
     }
     let text = read_to_string(source)
         .into_diagnostic()
         .wrap_err_with(|| format!("cannot read {}", source.display()))?;
-    let mut build = BuildFile::from_yaml(&text)
-        .wrap_err_with(|| format!("cannot convert {}", source.display()))?;
+    let starlark = star::is_starlark(source);
+    let mut build = if starlark {
+        star::parse(&source.display().to_string(), text)
+    } else {
+        BuildFile::from_yaml(&text)
+    }
+    .wrap_err_with(|| format!("cannot convert {}", source.display()))?;
 
     if recursive {
         let dependencies = build
@@ -156,14 +173,20 @@ fn convert_into(
         });
     }
 
-    let rendered = star::render(&build)?;
+    let rendered = recipe::render(&build)?;
+    let carried = if starlark {
+        "The Starlark was evaluated: loops, functions and\n\
+         // comments were not carried over, only the values they produced."
+    } else {
+        "Comments were not carried over."
+    };
     done.push(Converted {
         source: source.to_path_buf(),
         target: target_path(source),
         text: format!(
-            "# Converted from {} by `pm migrate`. Comments were not carried over.\n\
-             # Sign this file with `pm sign`; the old signature does not apply to it.\n\n{rendered}",
-source.file_name().map_or_else(
+            "// Converted from {} by `pm migrate`. {carried}\n\
+             // Sign this file with `pm sign`; the old signature does not apply to it.\n\n{rendered}",
+            source.file_name().map_or_else(
                 || {
                     source
                         .display()

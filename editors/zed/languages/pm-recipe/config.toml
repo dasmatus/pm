@@ -1,0 +1,12 @@
+name = "PM Recipe"
+grammar = "rhai"
+path_suffixes = ["rhai"]
+line_comments = ["// "]
+tab_size = 4
+brackets = [
+    { start = "{", end = "}", close = true, newline = true },
+    { start = "[", end = "]", close = true, newline = true },
+    { start = "(", end = ")", close = true, newline = true },
+    { start = "\"", end = "\"", close = true, newline = false, not_in = ["comment", "string"] },
+    { start = "`", end = "`", close = true, newline = false, not_in = ["comment", "string"] },
+]

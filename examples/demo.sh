@@ -84,7 +84,7 @@ rm -rf "$XDG_CONFIG_HOME"
 pm keygen || fail "keygen"
 
 # ---------------------------------------------------------------------------
-step "3. Generate pm.package from pm.package.in"
+step "3. Generate pm.rhai from pm.rhai.in"
 # ---------------------------------------------------------------------------
 # A build file has no $srcdir. Commands run with the working directory at
 # /build, and the only host directory mounted is the build file's OWN
@@ -106,15 +106,15 @@ sed -e "s#@SRCDIR@#$REPO#g" \
     -e "s#@TRIPLE@#$TRIPLE#g" \
     -e "s#@CC@#$CC_PATH#g" \
     -e "s#@AR@#$AR_PATH#g" \
-    "$REPO/pm.package.in" > "$REPO/pm.package" || fail "generating pm.package"
+    "$REPO/pm.rhai.in" > "$REPO/pm.rhai" || fail "generating pm.rhai"
 
 # ---------------------------------------------------------------------------
 step "4. Sign every build file in the chain"
 # ---------------------------------------------------------------------------
-for f in ../examples/01-seed/build.package \
-         ../examples/02-lib/build.package \
-         ../examples/03-app/build.package \
-         ../pm.package; do
+for f in ../examples/01-seed/build.rhai \
+         ../examples/02-lib/build.rhai \
+         ../examples/03-app/build.rhai \
+         ../pm.rhai; do
   pm sign "$f" || fail "signing $f"
 done
 
@@ -126,10 +126,10 @@ step "5. What each build file is allowed to do, before anything runs"
 # the build before a single step runs. See the module doc of src/policy.rs.
 # Note that only pm gets Network, and it gets it because `cargo` is in the
 # table as a program that resolves and downloads its own dependency graph.
-for f in ../examples/01-seed/build.package \
-         ../examples/02-lib/build.package \
-         ../examples/03-app/build.package \
-         ../pm.package; do
+for f in ../examples/01-seed/build.rhai \
+         ../examples/02-lib/build.rhai \
+         ../examples/03-app/build.rhai \
+         ../pm.rhai; do
   pm explain "$f" || fail "explain $f"
   printf '\n'
 done
@@ -152,7 +152,7 @@ step "6. The same build file, with the jail switched off"
 # Two things in the log are worth reading. `BUILD SANDBOX DISABLED` and the
 # per-command `running a build command UNSANDBOXED on the host` lines are pm
 # saying it has handed the build file the calling user's own privileges.
-if pm build --unsandboxed ../examples/01-seed/build.package; then
+if pm build --unsandboxed ../examples/01-seed/build.rhai; then
   fail "the unsandboxed build SUCCEEDED, so the confine step is not asserting confinement"
 fi
 printf '\n%sThe unconfined build failed its first confinement probe, which is the correct outcome.%s\n' "$green" "$off"
@@ -173,7 +173,7 @@ step "7. Build the chain: 01-seed -> 02-lib -> 03-app -> pm"
 # This downloads and compiles pm's entire dependency graph, so it takes a few
 # minutes. CARGO_HOME is /build/.cargo -- inside the workspace -- so the cache
 # is per-build and goes away with it.
-pm build ../pm.package || fail "building the chain"
+pm build ../pm.rhai || fail "building the chain"
 
 note "archives produced:"
 ls -1 "$OUT"/*.cpkg
@@ -188,24 +188,24 @@ step "8. A build step cannot write to the tree it was described by"
 # the demonstration.
 ESC="$OUT/escape"
 mkdir -p "$ESC"
-cat > "$ESC/escape.package" <<STAR
-package(
-    name = "escape",
-    version = "0",
-    dependencies = [],
-    steps = [
-        step(
-            stage = Build,
-            name = "write-back",
-            run = [
+cat > "$ESC/escape.rhai" <<RHAI
+package(#{
+    name: "escape",
+    version: "0",
+    dependencies: [],
+    steps: [
+        step(#{
+            stage: Build,
+            name: "write-back",
+            run: [
                 "touch $ESC/escaped",
             ],
-        ),
+        }),
     ],
-)
-STAR
-pm sign escape/escape.package || fail "signing the escape build file"
-if pm build escape/escape.package; then
+});
+RHAI
+pm sign escape/escape.rhai || fail "signing the escape build file"
+if pm build escape/escape.rhai; then
   fail "the escape build SUCCEEDED -- the read-only mount is not read-only"
 fi
 printf '\n%sThe build failed, which is the correct outcome.%s\n' "$green" "$off"
@@ -259,7 +259,7 @@ pm run pm-0.1.0.cpkg --bin usr/bin/pm
 printf '\n%s(exit 2 above is clap asking for a subcommand, not a sandbox failure.)%s\n' "$dim" "$off"
 
 step "Done."
-note "archives, signatures and the generated pm.package are gitignored"
+note "archives, signatures and the generated pm.rhai are gitignored"
 note "remove the demo key with: rm -rf $XDG_CONFIG_HOME"
 note "remove the decoy with:    rm -rf $DECOY"
 # Steps 6 and 8 are meant to fail, and pm deliberately retains the workspace of
