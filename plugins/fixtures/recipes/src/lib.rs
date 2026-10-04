@@ -10,6 +10,8 @@
 //!   cannot hold, and `refuse()` an error - each of which pm must turn into a recipe
 //!   error rather than a value;
 //! * `spin()` never returns, and must be stopped by the fuel meter;
+//! * `huge()` and `deep()` answer with a string longer, and arrays nested deeper,
+//!   than a recipe may hold;
 //! * `fn` and `too_many` are not functions a recipe could call, and must be dropped at
 //!   load.
 //!
@@ -81,6 +83,8 @@ impl Guest for Recipes {
             function("fraction", &[], RecipeValue::Any),
             function("refuse", &[], RecipeValue::Any),
             function("spin", &[], RecipeValue::Any),
+            function("huge", &[], RecipeValue::Any),
+            function("deep", &[], RecipeValue::Any),
             function("fn", &[], RecipeValue::Any),
             function("odd_params", &["fine", "not fine"], RecipeValue::Any),
             function(
@@ -107,6 +111,8 @@ impl Guest for Recipes {
             "misspelt" => Ok(r#"{"stage":"Build","nmae":"x","run":[]}"#.into()),
             "fraction" => Ok("1.5".into()),
             "refuse" => Err("this fixture refuses".into()),
+            "huge" => Ok(format!("\"{}\"", "x".repeat(3 << 19))),
+            "deep" => Ok(format!("{}{}", "[".repeat(100), "]".repeat(100))),
             "spin" => {
                 let mut n: u64 = 0;
                 loop {

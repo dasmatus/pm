@@ -99,8 +99,10 @@ fn the_fixture_s_functions_are_listed_and_the_unusable_ones_dropped() {
         names,
         [
             "build_step",
+            "deep",
             "echo",
             "fraction",
+            "huge",
             "kernel_for",
             "misspelt",
             "odd_params",
@@ -195,4 +197,23 @@ fn symbols_that_collide_as_constants_keep_the_first() {
         build.dependencies().collect::<Vec<_>>(),
         [Path::new("/first")]
     );
+}
+
+#[test]
+fn answers_are_held_to_the_recipe_limits() {
+    let (_root, plugins) = registry(&["recipes"]);
+    let message = error("recipe_fixture::huge();", &plugins);
+    assert!(message.contains("longer than"), "{message}");
+    let message = error("recipe_fixture::deep();", &plugins);
+    assert!(message.contains("nested"), "{message}");
+}
+
+#[test]
+fn arguments_nested_too_deep_are_refused_not_a_crash() {
+    let (_root, plugins) = registry(&["recipes"]);
+    let message = error(
+        "let v = []; for i in 0..1000 { v = [v]; }\nrecipe_fixture::echo(v);",
+        &plugins,
+    );
+    assert!(message.contains("nested"), "{message}");
 }

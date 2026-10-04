@@ -26,7 +26,9 @@ use rhai::{
 };
 use serde_json::Value as Json;
 
-use super::{KERNEL_KEYS, PACKAGE_KEYS, RhaiResult, STAGES, STEP_KEYS};
+use super::{
+    KERNEL_KEYS, MAX_COLLECTION_SIZE, MAX_STRING_SIZE, PACKAGE_KEYS, RhaiResult, STAGES, STEP_KEYS,
+};
 use crate::plugin::RecipeValue;
 
 /// One build step: optional downloads, then commands run in order.
@@ -441,36 +443,57 @@ pub(super) fn register(engine: &mut Engine) {
         .register_into_engine(engine, Package::from_map);
 }
 
+/// Deepest a value handed to a plugin, or declared as a package, may nest arrays and
+/// maps. A recipe can build a value nested far deeper than any expression it is
+/// written with, one level per loop iteration; walking that recursively would
+/// overflow pm's stack rather than fail the recipe.
+const MAX_NESTING: usize = 64;
+
+fn too_deep() -> Box<EvalAltResult> {
+    format!("a value is nested more than {MAX_NESTING} arrays or maps deep").into()
+}
+
 /// `value` with every `Step`, `Kernel` and `Package` in it turned into the object map
 /// it stands for, for serde.
-pub(super) fn plain(value: Dynamic) -> Dynamic {
+///
+/// # Errors
+///
+/// When it nests deeper than [`MAX_NESTING`].
+pub(super) fn plain(value: Dynamic) -> RhaiResult<Dynamic> {
+    plain_at(value, 0)
+}
+
+fn plain_at(value: Dynamic, depth: usize) -> RhaiResult<Dynamic> {
+    if depth > MAX_NESTING {
+        return Err(too_deep());
+    }
     if value.is::<Step>() {
-        return Dynamic::from_map(value.cast::<Step>().to_map());
+        return Ok(Dynamic::from_map(value.cast::<Step>().to_map()));
     }
     if value.is::<Kernel>() {
-        return Dynamic::from_map(value.cast::<Kernel>().to_map());
+        return Ok(Dynamic::from_map(value.cast::<Kernel>().to_map()));
     }
     if value.is::<Package>() {
-        return plain(Dynamic::from_map(value.cast::<Package>().to_map()));
+        return plain_at(Dynamic::from_map(value.cast::<Package>().to_map()), depth);
     }
     if value.is_array() {
-        return value
+        return Ok(value
             .cast::<Array>()
             .into_iter()
-            .map(plain)
-            .collect::<Array>()
-            .into();
+            .map(|item| plain_at(item, depth + 1))
+            .collect::<RhaiResult<Array>>()?
+            .into());
     }
     if value.is_map() {
-        return Dynamic::from_map(
+        return Ok(Dynamic::from_map(
             value
                 .cast::<Map>()
                 .into_iter()
-                .map(|(key, value)| (key, plain(value)))
-                .collect(),
-        );
+                .map(|(key, value)| Ok((key, plain_at(value, depth + 1)?)))
+                .collect::<RhaiResult<Map>>()?,
+        ));
     }
-    value
+    Ok(value)
 }
 
 /// What a plugin's recipe function answered, as the recipe sees it.
@@ -480,7 +503,7 @@ pub(super) fn plain(value: Dynamic) -> Dynamic {
 /// When the answer is not of the kind the function declared, or holds a number with
 /// a fraction (recipes have no floating point).
 pub(super) fn from_json(value: Json, kind: RecipeValue) -> RhaiResult<Dynamic> {
-    let value = json_to_dynamic(value)?;
+    let value = json_to_dynamic(value, 0)?;
     let map = |what: &str| {
         value
             .clone()
@@ -514,7 +537,27 @@ pub(super) fn from_json(value: Json, kind: RecipeValue) -> RhaiResult<Dynamic> {
 /// A JSON value as the Rhai value it stands for. Written out rather than left to
 /// serde, which hands back a map in place of a number when `serde_json` is built with
 /// arbitrary precision.
-fn json_to_dynamic(value: Json) -> RhaiResult<Dynamic> {
+///
+/// Held to the limits a recipe's own values are: no string longer, no array or map
+/// larger and nothing nested deeper than a recipe could have built itself.
+fn json_to_dynamic(value: Json, depth: usize) -> RhaiResult<Dynamic> {
+    if depth > MAX_NESTING {
+        return Err(too_deep());
+    }
+    let string = |text: String| -> RhaiResult<String> {
+        if text.len() > MAX_STRING_SIZE {
+            return Err(format!("a string is longer than {MAX_STRING_SIZE} bytes").into());
+        }
+        Ok(text)
+    };
+    let size = |len: usize| -> RhaiResult<()> {
+        if len > MAX_COLLECTION_SIZE {
+            return Err(
+                format!("an array or map holds more than {MAX_COLLECTION_SIZE} items").into(),
+            );
+        }
+        Ok(())
+    };
     Ok(match value {
         Json::Null => Dynamic::UNIT,
         Json::Bool(value) => value.into(),
@@ -525,18 +568,26 @@ fn json_to_dynamic(value: Json) -> RhaiResult<Dynamic> {
                     .into()
             })?
             .into(),
-        Json::String(text) => text.into(),
-        Json::Array(items) => items
-            .into_iter()
-            .map(json_to_dynamic)
-            .collect::<RhaiResult<Array>>()?
-            .into(),
-        Json::Object(entries) => Dynamic::from_map(
-            entries
+        Json::String(text) => string(text)?.into(),
+        Json::Array(items) => {
+            size(items.len())?;
+            items
                 .into_iter()
-                .map(|(key, value)| Ok((key.into(), json_to_dynamic(value)?)))
-                .collect::<RhaiResult<Map>>()?,
-        ),
+                .map(|item| json_to_dynamic(item, depth + 1))
+                .collect::<RhaiResult<Array>>()?
+                .into()
+        }
+        Json::Object(entries) => {
+            size(entries.len())?;
+            Dynamic::from_map(
+                entries
+                    .into_iter()
+                    .map(|(key, value)| {
+                        Ok((string(key)?.into(), json_to_dynamic(value, depth + 1)?))
+                    })
+                    .collect::<RhaiResult<Map>>()?,
+            )
+        }
     })
 }
 

@@ -544,7 +544,9 @@ pub fn definitions(plugins: &Registry) -> String {
 /// Turn what `package()` was given into a [`BuildFile`].
 fn to_build_file(spec: Map) -> Result<BuildFile, RecipeError> {
     // `plain` keeps a map a map; it only rewrites the pm objects inside it.
-    let mut spec = types::plain(Dynamic::from_map(spec)).cast::<Map>();
+    let mut spec = types::plain(Dynamic::from_map(spec))
+        .map_err(|error| RecipeError::from_eval(*error))?
+        .cast::<Map>();
     let version = spec.remove("version").unwrap_or_default();
     let version = version_components(&version)?;
     let mut package: Json =

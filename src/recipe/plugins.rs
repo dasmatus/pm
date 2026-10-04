@@ -19,6 +19,10 @@ use serde_json::Value as Json;
 use super::{RhaiResult, types};
 use crate::plugin::{RecipeFunction, RecipeModule};
 
+/// Longest answer a recipe function may give, as JSON text: a few of the largest
+/// strings a recipe may hold.
+const MAX_ANSWER_BYTES: usize = 4 * super::MAX_STRING_SIZE;
+
 /// The Rhai module for one plugin.
 pub(super) fn module(plugin: &RecipeModule) -> Module {
     let mut module = Module::new();
@@ -141,14 +145,20 @@ impl Call {
             .into_iter()
             .enumerate()
             .map(|(index, arg)| {
-                let json: Json =
-                    rhai::serde::from_dynamic(&types::plain(arg)).map_err(|error| {
-                        fail(format!(
-                            "{qualified}: argument {} cannot be passed to a plugin: {}",
-                            index + 1,
-                            error.unwrap_inner()
-                        ))
-                    })?;
+                let arg = types::plain(arg).map_err(|error| {
+                    fail(format!(
+                        "{qualified}: argument {} cannot be passed to a plugin: {}",
+                        index + 1,
+                        error.unwrap_inner()
+                    ))
+                })?;
+                let json: Json = rhai::serde::from_dynamic(&arg).map_err(|error| {
+                    fail(format!(
+                        "{qualified}: argument {} cannot be passed to a plugin: {}",
+                        index + 1,
+                        error.unwrap_inner()
+                    ))
+                })?;
                 Ok(json.to_string())
             })
             .collect::<RhaiResult<Vec<String>>>()?;
@@ -156,6 +166,13 @@ impl Call {
             .plugin
             .call(&self.function.name, &args)
             .map_err(|report| fail(report.to_string()))?;
+        // Every string and collection in it is held to the recipe limits below; this
+        // bounds the text before any of it is parsed.
+        if answer.len() > MAX_ANSWER_BYTES {
+            return Err(fail(format!(
+                "{qualified} answered with more than {MAX_ANSWER_BYTES} bytes"
+            )));
+        }
         let answer: Json = serde_json::from_str(&answer)
             .map_err(|error| fail(format!("{qualified} answered with invalid JSON: {error}")))?;
         types::from_json(answer, self.function.returns).map_err(|error| {

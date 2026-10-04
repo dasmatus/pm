@@ -790,3 +790,11 @@ package(p);
     .expect("evaluates");
     assert!(build.steps().is_empty());
 }
+
+#[test]
+fn a_package_nested_too_deep_is_an_error() {
+    let message = error(
+        "let v = []; for i in 0..1000 { v = [v]; }\npackage(#{ name: \"p\", version: \"1\", dependencies: v });",
+    );
+    assert!(message.contains("nested"), "{message}");
+}
