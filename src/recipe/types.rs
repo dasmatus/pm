@@ -276,9 +276,12 @@ impl Package {
     }
 
     fn add_steps(&mut self, steps: Array) -> RhaiResult<Self> {
-        for step in steps {
-            self.steps.push(to_step(step)?);
-        }
+        // Check them all first, so a bad one leaves the package as it was.
+        let steps = steps
+            .into_iter()
+            .map(to_step)
+            .collect::<RhaiResult<Array>>()?;
+        self.steps.extend(steps);
         Ok(self.clone())
     }
 

@@ -13,7 +13,10 @@
 //! * `fn` and `too_many` are not functions a recipe could call, and must be dropped at
 //!   load.
 //!
-//! It also publishes a symbol, which a recipe sees as a constant.
+//! `odd_params` has a parameter name that is not an identifier, which pm renames.
+//!
+//! It also publishes symbols, which a recipe sees as constants, two of them spelt
+//! `same-name` and `same_name`: only the first is reachable from a recipe.
 
 wit_bindgen::generate!({ path: "../../../wit", world: "recipe-plugin" });
 
@@ -39,11 +42,24 @@ impl Guest for Recipes {
             hooks: Vec::new(),
             grants_at_most: Vec::new(),
             source_extensions: Vec::new(),
-            symbols: vec![Symbol {
-                name: "prefix".into(),
-                value: "/opt/fixture".into(),
-                summary: "a constant".into(),
-            }],
+            symbols: vec![
+                Symbol {
+                    name: "prefix".into(),
+                    value: "/opt/fixture".into(),
+                    summary: "a constant".into(),
+                },
+                // The same recipe constant, `same_name`, twice over.
+                Symbol {
+                    name: "same-name".into(),
+                    value: "/first".into(),
+                    summary: "kept".into(),
+                },
+                Symbol {
+                    name: "same_name".into(),
+                    value: "/second".into(),
+                    summary: "dropped from recipes".into(),
+                },
+            ],
         }
     }
 
@@ -66,6 +82,7 @@ impl Guest for Recipes {
             function("refuse", &[], RecipeValue::Any),
             function("spin", &[], RecipeValue::Any),
             function("fn", &[], RecipeValue::Any),
+            function("odd_params", &["fine", "not fine"], RecipeValue::Any),
             function(
                 "too_many",
                 &["a", "b", "c", "d", "e", "f", "g"],

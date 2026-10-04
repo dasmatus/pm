@@ -777,3 +777,16 @@ package(p);
     .expect("evaluates");
     assert_eq!(build.steps()[1].run, ["test ! -w /etc"]);
 }
+
+#[test]
+fn a_failed_add_steps_leaves_the_package_unchanged() {
+    let build = eval(
+        r#"
+let p = Package("p", "1");
+try { p.add_steps([step(Build, "ok", []), 42]); } catch {}
+package(p);
+"#,
+    )
+    .expect("evaluates");
+    assert!(build.steps().is_empty());
+}

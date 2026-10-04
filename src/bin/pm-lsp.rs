@@ -53,7 +53,12 @@ fn main() -> miette::Result<()> {
             "--definitions" => definitions = true,
             "--no-plugins" => no_plugins = true,
             "--allow-unsigned-plugins" => allow_unsigned = true,
-            "--plugin-dir" => plugin_dir = args.next().map(std::path::PathBuf::from),
+            "--plugin-dir" => {
+                let Some(dir) = args.next() else {
+                    return Err(miette::miette!("--plugin-dir needs a directory"));
+                };
+                plugin_dir = Some(std::path::PathBuf::from(dir));
+            }
             "--version" => {
                 println!("pm-lsp {}", env!("CARGO_PKG_VERSION"));
                 return Ok(());

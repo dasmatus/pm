@@ -203,10 +203,27 @@ pub(super) fn recipe_functions(
             WitRecipeValue::Kernel => RecipeValue::Kernel,
             WitRecipeValue::Package => RecipeValue::Package,
         };
+        // Parameter names only document the function, but they land in `pm plugins`
+        // and in `pm-lsp --definitions`, so one that is not an identifier becomes
+        // `argN` rather than text a definitions file cannot parse.
         let params = raw
             .params
             .into_iter()
-            .map(|param| clip(param, NAME_MAX))
+            .enumerate()
+            .map(|(index, param)| {
+                if param.len() <= NAME_MAX && rhai::is_valid_identifier(&param) {
+                    param
+                } else {
+                    warn!(
+                        plugin,
+                        function = %raw.name,
+                        param = %param,
+                        "not a usable parameter name; calling it arg{}",
+                        index + 1
+                    );
+                    format!("arg{}", index + 1)
+                }
+            })
             .collect();
         kept.insert(
             raw.name.clone(),

@@ -690,7 +690,7 @@ impl Registry {
                 plugin: plugin.manifest.name.clone(),
                 component: plugin.component.clone(),
                 functions: plugin.manifest.recipe_functions.values().cloned().collect(),
-                symbols: plugin.manifest.symbols.values().cloned().collect(),
+                symbols: recipe_symbols(plugin),
             })
             .collect()
     }
@@ -983,6 +983,34 @@ impl PartialEq for Registry {
 }
 
 impl Eq for Registry {}
+
+/// The symbols of `plugin` a recipe can reach as constants.
+///
+/// A recipe names one with `-` written `_`, so `unit-dir` and `unit_dir` would be the
+/// same constant. Only the first of such a pair (in name order) is kept, and the other
+/// is logged, rather than letting one silently stand for both.
+fn recipe_symbols(plugin: &Plugin) -> Vec<Symbol> {
+    let mut seen = BTreeSet::new();
+    plugin
+        .manifest
+        .symbols
+        .values()
+        .filter(|symbol| {
+            let constant = symbol.name.replace('-', "_");
+            if seen.insert(constant.clone()) {
+                return true;
+            }
+            warn!(
+                plugin = %plugin.manifest.name,
+                symbol = %symbol.name,
+                "is the recipe constant `{constant}` too, which another of the plugin's symbols \
+                 already is; recipes cannot reach it (`%{{...}}` references still can)"
+            );
+            false
+        })
+        .cloned()
+        .collect()
+}
 
 /// Read, verify, compile and interrogate one plugin file.
 fn load_one(runtime: &Runtime, path: &Path, trust: Option<&TrustStore>) -> Result<Plugin> {

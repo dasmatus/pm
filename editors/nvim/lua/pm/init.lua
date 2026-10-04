@@ -5,10 +5,12 @@ local M = {}
 local parsers_wanted = {
     rhai = {
         url = "https://github.com/elkowar/tree-sitter-rhai",
+        branch = "main",
         revision = "4ac7384d487ffcb54e746ef1569585a749370c5b",
     },
     starlark = {
         url = "https://github.com/tree-sitter-grammars/tree-sitter-starlark",
+        branch = "master",
         revision = "a453dbf3ba433db0e5ec621a38a7e59d72e4dc69",
     },
 }
@@ -31,7 +33,7 @@ local function register_parser()
             configs[name] = {
                 install_info = {
                     url = source.url,
-                    branch = "master",
+                    branch = source.branch,
                     revision = source.revision,
                     files = { "src/parser.c" },
                 },

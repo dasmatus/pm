@@ -59,7 +59,7 @@ package(p);
     assert_eq!(steps[0].name, "install foo.service");
     assert_eq!(
         steps[0].run,
-        ["install -Dm644 units/foo.service /dest/usr/lib/systemd/system/foo.service"]
+        ["install -Dm644 -- units/foo.service /dest/usr/lib/systemd/system/foo.service"]
     );
     assert_eq!(steps[2].name, "install b.timer");
     assert_eq!(steps[3].run, ["test -d /dest/usr/lib/systemd/system"]);
@@ -103,6 +103,7 @@ fn the_fixture_s_functions_are_listed_and_the_unusable_ones_dropped() {
             "fraction",
             "kernel_for",
             "misspelt",
+            "odd_params",
             "refuse",
             "skeleton",
             "spin"
@@ -111,6 +112,10 @@ fn the_fixture_s_functions_are_listed_and_the_unusable_ones_dropped() {
     assert_eq!(
         manifest.recipe_functions["skeleton"].returns,
         RecipeValue::Package
+    );
+    assert_eq!(
+        manifest.recipe_functions["odd_params"].params,
+        ["fine", "arg2"]
     );
     let modules = plugins.recipe_modules();
     assert_eq!(modules[0].namespace(), "recipe_fixture");
@@ -169,4 +174,25 @@ fn definitions_include_plugin_modules() {
     let (_root, plugins) = registry(&["systemd"]);
     let definitions = recipe::definitions(&plugins);
     assert!(definitions.contains("install_unit"), "{definitions}");
+}
+
+#[test]
+fn symbols_that_collide_as_constants_keep_the_first() {
+    let (_root, plugins) = registry(&["recipes"]);
+    let modules = plugins.recipe_modules();
+    let constants: Vec<_> = modules[0]
+        .symbols()
+        .iter()
+        .map(|symbol| symbol.name.as_str())
+        .collect();
+    assert_eq!(constants, ["prefix", "same-name"]);
+    let build = recipe::evaluate_with(
+        "package(#{ name: \"p\", version: \"1\", dependencies: [recipe_fixture::same_name] });",
+        &plugins,
+    )
+    .expect("evaluates");
+    assert_eq!(
+        build.dependencies().collect::<Vec<_>>(),
+        [Path::new("/first")]
+    );
 }

@@ -134,7 +134,8 @@ fn install_unit(file: &str) -> Result<String, String> {
         .iter()
         .find(|(name, ..)| *name == "unitdir")
         .map_or("/usr/lib/systemd/system", |(_, value, _)| value);
-    let command = format!("install -Dm644 {file} /dest{unitdir}/{unit}");
+    // `--`, so a path starting with `-` is still the file to install.
+    let command = format!("install -Dm644 -- {file} /dest{unitdir}/{unit}");
     Ok(format!(
         r#"{{"stage":"Install","name":{},"run":[{}]}}"#,
         json::quote(&format!("install {unit}")),

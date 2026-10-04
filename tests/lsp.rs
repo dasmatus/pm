@@ -126,3 +126,14 @@ fn definitions_can_be_printed() {
     let text = String::from_utf8_lossy(&output.stdout);
     assert!(text.contains("fn Package("), "{text}");
 }
+
+#[test]
+fn a_plugin_dir_flag_without_a_directory_is_an_error() {
+    let output = Command::new(env!("CARGO_BIN_EXE_pm-lsp"))
+        .args(["--plugin-dir"])
+        .stdin(Stdio::null())
+        .output()
+        .expect("run pm-lsp");
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("--plugin-dir"));
+}
