@@ -1,11 +1,68 @@
-# To get started with Dependabot version updates, you'll need to specify which
-# package ecosystems to update and where the package manifests are located.
-# Please see the documentation for all configuration options:
-# https://docs.github.com/code-security/dependabot/dependabot-version-updates/configuration-options-for-the-dependabot.yml-file
-
+# Dependabot configuration
+# Docs: https://docs.github.com/code-security/dependabot/dependabot-version-updates/configuration-options-for-the-dependabot.yml-file
+#
+# - Weekly version updates for every package ecosystem in this repository
+# - Minor/patch updates grouped into a single PR per ecosystem; majors stay separate
+# - Security updates grouped per ecosystem
+# - 3-day cooldown so brand-new releases settle before a PR is opened
 version: 2
 updates:
-  - package-ecosystem: "cargo" # See documentation for possible values
-    directory: "/" # Location of package manifests
+  - package-ecosystem: "cargo"
+    directories:
+      - "/"
+      - "/plugins"
+      - "/editors/zed"
     schedule:
       interval: "weekly"
+      day: "monday"
+    open-pull-requests-limit: 10
+    rebase-strategy: "auto"
+    labels:
+      - "dependencies"
+      - "rust"
+    commit-message:
+      prefix: "deps(cargo)"
+      include: "scope"
+    cooldown:
+      default-days: 3
+    groups:
+      cargo-minor-patch:
+        applies-to: version-updates
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
+      cargo-major:
+        applies-to: version-updates
+        patterns: ["*"]
+        update-types: ["major"]
+      cargo-security:
+        applies-to: security-updates
+        patterns: ["*"]
+
+  - package-ecosystem: "github-actions"
+    directories:
+      - "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    open-pull-requests-limit: 10
+    rebase-strategy: "auto"
+    labels:
+      - "dependencies"
+      - "ci"
+    commit-message:
+      prefix: "deps(github-actions)"
+      include: "scope"
+    cooldown:
+      default-days: 3
+    groups:
+      githubactions-minor-patch:
+        applies-to: version-updates
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
+      githubactions-major:
+        applies-to: version-updates
+        patterns: ["*"]
+        update-types: ["major"]
+      githubactions-security:
+        applies-to: security-updates
+        patterns: ["*"]
