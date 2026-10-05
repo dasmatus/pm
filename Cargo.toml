@@ -97,3 +97,11 @@ opt-level = 3
 opt-level = 3
 [profile.dev.package.gimli]
 opt-level = 3
+
+# The release binaries are what ships, in release.yml's assets and in LosOS's
+# image, so they trade build time for fat LTO and one codegen unit: inlining
+# across crate boundaries (wasmtime, cranelift, zbus) and a smaller binary.
+# plugins/ is its own workspace and sets the same in its own profile.
+[profile.release]
+lto = true
+codegen-units = 1
