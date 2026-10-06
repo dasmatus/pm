@@ -3,5 +3,7 @@ name = "pm-cancel"
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
+license.workspace = true
+description = "The best-effort cancellation token a pm build is threaded with."
 
 [dependencies]

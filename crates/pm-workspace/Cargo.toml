@@ -3,6 +3,8 @@ name = "pm-workspace"
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
+license.workspace = true
+description = "RAII guards for a pm build's staging directory and the sandboxed child processes it runs."
 
 [dependencies]
 hakoniwa.workspace = true

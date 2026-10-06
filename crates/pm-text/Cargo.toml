@@ -3,5 +3,7 @@ name = "pm-text"
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
+license.workspace = true
+description = "Text helpers shared by pm's crates, including sanitise, the one place untrusted build output is cleaned before it reaches a wire type."
 
 [dependencies]

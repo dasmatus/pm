@@ -3,6 +3,8 @@ name = "pm-vm"
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
+license.workspace = true
+description = "Packages that ship their own kernel, booted in a virtual machine: the initramfs, the guest's init and the host side."
 
 [dependencies]
 pm-elf.workspace = true

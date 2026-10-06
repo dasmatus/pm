@@ -3,6 +3,8 @@ name = "pm-wire"
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
+license.workspace = true
+description = "The types and framing that cross the boundary between pm's daemon and its clients or its own worker."
 
 [dependencies]
 pm-text.workspace = true

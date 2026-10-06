@@ -3,6 +3,8 @@ name = "pm-signing"
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
+license.workspace = true
+description = "Ed25519 signing and verification of pm build files and packages, and the local trust store."
 
 [dependencies]
 miette.workspace = true
