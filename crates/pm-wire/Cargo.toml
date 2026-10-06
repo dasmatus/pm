@@ -1,0 +1,11 @@
+[package]
+name = "pm-wire"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+pm-text.workspace = true
+miette.workspace = true
+serde.workspace = true
+zbus.workspace = true

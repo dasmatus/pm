@@ -31,7 +31,29 @@ path = "src/bin/pm-vm-init.rs"
 name = "pmd"
 path = "src/bin/pmd.rs"
 
-[dependencies]
+[workspace]
+resolver = "3"
+# pm's library and binaries stay in the root package, so `tests/`, `benches/` and
+# build.rs keep working where they are and every binary keeps its name. What stands
+# on its own below the build core lives under crates/. plugins/ and editors/zed are
+# workspaces of their own: they compile to WebAssembly, not to the host.
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[workspace.dependencies]
+pm-cancel = { path = "crates/pm-cancel" }
+pm-download = { path = "crates/pm-download" }
+pm-elf = { path = "crates/pm-elf" }
+pm-progress = { path = "crates/pm-progress" }
+pm-signing = { path = "crates/pm-signing" }
+pm-text = { path = "crates/pm-text" }
+pm-vm = { path = "crates/pm-vm" }
+pm-wire = { path = "crates/pm-wire" }
+pm-workspace = { path = "crates/pm-workspace" }
 anyhow = "1"
 arbitrary = { version = "1.4.2", features = ["derive"] }
 clap = { version = "4.6.6", features = ["derive"] }
@@ -63,6 +85,44 @@ wasmtime = { version = "49.0.0", default-features = false, features = [
     "std",
 ] }
 zbus = { version = "5.19", default-features = false, features = ["async-io", "blocking-api", "p2p"] }
+
+
+[dependencies]
+pm-cancel.workspace = true
+pm-download.workspace = true
+pm-elf.workspace = true
+pm-progress.workspace = true
+pm-signing.workspace = true
+pm-text.workspace = true
+pm-vm.workspace = true
+pm-wire.workspace = true
+pm-workspace.workspace = true
+anyhow.workspace = true
+arbitrary.workspace = true
+clap.workspace = true
+dialoguer.workspace = true
+either.workspace = true
+hakoniwa.workspace = true
+lsp-server.workspace = true
+lsp-types.workspace = true
+miette.workspace = true
+minreq.workspace = true
+nix.workspace = true
+nom.workspace = true
+rayon.workspace = true
+rhai.workspace = true
+ring.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml.workspace = true
+starlark.workspace = true
+tempfile.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+url.workspace = true
+walkdir.workspace = true
+wasmtime.workspace = true
+zbus.workspace = true
 
 [build-dependencies]
 # Encodes the bundled plugins built by build.rs as components.

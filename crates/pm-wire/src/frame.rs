@@ -1,7 +1,7 @@
 //! Length-prefixed framing for the worker's socketpair.
 //!
 //! The daemon's public API travels over D-Bus, encoded by
-//! [`crate::wire::types`]. This is the OTHER wire: what the daemon will speak
+//! `pm::types`. This is the OTHER wire: what the daemon will speak
 //! to its own build worker over a `socketpair(2)`, once one exists. That
 //! channel has no client watching it and no bus name to register, so
 //! reaching for zbus there would drag a whole codec onto a byte pipe it was
@@ -17,7 +17,7 @@ use miette::{IntoDiagnostic, WrapErr, miette};
 /// Once the worker is a separate process, a frame's length prefix is
 /// attacker-adjacent: a corrupted or hostile prefix must fail cleanly rather
 /// than turn into an attempt to allocate gigabytes for one frame. 16 MiB
-/// comfortably covers a sanitised [`crate::wire::types::Diagnostic`] - see its
+/// comfortably covers a sanitised `pm::types::Diagnostic` - see its
 /// own field caps - with plenty of room to spare.
 pub const MAX_FRAME: u32 = 16 * 1024 * 1024;
 

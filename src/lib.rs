@@ -1,7 +1,15 @@
+//! pm's build core: build files, their dependency graph, the plugins and policy
+//! that classify their steps, the sandbox they run in, and the permissions a
+//! package is found to need.
+//!
+//! The layers below that core are crates of their own under `crates/`, and are
+//! re-exported here under the module names they always had, so `pm::signing`,
+//! `pm::wire` and the rest still resolve.
+
 /// Build-file parsing, building and packaging.
 pub mod bf;
 /// A best-effort cancellation token threaded through a build.
-pub mod cancel;
+pub use pm_cancel as cancel;
 /// The caller-supplied environment a build runs against, instead of the
 /// process's own cwd, `$PATH` and `$HOME`.
 pub mod context;
@@ -9,7 +17,7 @@ pub mod context;
 /// `org.pm1` D-Bus service once a later task adds it.
 pub mod daemon;
 /// Fetching a build file's sources over HTTP, hashing them as they land.
-pub mod download;
+pub use pm_download as download;
 /// Resolving a build file's dependency graph, and building it.
 pub mod graph;
 /// Package metadata written into each archive.
@@ -24,7 +32,7 @@ pub mod plugin;
 /// Deriving a sandbox policy from the contents of a build file.
 pub mod policy;
 /// A live, redrawable region that reports what a build is doing right now.
-pub mod progress;
+pub use pm_progress as progress;
 /// Recipes written in Rhai.
 pub mod recipe;
 /// Extracting and running a built package inside a sandbox.
@@ -32,17 +40,17 @@ pub mod run;
 /// The hakoniwa jail that build steps run inside.
 pub mod sandbox;
 /// Ed25519 signing and verification of build files and packages.
-pub mod signing;
+pub use pm_signing as signing;
 /// Build files written in Starlark, deprecated in favour of [`recipe`].
 pub mod star;
 /// Individual build steps and their stages.
 pub mod step;
 /// Small text-formatting helpers shared by the library and the binaries.
-pub mod text;
+pub use pm_text as text;
 /// Packages that ship their own kernel, booted in a virtual machine.
-pub mod vm;
+pub use pm_vm as vm;
 /// Types and framing that cross the boundary between the daemon and its
 /// clients or its own worker.
-pub mod wire;
+pub use pm_wire as wire;
 /// RAII guards that auto-close build workspaces and sandboxed child processes.
-pub mod workspace;
+pub use pm_workspace as workspace;

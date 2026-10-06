@@ -21,11 +21,11 @@ use std::{
 
 use tracing::{debug, warn};
 
-use crate::perms::elf::{Linkage, linkage};
+use pm_elf::{Linkage, linkage};
 
 /// Directories the loader searches for a soname after `DT_RUNPATH`.
 ///
-/// The same list [`crate::run`] locates libraries with, for the same reason: the
+/// The same list `pm::run` locates libraries with, for the same reason: the
 /// guest's loader is the host's loader, copied in.
 const DEFAULT_LIBRARY_DIRS: [&str; 6] = [
     "/lib64",
@@ -39,7 +39,7 @@ const DEFAULT_LIBRARY_DIRS: [&str; 6] = [
 /// The only host directories a file is copied into the guest from.
 ///
 /// The run jail's view of the host: the directories `rootfs("/")` mirrors, plus the
-/// Nix store it adds (see [`crate::run`]). Which host files the guest gets is decided
+/// Nix store it adds (see `pm::run`). Which host files the guest gets is decided
 /// by the package - its `PT_INTERP`, `DT_RUNPATH` and `#!` lines - so without this a
 /// package could name `$HOME/.ssh` as a library directory and be handed a private key
 /// inside its VM. With it, a package's VM never holds a host file its jail could not

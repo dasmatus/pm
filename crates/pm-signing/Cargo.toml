@@ -1,0 +1,12 @@
+[package]
+name = "pm-signing"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+miette.workspace = true
+ring.workspace = true
+serde.workspace = true
+serde_yaml.workspace = true
+tracing.workspace = true

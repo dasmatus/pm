@@ -1,0 +1,17 @@
+[package]
+name = "pm-vm"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+pm-elf.workspace = true
+pm-workspace.workspace = true
+hakoniwa.workspace = true
+miette.workspace = true
+nix.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true
+tracing.workspace = true
+walkdir.workspace = true

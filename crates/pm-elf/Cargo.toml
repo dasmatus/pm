@@ -1,0 +1,10 @@
+[package]
+name = "pm-elf"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+miette.workspace = true
+nom.workspace = true
+tracing.workspace = true
