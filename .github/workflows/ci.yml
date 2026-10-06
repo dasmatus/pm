@@ -91,7 +91,8 @@ jobs:
       # linted too. Without it clippy checks the lib and the main binary only,
       # and divan benches with `harness = false` are exactly the kind of target
       # that rots unnoticed.
-      - run: cargo clippy --all-targets --all-features -- -D warnings
+      # --workspace so the crates under crates/ are linted too, not only the root package.
+      - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       - run: cargo clippy --manifest-path editors/zed/Cargo.toml --locked --all-targets --all-features -- -D warnings
       - run: cargo check --manifest-path editors/zed/Cargo.toml --locked
 
@@ -135,8 +136,9 @@ jobs:
       # No --all-targets: that would build the benches as test targets for
       # nothing. The `--ignored` tests are handled by the sandbox job below.
       # Nothing here reaches the network — tests/download.rs runs against a
-      # TestServer on a local socket, not a real host.
-      - run: cargo test --all-features
+      # TestServer on a local socket, not a real host. --workspace runs the unit
+      # tests of the crates under crates/ as well as the root package's suite.
+      - run: cargo test --workspace --all-features
 
   sandbox:
     name: "confined tests (userns + landlock)"

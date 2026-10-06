@@ -1,7 +1,7 @@
 //! RAII guards for the two resources a build owns: the staging directory it
 //! writes into, and the child process it spawns out of that directory -
 //! [`SandboxedChild`] for a `hakoniwa`-jailed one, [`HostChild`] for a plain
-//! [`std::process::Child`] run through the [`crate::sandbox::BuildSandbox`]
+//! [`std::process::Child`] run through the `pm::sandbox::BuildSandbox`
 //! escape hatch.
 //!
 //! # Drop order
@@ -309,7 +309,7 @@ impl Drop for SandboxedChild {
 /// A plain host process child that is killed and reaped if it is still
 /// running when the guard drops.
 ///
-/// [`crate::sandbox::BuildSandbox::unsandboxed`] spawns a
+/// `pm::sandbox::BuildSandbox::unsandboxed` spawns a
 /// [`std::process::Child`] instead of a [`hakoniwa::Child`], so it cannot use
 /// [`SandboxedChild`]: the two child types share no common trait for killing
 /// and waiting on them (different error types, different exit status types),

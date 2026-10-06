@@ -23,7 +23,8 @@ use ring::digest::{Context, SHA256};
 use tracing::{debug, warn};
 use url::Url;
 
-use crate::{cancel::Cancel, signing::to_hex};
+use pm_cancel::Cancel;
+use pm_signing::to_hex;
 
 /// How much of the body is hashed and written per pass.
 ///

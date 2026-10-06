@@ -1,0 +1,16 @@
+[package]
+name = "pm-download"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+description = "Fetching a build file's sources over HTTP, hashing them as they land."
+
+[dependencies]
+pm-cancel.workspace = true
+pm-signing.workspace = true
+miette.workspace = true
+minreq.workspace = true
+ring.workspace = true
+tracing.workspace = true
+url.workspace = true

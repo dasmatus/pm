@@ -4,7 +4,9 @@
 
 use miette::Report;
 
-use crate::{progress::sanitise, wire::types::Diagnostic};
+use pm_text::sanitise;
+
+use crate::types::Diagnostic;
 
 /// Something failed for a reason the returned [`Diagnostic`] describes. The
 /// fallback name when nothing more specific applies - which, today, is every

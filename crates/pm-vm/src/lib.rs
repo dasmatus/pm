@@ -80,7 +80,7 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 use walkdir::WalkDir;
 
-use crate::workspace::{HostChild, Workspace};
+use pm_workspace::{HostChild, Workspace};
 
 use cpio::Newc;
 
@@ -95,7 +95,7 @@ const STATUS_PORT: &str = "/dev/ttyS1";
 
 /// The `PATH` the entrypoint starts with, which is also where `#!/usr/bin/env
 /// program` scripts find `program` ([`closure`]).
-pub(crate) const GUEST_PATH: &str = "/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bin:/sbin";
+pub const GUEST_PATH: &str = "/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bin:/sbin";
 
 /// The most of init's report pm keeps. A report is one short line; the guest can
 /// write as much as it likes to the port, and everything past this is discarded.

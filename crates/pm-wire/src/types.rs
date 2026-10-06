@@ -40,7 +40,7 @@ pub struct CallerContext {
 /// A build failure, flattened for a client with no shared address space to
 /// read a `miette::Report` out of.
 ///
-/// Construct one with `From<&miette::Report>` (see [`crate::wire::error`]),
+/// Construct one with `From<&miette::Report>` (see `pm::error`),
 /// which is the only place raw, untrusted command output is sanitised before
 /// it can reach a field here.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
@@ -56,12 +56,12 @@ pub struct Diagnostic {
     pub causes: Vec<String>,
 }
 
-/// One line of a [`crate::progress::Progress`] tree, flattened for polling.
+/// One line of a `pm_progress::Progress` tree, flattened for polling.
 ///
 /// A daemon has no terminal to redraw and no client watching every
 /// `set_message`/`set_bytes` call - `set_bytes` alone fires once per 64 KiB
 /// of a download - so instead of one event per update, a client polls
-/// [`crate::progress::Progress::nodes`] on its own schedule and diffs the
+/// `pm_progress::Progress::nodes` on its own schedule and diffs the
 /// tree against what it saw last time.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
 pub struct ProgressNode {

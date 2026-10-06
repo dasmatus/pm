@@ -480,14 +480,14 @@ pub fn default_trust_dir() -> miette::Result<PathBuf> {
 
 /// `$XDG_CONFIG_HOME` when it is an absolute path, else `$HOME/.config`.
 ///
-/// Visible to the crate because [`crate::plugin::default_plugin_dir`] puts the plugin
+/// Public because `pm::plugin::default_plugin_dir` puts the plugin
 /// directory beside the trust store, and the two must not be able to disagree about
 /// where `<config>` is.
 ///
 /// # Errors
 ///
 /// Fails if neither variable gives an absolute directory.
-pub(crate) fn config_dir() -> miette::Result<PathBuf> {
+pub fn config_dir() -> miette::Result<PathBuf> {
     if let Some(configured) = std::env::var_os("XDG_CONFIG_HOME") {
         let path = PathBuf::from(configured);
         // The XDG spec says a relative (or empty) value must be ignored as if unset.
@@ -598,7 +598,7 @@ fn signature_path(path: &Path) -> PathBuf {
 }
 
 /// Lowercase hex, without pulling in a dependency for sixteen digits.
-pub(crate) fn to_hex(bytes: &[u8]) -> String {
+pub fn to_hex(bytes: &[u8]) -> String {
     const DIGITS: &[u8; 16] = b"0123456789abcdef";
 
     bytes

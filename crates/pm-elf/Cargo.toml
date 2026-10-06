@@ -1,0 +1,12 @@
+[package]
+name = "pm-elf"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+description = "A bounds-checked reader for what an ELF object says about how it links: PT_INTERP, DT_NEEDED, DT_RUNPATH and DT_RPATH."
+
+[dependencies]
+miette.workspace = true
+nom.workspace = true
+tracing.workspace = true

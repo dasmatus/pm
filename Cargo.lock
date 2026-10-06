@@ -2405,6 +2405,15 @@ dependencies = [
  "minreq",
  "nix 0.31.3",
  "nom",
+ "pm-cancel",
+ "pm-download",
+ "pm-elf",
+ "pm-progress",
+ "pm-signing",
+ "pm-text",
+ "pm-vm",
+ "pm-wire",
+ "pm-workspace",
  "proptest",
  "rayon",
  "rhai",
@@ -2421,6 +2430,96 @@ dependencies = [
  "wasmtime",
  "wit-component 0.260.0",
  "zbus",
+]
+
+[[package]]
+name = "pm-cancel"
+version = "0.1.0"
+
+[[package]]
+name = "pm-download"
+version = "0.1.0"
+dependencies = [
+ "miette",
+ "minreq",
+ "pm-cancel",
+ "pm-signing",
+ "ring",
+ "tracing",
+ "url",
+]
+
+[[package]]
+name = "pm-elf"
+version = "0.1.0"
+dependencies = [
+ "miette",
+ "nom",
+ "tracing",
+]
+
+[[package]]
+name = "pm-progress"
+version = "0.1.0"
+dependencies = [
+ "dialoguer",
+ "miette",
+ "pm-text",
+ "pm-wire",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "pm-signing"
+version = "0.1.0"
+dependencies = [
+ "miette",
+ "ring",
+ "serde",
+ "serde_yaml",
+ "tracing",
+]
+
+[[package]]
+name = "pm-text"
+version = "0.1.0"
+
+[[package]]
+name = "pm-vm"
+version = "0.1.0"
+dependencies = [
+ "hakoniwa",
+ "miette",
+ "nix 0.31.3",
+ "pm-elf",
+ "pm-workspace",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tracing",
+ "walkdir",
+]
+
+[[package]]
+name = "pm-wire"
+version = "0.1.0"
+dependencies = [
+ "miette",
+ "pm-text",
+ "serde",
+ "zbus",
+]
+
+[[package]]
+name = "pm-workspace"
+version = "0.1.0"
+dependencies = [
+ "hakoniwa",
+ "miette",
+ "tempfile",
+ "tracing",
+ "walkdir",
 ]
 
 [[package]]

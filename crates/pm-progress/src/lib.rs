@@ -29,7 +29,7 @@
 //! # A third mode for a daemon with no terminal
 //!
 //! [`Progress::silent`] is neither of the above: it tracks nodes exactly as a
-//! live region does - [`Task::is_live`] is true, so [`crate::sandbox`]
+//! live region does - [`Task::is_live`] is true, so `pm::sandbox`
 //! captures a build's stdout instead of inheriting it - but spawns no ticker
 //! and draws nothing, ever. A daemon has no terminal to redraw and no client
 //! watching every `set_message`, so it polls [`Progress::nodes`] on its own
@@ -45,7 +45,9 @@ use std::{
 use dialoguer::console::Term;
 use tracing_subscriber::fmt::MakeWriter;
 
-use crate::wire::types::ProgressNode;
+use pm_text::collapse_control;
+pub use pm_text::sanitise;
+use pm_wire::types::ProgressNode;
 
 /// Frames of the spinner, advanced once per [`Progress::tick`].
 const FRAMES: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
@@ -696,7 +698,7 @@ impl Task {
     /// A second reference to this same line, which does not close it.
     ///
     /// Lets a value that needs to report under an existing line - a
-    /// [`crate::sandbox::BuildSandbox`] reporting under its package - hold a
+    /// `pm::sandbox::BuildSandbox` reporting under its package - hold a
     /// `Task` of its own without the line vanishing when that value is dropped
     /// or opening a redundant level of nesting under it.
     pub fn handle(&self) -> Self {
@@ -875,56 +877,4 @@ fn format_elapsed(elapsed: Duration) -> String {
     } else {
         format!("{}m{:02}s", seconds / 60, seconds % 60)
     }
-}
-
-/// Flatten anything that would move the cursor out of the line it is on.
-///
-/// A message is usually a line of a build's own output, which is free to carry
-/// carriage returns, tabs and escape sequences. Any of those inside the region
-/// desynchronises the redraw from what is on screen.
-fn collapse_control(text: &str) -> String {
-    text.chars()
-        .map(|c| {
-            if c == '\t' {
-                ' '
-            } else if c.is_control() {
-                '\u{fffd}'
-            } else {
-                c
-            }
-        })
-        .filter(|c| *c != '\u{fffd}')
-        .collect()
-}
-
-/// The single choke point untrusted text passes through before it can reach
-/// a wire type.
-///
-/// A build file is untrusted input, and its commands' stdout reaches these
-/// strings verbatim - a package's own `make` output becomes a progress
-/// message, and a failed step's captured stdout AND stderr become a
-/// [`crate::wire::types::Diagnostic`]. Every wire constructor that carries
-/// build-controlled text MUST pass it through here first: [`Task::set_message`]
-/// does, and so does `From<&miette::Report> for Diagnostic` in
-/// [`crate::wire::error`].
-///
-/// Two things happen, in order: control characters are collapsed by reusing
-/// [`collapse_control`] - the same logic that already protects the terminal
-/// render from a carriage return or an escape sequence - and the result is
-/// truncated to `cap` characters. A truncated result always ends in a
-/// visible `…` so a capped message is never mistaken for one that simply
-/// ended there.
-#[must_use]
-pub fn sanitise(text: &str, cap: usize) -> String {
-    let collapsed = collapse_control(text);
-    if collapsed.chars().count() <= cap {
-        return collapsed;
-    }
-    if cap == 0 {
-        return String::new();
-    }
-
-    let mut truncated: String = collapsed.chars().take(cap - 1).collect();
-    truncated.push('…');
-    truncated
 }

@@ -8,8 +8,8 @@
 //!
 //! # This is best-effort
 //!
-//! Tripping the token stops [`crate::graph::Graph`] handing out a package that
-//! has not started, and stops [`crate::download::Downloader`] writing another
+//! Tripping the token stops `pm::graph::Graph` handing out a package that
+//! has not started, and stops `pm_download::Downloader` writing another
 //! chunk of a download in progress. It does **not** reach into a package
 //! that is already mid-build: a step's subprocess keeps running to whatever
 //! end it was going to reach, because nothing here kills it. Say only that
@@ -30,7 +30,7 @@ type Wakeup = Arc<dyn Fn() + Send + Sync>;
 /// Every clone refers to the same underlying flag, so a caller can keep one
 /// handle to trip it while a scheduler holds another to poll it. Backed by an
 /// [`AtomicBool`] rather than a `Mutex<bool>` because for a plain poller -
-/// [`crate::download::Downloader`] between chunks, or anyone just asking "has
+/// `pm_download::Downloader` between chunks, or anyone just asking "has
 /// this fired yet" - the only operations are "set" and "read", neither of
 /// which needs to observe the other's timing beyond what atomics already
 /// guarantee.
@@ -44,8 +44,8 @@ pub struct Cancel {
     /// scheduler has registered one.
     ///
     /// This is deliberately opaque to `Cancel` - it does not name
-    /// [`crate::graph::Graph`]'s scheduler state, and knows nothing about it.
-    /// What it buys is real: [`crate::graph::Graph::build_with`] registers a
+    /// `pm::graph::Graph`'s scheduler state, and knows nothing about it.
+    /// What it buys is real: `pm::graph::Graph::build_with` registers a
     /// closure that locks the *same* mutex its workers already hold across
     /// their whole check-then-park sequence, sets whatever the scheduler
     /// checks WHILE HOLDING that lock, then releases it and only afterwards
@@ -81,7 +81,7 @@ impl Cancel {
     /// worker parked on a condvar promptly and correctly - see the field doc
     /// on `action`. Without one registered (nobody is scheduling against this
     /// token, or nobody has started yet), only the flag is set, which is
-    /// exactly what a plain poller like [`crate::download::Downloader`] needs.
+    /// exactly what a plain poller like `pm_download::Downloader` needs.
     pub fn cancel(&self) {
         self.flag.store(true, Ordering::Release);
         let action = self
@@ -102,14 +102,15 @@ impl Cancel {
 
     /// Register the action [`Cancel::cancel`] runs to reach a parked worker.
     ///
-    /// Crate-private: [`crate::graph::Graph::build_with`] is the only caller.
+    /// Public only because pm lives in another crate:
+    /// `pm::graph::Graph::build_with` is the only caller.
     /// It registers a closure that locks its own scheduler mutex, sets the
     /// cancellation flag the scheduler checks WHILE HOLDING that lock, then
     /// releases it and notifies its condvar - see the `action` field for why
     /// setting the flag under that lock, not the notify's timing relative to
     /// the unlock, is what actually closes the race. Replaces whatever was
     /// registered before.
-    pub(crate) fn register_wakeup<F>(&self, action: F)
+    pub fn register_wakeup<F>(&self, action: F)
     where
         F: Fn() + Send + Sync + 'static,
     {
@@ -119,13 +120,14 @@ impl Cancel {
     /// Forget the registered action, once the scheduler it belonged to has no
     /// more workers left to wake.
     ///
-    /// Crate-private: called by [`crate::graph::Graph::build_with`] after
+    /// Public only because pm lives in another crate: called by
+    /// `pm::graph::Graph::build_with` after
     /// every worker has joined, so a token kept alive past one build (a
     /// caller is free to hold and inspect it afterwards) does not keep that
     /// build's scheduler state pinned in memory, and so a later `cancel()` on
     /// an already-finished build's token is a harmless flag set rather than a
     /// call into a scheduler that no longer exists.
-    pub(crate) fn clear_wakeup(&self) {
+    pub fn clear_wakeup(&self) {
         *self.action.lock().unwrap_or_else(PoisonError::into_inner) = None;
     }
 }
