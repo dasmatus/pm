@@ -5,15 +5,12 @@
 //! every byte of init is a byte the guest has to unpack. `pm` itself can be init
 //! too, and is when this binary is missing; see [`pm::vm::guest`].
 
-use std::process::ExitCode;
-
-fn main() -> ExitCode {
+fn main() -> miette::Result<()> {
     if pm::vm::guest::is_guest_init() {
         pm::vm::guest::run();
     }
-    eprintln!(
-        "pm-vm-init only runs as PID 1 inside a package's virtual machine, which `pm run` \
-         boots; it does nothing on its own"
-    );
-    ExitCode::FAILURE
+    Err(miette::miette!(
+        help = "`pm run` boots it as PID 1 inside a package's virtual machine",
+        "pm-vm-init does nothing on its own"
+    ))
 }
