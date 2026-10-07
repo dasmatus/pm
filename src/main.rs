@@ -31,7 +31,7 @@ use std::{
     process::Command,
 };
 use tracing::{info, warn};
-use tracing_subscriber::fmt;
+use tracing_subscriber::{EnvFilter, fmt};
 use url::Url;
 
 /// Width the labels of the key/value blocks are padded to, so their values
@@ -429,7 +429,15 @@ fn main() -> miette::Result<()> {
     } else {
         Progress::to_terminal()
     };
-    fmt().without_time().with_writer(progress.log_sink()).init();
+    // `RUST_LOG` picks what is logged, as in every LosOS program; unset or
+    // unparsable, it is `info`, which is what pm always logged.
+    fmt()
+        .without_time()
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+        )
+        .with_writer(progress.log_sink())
+        .init();
 
     // Destructured rather than matched through `args`, so the plugin flags stay
     // reachable while the subcommand is moved out arm by arm.
@@ -1527,7 +1535,7 @@ fn migrate_command(
         migrate::write_converted(item, output, force)?;
         println!("{} -> {}", item.source.display(), target.display());
     }
-    eprintln!("Sign the new file(s) with `pm sign`; signatures do not carry over.");
+    info!("sign the new file(s) with `pm sign`; signatures do not carry over");
     Ok(())
 }
 

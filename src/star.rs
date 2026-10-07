@@ -131,9 +131,9 @@ fn pm_builtins(builder: &mut GlobalsBuilder) {
         let collected = eval
             .extra
             .and_then(|extra| extra.downcast_ref::<Collected>())
-            .ok_or_else(|| anyhow::anyhow!("package() is not available in this context"))?;
+            .ok_or_else(|| starlark::Error::new_other(BuiltinError::NoPackageContext))?;
         if collected.package.borrow_mut().replace(package).is_some() {
-            return Err(anyhow::anyhow!("package() was called more than once").into());
+            return Err(starlark::Error::new_other(BuiltinError::PackageTwice));
         }
         Ok(NoneType)
     }
@@ -151,10 +151,9 @@ fn pm_builtins(builder: &mut GlobalsBuilder) {
         heap: Heap<'v>,
     ) -> starlark::Result<Value<'v>> {
         if serde_json::from_value::<Stage>(Json::String(stage.to_owned())).is_err() {
-            return Err(anyhow::anyhow!(
-                "unknown stage {stage:?}; use Prepare, Build, Install or Test"
-            )
-            .into());
+            return Err(starlark::Error::new_other(BuiltinError::UnknownStage(
+                stage.to_owned(),
+            )));
         }
         let mut entries: Vec<(&str, Value<'v>)> = vec![
             ("stage", heap.alloc(stage)),
@@ -187,6 +186,26 @@ fn pm_builtins(builder: &mut GlobalsBuilder) {
     }
 }
 
+/// What a pm builtin rejects in a build file.
+///
+/// starlark carries these inside its own error, which renders them with the call's
+/// span; the codes are for anyone matching on the diagnostic instead.
+#[derive(Debug, thiserror::Error, miette::Diagnostic)]
+enum BuiltinError {
+    #[error("package() is not available in this context")]
+    #[diagnostic(code(pm::star::no_package_context))]
+    NoPackageContext,
+    #[error("package() was called more than once")]
+    #[diagnostic(code(pm::star::package_twice))]
+    PackageTwice,
+    #[error("unknown stage {0:?}; use Prepare, Build, Install or Test")]
+    #[diagnostic(code(pm::star::unknown_stage))]
+    UnknownStage(String),
+    #[error("version must be a string like \"1.2.3\" or a list of strings, not {0}")]
+    #[diagnostic(code(pm::star::version_type))]
+    VersionType(String),
+}
+
 /// `version = "1.2.3"` or `version = ["1", "2", "3"]` to its components.
 fn version_components(version: Value<'_>) -> starlark::Result<Vec<String>> {
     if let Some(text) = version.unpack_str() {
@@ -194,11 +213,9 @@ fn version_components(version: Value<'_>) -> starlark::Result<Vec<String>> {
     }
     match UnpackList::<String>::unpack_value(version)? {
         Some(list) => Ok(list.items),
-        None => Err(anyhow::anyhow!(
-            "version must be a string like \"1.2.3\" or a list of strings, not {}",
-            version.get_type()
-        )
-        .into()),
+        None => Err(starlark::Error::new_other(BuiltinError::VersionType(
+            version.get_type().to_owned(),
+        ))),
     }
 }
 

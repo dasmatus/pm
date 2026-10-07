@@ -12,47 +12,40 @@
 //! encoder <core module> <component>
 //! ```
 
-use std::{env::args_os, ffi::OsString, fs, path::PathBuf, process::ExitCode};
+use std::{env::args_os, ffi::OsString, fs, path::PathBuf};
 
+use miette::{IntoDiagnostic, WrapErr, miette};
 use wit_component::ComponentEncoder;
 
-fn main() -> ExitCode {
+fn main() -> miette::Result<()> {
     let arguments: Vec<OsString> = args_os().skip(1).collect();
     let [input, output] = arguments.as_slice() else {
-        eprintln!("usage: encoder <core module.wasm> <component.wasm>");
-        return ExitCode::FAILURE;
+        return Err(miette!(
+            help = "usage: encoder <core module.wasm> <component.wasm>",
+            "expected two arguments, got {}",
+            arguments.len()
+        ));
     };
     let (input, output) = (PathBuf::from(input), PathBuf::from(output));
 
-    let module = match fs::read(&input) {
-        Ok(bytes) => bytes,
-        Err(error) => {
-            eprintln!("cannot read {}: {error}", input.display());
-            return ExitCode::FAILURE;
-        }
-    };
+    let module = fs::read(&input)
+        .into_diagnostic()
+        .wrap_err_with(|| format!("cannot read {}", input.display()))?;
 
     // `validate` is the point of doing this in a build step rather than at load: a
     // component that does not validate is caught here, where the author is looking,
     // instead of in pm, where the user is.
-    let encoded = ComponentEncoder::default()
+    let bytes = ComponentEncoder::default()
         .module(&module)
-        .and_then(|encoder| encoder.validate(true).encode());
-    let bytes = match encoded {
-        Ok(bytes) => bytes,
-        Err(error) => {
-            eprintln!(
-                "cannot encode {} as a component: {error:?}",
-                input.display()
-            );
-            return ExitCode::FAILURE;
-        }
-    };
+        .and_then(|encoder| encoder.validate(true).encode())
+        // wit-component's errors are anyhow's, whose `Debug` carries the whole chain
+        // of causes; `Display` would keep only the outermost.
+        .map_err(|error| miette!("{error:?}"))
+        .wrap_err_with(|| format!("cannot encode {} as a component", input.display()))?;
 
-    if let Err(error) = fs::write(&output, &bytes) {
-        eprintln!("cannot write {}: {error}", output.display());
-        return ExitCode::FAILURE;
-    }
+    fs::write(&output, &bytes)
+        .into_diagnostic()
+        .wrap_err_with(|| format!("cannot write {}", output.display()))?;
     println!("{} ({} bytes)", output.display(), bytes.len());
-    ExitCode::SUCCESS
+    Ok(())
 }

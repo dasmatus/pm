@@ -21,7 +21,7 @@
 //! Deprecated Starlark `.package` files get a warning pointing at `pm migrate`,
 //! plus any error evaluating them.
 
-use std::collections::HashMap;
+use std::{collections::HashMap, io::IsTerminal};
 
 use lsp_server::{Connection, Message, Notification, Request, Response};
 use lsp_types::{
@@ -41,8 +41,21 @@ use pm::{
     plugin::{Loader, Registry, default_plugin_dir},
     recipe, star,
 };
+use tracing::warn;
+use tracing_subscriber::EnvFilter;
 
 fn main() -> miette::Result<()> {
+    // Logs go to stderr, which editors show in the server's output panel: stdout
+    // is the protocol, and one stray line there breaks the session.
+    tracing_subscriber::fmt()
+        .without_time()
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+        )
+        .with_writer(std::io::stderr)
+        .with_ansi(std::io::stderr().is_terminal())
+        .init();
+
     let mut args = std::env::args().skip(1);
     let mut definitions = false;
     let mut no_plugins = false;
@@ -104,7 +117,7 @@ fn load_plugins(dir: Option<std::path::PathBuf>, allow_unsigned: bool) -> Regist
         .map_or_else(default_plugin_dir, Ok)
         .and_then(|dir| Loader::new(dir).allow_unsigned(allow_unsigned).load());
     loaded.unwrap_or_else(|report| {
-        eprintln!("pm-lsp: carrying on without plugins: {report:?}");
+        warn!("carrying on without plugins: {report:?}");
         Registry::empty()
     })
 }

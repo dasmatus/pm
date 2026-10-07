@@ -8,9 +8,10 @@
 //! bind a session bus name at all - that lands in a later task, once the
 //! worker this one calls into is trustworthy on its own.
 
-use std::{os::fd::RawFd, process::ExitCode};
+use std::os::fd::RawFd;
 
 use clap::Parser;
+use miette::{IntoDiagnostic, WrapErr};
 use nix::{sys::prctl, sys::signal::Signal, unistd::getppid};
 use pm::daemon::worker;
 
@@ -34,31 +35,22 @@ struct Args {
     fd: Option<RawFd>,
 }
 
-fn main() -> ExitCode {
+fn main() -> miette::Result<()> {
     // Before ANYTHING else - even argument parsing - see this module's docs
     // and design section 7, invariant 2: the window this closes is between
     // our parent's `fork` and this call, and every instruction that runs
     // first widens it.
-    if let Err(code) = die_with_parent_or_exit() {
-        return code;
-    }
+    die_with_parent()?;
 
+    // No subscriber here: the worker installs its own, at the level the job
+    // asks for, once it has read the job (see `worker::run`).
     let args = Args::parse();
     match (args.worker, args.fd) {
-        (true, Some(fd)) => match worker::run(fd) {
-            Ok(()) => ExitCode::SUCCESS,
-            Err(report) => {
-                eprintln!("{report:?}");
-                ExitCode::FAILURE
-            }
-        },
-        _ => {
-            eprintln!(
-                "pmd currently only runs as `pmd --worker --fd <N>`; the daemon service \
-                 itself is a later task"
-            );
-            ExitCode::FAILURE
-        }
+        (true, Some(fd)) => worker::run(fd),
+        _ => Err(miette::miette!(
+            help = "the daemon service itself is a later task",
+            "pmd currently only runs as `pmd --worker --fd <N>`"
+        )),
     }
 }
 
@@ -79,19 +71,19 @@ fn main() -> ExitCode {
 /// request yet, no `Completed` frame anyone is waiting on either - exiting
 /// here is silent by construction, not silently wrong.
 ///
-/// Returns `Ok(())` when it is safe to continue, or the [`ExitCode`]
-/// `main` should return immediately, either because the parent already
-/// died or because the syscalls themselves failed.
-fn die_with_parent_or_exit() -> Result<(), ExitCode> {
+/// Returns `Ok(())` when it is safe to continue, or the error `main` should
+/// exit with immediately, either because the parent already died or because
+/// the syscalls themselves failed.
+fn die_with_parent() -> miette::Result<()> {
     let before = getppid();
-    if let Err(errno) = prctl::set_pdeathsig(Signal::SIGKILL) {
-        eprintln!("pmd: cannot set PR_SET_PDEATHSIG: {errno}");
-        return Err(ExitCode::FAILURE);
-    }
+    prctl::set_pdeathsig(Signal::SIGKILL)
+        .into_diagnostic()
+        .wrap_err("cannot set PR_SET_PDEATHSIG")?;
     let after = getppid();
     if before != after {
-        eprintln!("pmd: parent process exited before PDEATHSIG could be armed against it; exiting");
-        return Err(ExitCode::FAILURE);
+        return Err(miette::miette!(
+            "parent process exited before PDEATHSIG could be armed against it; exiting"
+        ));
     }
     Ok(())
 }

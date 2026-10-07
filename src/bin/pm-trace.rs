@@ -39,7 +39,7 @@ use clap::Parser;
 use miette::{IntoDiagnostic as _, WrapErr as _};
 use pm::perms::monitor::{self, ChildFailure, TraceOptions, TraceReport};
 use tracing::{debug, error, info};
-use tracing_subscriber::fmt;
+use tracing_subscriber::{EnvFilter, fmt};
 
 /// Traced to completion; the report was written. Also the exit code when the traced
 /// program itself exited non-zero - that is reported through the file's `exit_status`,
@@ -126,7 +126,13 @@ fn default_timeout_secs() -> u64 {
 }
 
 fn main() -> ExitCode {
-    fmt().without_time().with_writer(std::io::stderr).init();
+    fmt()
+        .without_time()
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+        )
+        .with_writer(std::io::stderr)
+        .init();
 
     let args = Args::parse();
 

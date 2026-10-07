@@ -39,7 +39,7 @@ use clap::Parser;
 use miette::{IntoDiagnostic, miette};
 use rayon::prelude::*;
 use tracing::{debug, error, info, warn};
-use tracing_subscriber::fmt;
+use tracing_subscriber::{EnvFilter, fmt};
 
 /// How long a single `pm` invocation may take before it is killed.
 const RUN_TIMEOUT: Duration = Duration::from_secs(20);
@@ -870,7 +870,12 @@ fn find_pm() -> miette::Result<PathBuf> {
 }
 
 fn main() -> miette::Result<()> {
-    fmt().without_time().init();
+    fmt()
+        .without_time()
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+        )
+        .init();
     let args = Args::parse();
 
     let seed = args.seed.unwrap_or_else(|| {
