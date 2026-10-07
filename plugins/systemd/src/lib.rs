@@ -488,52 +488,52 @@ impl Guest for Systemd {
 }
 
 /// Paths a directive says the program reads.
-fn read_grants(directive: &Directive) -> Vec<Grant> {
-    let mut grants: Vec<Grant> = READ_KEYS
+fn read_grants(directive: &Directive) -> impl Iterator<Item = Grant> {
+    let stream = directive.is("Service", "StandardInput");
+    READ_KEYS
         .iter()
-        .filter(|(sections, key)| directive.is_any(sections, key))
-        .flat_map(|_| paths(directive, false))
-        .collect();
-
-    grants.extend(directories(directive, false));
-    if directive.is("Service", "StandardInput") {
-        grants.extend(stream_path(directive, false));
-    }
-    grants
+        .filter(move |(sections, key)| directive.is_any(sections, key))
+        .flat_map(move |_| paths(directive, false))
+        .chain(directories(directive, false))
+        .chain(
+            stream
+                .then(|| stream_path(directive, false))
+                .into_iter()
+                .flatten(),
+        )
 }
 
 /// Paths a directive says the program writes.
-fn write_grants(directive: &Directive) -> Vec<Grant> {
-    let mut grants: Vec<Grant> = WRITE_KEYS
+fn write_grants(directive: &Directive) -> impl Iterator<Item = Grant> {
+    let stream =
+        directive.is("Service", "StandardOutput") || directive.is("Service", "StandardError");
+    WRITE_KEYS
         .iter()
-        .filter(|(sections, key)| directive.is_any(sections, key))
-        .flat_map(|_| paths(directive, true))
-        .collect();
-
-    grants.extend(directories(directive, true));
-    if directive.is("Service", "StandardOutput") || directive.is("Service", "StandardError") {
-        grants.extend(stream_path(directive, true));
-    }
-    grants
+        .filter(move |(sections, key)| directive.is_any(sections, key))
+        .flat_map(move |_| paths(directive, true))
+        .chain(directories(directive, true))
+        .chain(
+            stream
+                .then(|| stream_path(directive, true))
+                .into_iter()
+                .flatten(),
+        )
 }
 
 /// The program an `Exec*` directive runs.
-fn exec_grants(directive: &Directive) -> Vec<Grant> {
-    if !EXEC_KEYS
+fn exec_grants(directive: &Directive) -> impl Iterator<Item = Grant> {
+    let execs = EXEC_KEYS
         .iter()
-        .any(|key| directive.is_any(EXEC_SECTIONS, key))
-    {
-        return Vec::new();
-    }
+        .any(|key| directive.is_any(EXEC_SECTIONS, key));
     // The command line is the value; the program is its first word, once the `-@:+!`
     // decorations systemd allows in front of it are off.
-    let Some(first) = words(&directive.value).into_iter().next() else {
-        return Vec::new();
-    };
-    absolute_path(&first)
-        .map(|path| grant(Permission::ExecPath(path.into()), directive))
+    execs
+        .then(|| words(&directive.value).into_iter().next())
+        .flatten()
+        .and_then(|first| {
+            absolute_path(&first).map(|path| grant(Permission::ExecPath(path.into()), directive))
+        })
         .into_iter()
-        .collect()
 }
 
 /// What a `Listen*` directive asks for: a port is the network, a path is a socket file
@@ -543,26 +543,26 @@ fn exec_grants(directive: &Directive) -> Vec<Grant> {
 /// `ListenStream=8080` and `ListenStream=/run/foo.sock` are the same directive and mean
 /// entirely different things, and nothing about the program's source would tell them
 /// apart.
-fn listen_grants(directive: &Directive) -> Vec<Grant> {
-    if directive.is("Socket", "ListenFIFO") {
-        return absolute_path(&directive.value)
-            .map(|path| grant(Permission::WritePath(path.into()), directive))
-            .into_iter()
-            .collect();
-    }
-    if !LISTEN_KEYS.iter().any(|key| directive.is("Socket", key)) {
-        return Vec::new();
-    }
-    match absolute_path(&directive.value) {
-        Some(path) => vec![grant(Permission::WritePath(path.into()), directive)],
-        // An abstract namespace socket (`@name`) is not a file and not the network.
-        None if directive.value.starts_with('@') => Vec::new(),
-        None => vec![grant(Permission::Network, directive)],
-    }
+fn listen_grants(directive: &Directive) -> impl Iterator<Item = Grant> {
+    let permission = if directive.is("Socket", "ListenFIFO") {
+        absolute_path(&directive.value).map(|path| Permission::WritePath(path.into()))
+    } else if !LISTEN_KEYS.iter().any(|key| directive.is("Socket", key)) {
+        None
+    } else {
+        match absolute_path(&directive.value) {
+            Some(path) => Some(Permission::WritePath(path.into())),
+            // An abstract namespace socket (`@name`) is not a file and not the network.
+            None if directive.value.starts_with('@') => None,
+            None => Some(Permission::Network),
+        }
+    };
+    permission
+        .map(|permission| grant(permission, directive))
+        .into_iter()
 }
 
 /// Directives that say the program reaches the network.
-fn network_grants(directive: &Directive) -> Vec<Grant> {
+fn network_grants(directive: &Directive) -> impl Iterator<Item = Grant> {
     let wanted = if directive.is("Service", "IPAddressAllow") {
         !directive.value.is_empty()
     } else if directive.is("Service", "RestrictAddressFamilies") {
@@ -581,11 +581,10 @@ fn network_grants(directive: &Directive) -> Vec<Grant> {
     wanted
         .then(|| grant(Permission::Network, directive))
         .into_iter()
-        .collect()
 }
 
 /// Directives that say the unit runs more than one process.
-fn spawn_grants(directive: &Directive) -> Vec<Grant> {
+fn spawn_grants(directive: &Directive) -> impl Iterator<Item = Grant> {
     let spawns = AUXILIARY_EXEC
         .iter()
         .any(|key| directive.is_any(EXEC_SECTIONS, key))
@@ -593,7 +592,6 @@ fn spawn_grants(directive: &Directive) -> Vec<Grant> {
     spawns
         .then(|| grant(Permission::Spawn, directive))
         .into_iter()
-        .collect()
 }
 
 /// Whether the unit denies itself the network outright.
@@ -608,29 +606,26 @@ fn denies_network(directives: &[Directive]) -> bool {
 /// A `BindPaths=` entry is `source:destination:options`; the source is the host path and
 /// the rest describes where it lands inside the unit's own namespace, so only the source
 /// is recorded.
-fn paths(directive: &Directive, writes: bool) -> Vec<Grant> {
-    words(&directive.value)
-        .iter()
-        .filter_map(|word| {
-            let source = word.split(':').next().unwrap_or(word);
-            absolute_path(source).map(|path| {
-                let permission = if writes {
-                    Permission::WritePath(path.into())
-                } else {
-                    Permission::ReadPath(path.into())
-                };
-                grant(permission, directive)
-            })
+fn paths(directive: &Directive, writes: bool) -> impl Iterator<Item = Grant> {
+    words(&directive.value).into_iter().filter_map(move |word| {
+        let source = word.split(':').next().unwrap_or(&word);
+        absolute_path(source).map(|path| {
+            let permission = if writes {
+                Permission::WritePath(path.into())
+            } else {
+                Permission::ReadPath(path.into())
+            };
+            grant(permission, directive)
         })
-        .collect()
+    })
 }
 
 /// A `*Directory=` value, which is a name (or several) under a fixed root.
-fn directories(directive: &Directive, writes: bool) -> Vec<Grant> {
+fn directories(directive: &Directive, writes: bool) -> impl Iterator<Item = Grant> {
     DIRECTORY_KEYS
         .iter()
-        .filter(|(key, _, is_write)| *is_write == writes && directive.is("Service", key))
-        .flat_map(|(_, root, _)| {
+        .filter(move |(key, _, is_write)| *is_write == writes && directive.is("Service", key))
+        .flat_map(move |(_, root, _)| {
             words(&directive.value).into_iter().filter_map(move |name| {
                 let name = undecorate(&name);
                 // `StateDirectory=foo/bar` is legal; a specifier is not a name.
@@ -640,7 +635,7 @@ fn directories(directive: &Directive, writes: bool) -> Vec<Grant> {
                 Some(format!("{root}/{name}"))
             })
         })
-        .map(|path| {
+        .map(move |path| {
             let permission = if writes {
                 Permission::WritePath(path)
             } else {
@@ -648,21 +643,18 @@ fn directories(directive: &Directive, writes: bool) -> Vec<Grant> {
             };
             grant(permission, directive)
         })
-        .collect()
 }
 
 /// The path in a `Standard{Input,Output,Error}=` directive, if it names one.
 ///
 /// Only the `file:`, `append:` and `truncate:` forms name a path; `journal`, `null`,
 /// `socket`, `inherit` and `fd:name` do not.
-fn stream_path(directive: &Directive, writes: bool) -> Vec<Grant> {
-    let Some((kind, rest)) = directive.value.split_once(':') else {
-        return Vec::new();
-    };
-    if !["file", "append", "truncate"].contains(&kind) {
-        return Vec::new();
-    }
-    absolute_path(rest)
+fn stream_path(directive: &Directive, writes: bool) -> impl Iterator<Item = Grant> {
+    directive
+        .value
+        .split_once(':')
+        .filter(|(kind, _)| ["file", "append", "truncate"].contains(kind))
+        .and_then(|(_, rest)| absolute_path(rest))
         .map(|path| {
             let permission = if writes {
                 Permission::WritePath(path.into())
@@ -672,7 +664,6 @@ fn stream_path(directive: &Directive, writes: bool) -> Vec<Grant> {
             grant(permission, directive)
         })
         .into_iter()
-        .collect()
 }
 
 /// One grant, with the evidence line pm prefixes with the file and the plugin name.

@@ -119,8 +119,11 @@ fn the_fixture_s_functions_are_listed_and_the_unusable_ones_dropped() {
         manifest.recipe_functions["odd_params"].params,
         ["fine", "arg2"]
     );
-    let modules = plugins.recipe_modules();
-    assert_eq!(modules[0].namespace(), "recipe_fixture");
+    let module = plugins
+        .recipe_modules()
+        .next()
+        .expect("the fixture adds a module");
+    assert_eq!(module.namespace(), "recipe_fixture");
 }
 
 #[test]
@@ -181,8 +184,11 @@ fn definitions_include_plugin_modules() {
 #[test]
 fn symbols_that_collide_as_constants_keep_the_first() {
     let (_root, plugins) = registry(&["recipes"]);
-    let modules = plugins.recipe_modules();
-    let constants: Vec<_> = modules[0]
+    let module = plugins
+        .recipe_modules()
+        .next()
+        .expect("the fixture adds a module");
+    let constants: Vec<_> = module
         .symbols()
         .iter()
         .map(|symbol| symbol.name.as_str())

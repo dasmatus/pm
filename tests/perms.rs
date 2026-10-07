@@ -699,7 +699,7 @@ fn a_non_elf_file_is_not_an_error() {
 
     assert!(elf::analyse(&path).expect("analyse").is_none());
     assert!(elf::needed_libraries(&path).expect("needed").is_empty());
-    assert!(elf::runpath(&path).expect("runpath").is_empty());
+    assert!(elf::runpath(&path).expect("runpath").next().is_none());
     assert!(elf::interpreter(&path).expect("interp").is_none());
 }
 

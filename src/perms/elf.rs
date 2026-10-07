@@ -82,7 +82,7 @@ pub fn analyse(path: &Path) -> miette::Result<Option<Permissions>> {
     let Some(inspection) = inspect(path)? else {
         return Ok(None);
     };
-    let permissions: Permissions = grants(path, &inspection).into_iter().collect();
+    let permissions: Permissions = grants(path, &inspection).collect();
     debug!(
         path = %path.display(),
         needed = inspection.needed.len(),
@@ -100,7 +100,7 @@ pub fn analyse(path: &Path) -> miette::Result<Option<Permissions>> {
 /// libc.so.6` rather than a shrug. Duplicate grants are expected and harmless -
 /// [`Permissions::from_grants`] unifies them and merges their evidence, which is how a
 /// binary with thirty `DT_NEEDED` entries still yields four directory grants.
-fn grants(path: &Path, inspection: &Inspection) -> Vec<Grant> {
+fn grants(path: &Path, inspection: &Inspection) -> impl Iterator<Item = Grant> + use<> {
     let mut grants = Vec::new();
 
     if let Some(loader) = &inspection.interpreter {
@@ -171,7 +171,7 @@ fn grants(path: &Path, inspection: &Inspection) -> Vec<Grant> {
         }
     }
 
-    grants
+    grants.into_iter()
 }
 
 /// Join library names for an evidence line, naming the first few and counting the rest.

@@ -525,18 +525,19 @@ fn qemu_option_value(path: &Path) -> OsString {
 }
 
 /// `-accel kvm` when `/dev/kvm` can be opened, TCG emulation otherwise.
-fn accelerator() -> Vec<&'static str> {
-    if OpenOptions::new()
+fn accelerator() -> impl Iterator<Item = &'static str> {
+    let args: &[&str] = if OpenOptions::new()
         .read(true)
         .write(true)
         .open("/dev/kvm")
         .is_ok()
     {
-        vec!["-accel", "kvm", "-cpu", "host"]
+        &["-accel", "kvm", "-cpu", "host"]
     } else {
         warn!("/dev/kvm is not available; the guest is emulated and will be slow");
-        vec!["-accel", "tcg"]
-    }
+        &["-accel", "tcg"]
+    };
+    args.iter().copied()
 }
 
 /// Turn init's report into an exit status.

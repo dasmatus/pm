@@ -193,11 +193,7 @@ pub fn sources() -> Result<&'static [Loaded]> {
 /// # Errors
 ///
 /// As [`commands`].
-pub fn fingerprint_names() -> Result<Vec<&'static str>> {
-    Ok(fingerprint_names_iter()?.collect())
-}
-
-pub(crate) fn fingerprint_names_iter() -> Result<impl Iterator<Item = &'static str>> {
+pub fn fingerprint_names() -> Result<impl Iterator<Item = &'static str>> {
     Ok(commands()?
         .iter()
         .flat_map(|plugin| plugin.fingerprints.iter().copied()))
@@ -294,8 +290,13 @@ pub fn scanner_for(extension: &str) -> Result<Option<&'static Loaded>> {
 /// Its grants are recorded as [`Provenance::SourceAnalysis`] with the scanner's own
 /// evidence line, exactly as the compiled-in scanner recorded them. A scanner that traps
 /// costs this file's grants and a `warn` line, never the scan.
-#[must_use]
-pub fn scan_source(scanner: &'static Loaded, relative: &str, contents: &str) -> Vec<Grant> {
+///
+/// The scanner has run by the time this returns; the iterator only converts its answer.
+pub fn scan_source(
+    scanner: &'static Loaded,
+    relative: &str,
+    contents: &str,
+) -> impl Iterator<Item = Grant> + use<> {
     let name = scanner.manifest.name.as_str();
     let file = WitSourceFile {
         path: relative.to_owned(),
@@ -306,29 +307,26 @@ pub fn scan_source(scanner: &'static Loaded, relative: &str, contents: &str) -> 
             bindings.call_scan_source(store, &file)
         })
     });
-    match answer {
-        Ok(grants) => grants
-            .into_iter()
-            .map(|grant| {
-                let permission = match grant.permission {
-                    WitPermission::ReadPath(path) => Permission::ReadPath(path.into()),
-                    WitPermission::WritePath(path) => Permission::WritePath(path.into()),
-                    WitPermission::ExecPath(path) => Permission::ExecPath(path.into()),
-                    WitPermission::Network => Permission::Network,
-                    WitPermission::Spawn => Permission::Spawn,
-                };
-                Grant::new(permission, Provenance::SourceAnalysis, [grant.evidence])
-            })
-            .collect(),
-        Err(report) => {
+    answer
+        .inspect_err(|report| {
             warn!(
                 plugin = name,
                 file = %relative,
                 "cannot scan this file; its grants are missing from the profile: {report}"
             );
-            Vec::new()
-        }
-    }
+        })
+        .into_iter()
+        .flatten()
+        .map(|grant| {
+            let permission = match grant.permission {
+                WitPermission::ReadPath(path) => Permission::ReadPath(path.into()),
+                WitPermission::WritePath(path) => Permission::WritePath(path.into()),
+                WitPermission::ExecPath(path) => Permission::ExecPath(path.into()),
+                WitPermission::Network => Permission::Network,
+                WitPermission::Spawn => Permission::Spawn,
+            };
+            Grant::new(permission, Provenance::SourceAnalysis, [grant.evidence])
+        })
 }
 
 #[cfg(test)]
@@ -341,7 +339,9 @@ mod tests {
     #[test]
     fn fingerprint_precedence_is_unchanged() {
         assert_eq!(
-            fingerprint_names().expect("bundled classifiers load"),
+            fingerprint_names()
+                .expect("bundled classifiers load")
+                .collect::<Vec<_>>(),
             [
                 "make",
                 "configure",

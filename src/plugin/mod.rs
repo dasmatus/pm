@@ -675,24 +675,23 @@ impl Registry {
 
     /// What each plugin adds to Rhai recipes: its recipe functions, and its symbols as
     /// constants. Plugins that add nothing are left out.
-    #[must_use]
-    pub fn recipe_modules(&self) -> Vec<RecipeModule> {
-        let Some(runtime) = &self.runtime else {
-            return Vec::new();
-        };
-        self.plugins
-            .iter()
-            .filter(|plugin| {
-                !plugin.manifest.recipe_functions.is_empty() || !plugin.manifest.symbols.is_empty()
-            })
-            .map(|plugin| RecipeModule {
-                runtime: Arc::clone(runtime),
-                plugin: plugin.manifest.name.clone(),
-                component: plugin.component.clone(),
-                functions: plugin.manifest.recipe_functions.values().cloned().collect(),
-                symbols: recipe_symbols(plugin),
-            })
-            .collect()
+    pub fn recipe_modules(&self) -> impl Iterator<Item = RecipeModule> {
+        // No runtime means no plugins, so there is nothing to pair it with.
+        self.runtime.iter().flat_map(move |runtime| {
+            self.plugins
+                .iter()
+                .filter(|plugin| {
+                    !plugin.manifest.recipe_functions.is_empty()
+                        || !plugin.manifest.symbols.is_empty()
+                })
+                .map(move |plugin| RecipeModule {
+                    runtime: Arc::clone(runtime),
+                    plugin: plugin.manifest.name.clone(),
+                    component: plugin.component.clone(),
+                    functions: plugin.manifest.recipe_functions.values().cloned().collect(),
+                    symbols: recipe_symbols(plugin),
+                })
+        })
     }
 
     /// Substitute `%{<plugin>:<name>}` references in `text`.
@@ -854,8 +853,14 @@ impl Registry {
     /// Unlike [`Registry::classify`], *every* interested plugin is asked and the grants
     /// are concatenated: permissions merge, so two plugins agreeing about a path is
     /// information worth keeping rather than a tie to break.
-    #[must_use]
-    pub fn scan_source(&self, relative: &str, contents: &str) -> Vec<Grant> {
+    ///
+    /// Every plugin has been called by the time this returns; the iterator only hands
+    /// over what they answered.
+    pub fn scan_source(
+        &self,
+        relative: &str,
+        contents: &str,
+    ) -> impl Iterator<Item = Grant> + use<> {
         self.scan_source_with(relative, contents, None)
     }
 
@@ -863,13 +868,12 @@ impl Registry {
     ///
     /// Grants are concatenated in registry order; callers get the same result as
     /// [`Registry::scan_source`] with a different execution schedule.
-    #[must_use]
     pub fn scan_source_parallel(
         &self,
         relative: &str,
         contents: &str,
         parallelism: &Parallelism,
-    ) -> Vec<Grant> {
+    ) -> impl Iterator<Item = Grant> + use<> {
         self.scan_source_with(relative, contents, Some(parallelism))
     }
 
@@ -878,12 +882,12 @@ impl Registry {
         relative: &str,
         contents: &str,
         parallelism: Option<&Parallelism>,
-    ) -> Vec<Grant> {
-        let Some(runtime) = self.runtime.as_ref() else {
-            return Vec::new();
-        };
-        let Some(extension) = extension_of(relative) else {
-            return Vec::new();
+    ) -> impl Iterator<Item = Grant> + use<> {
+        // Collected rather than chained: every plugin is called here, on the threads
+        // `parallelism` provides, not whenever the caller gets round to iterating.
+        let (Some(runtime), Some(extension)) = (self.runtime.as_ref(), extension_of(relative))
+        else {
+            return Vec::new().into_iter().flatten();
         };
 
         let plugins: Vec<&Plugin> = self
@@ -903,7 +907,7 @@ impl Registry {
                 .map(|plugin| scan_source_one(runtime, plugin, relative, contents))
                 .collect(),
         };
-        grants.into_iter().flatten().collect()
+        grants.into_iter().flatten()
     }
 }
 

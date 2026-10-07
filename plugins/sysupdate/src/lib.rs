@@ -168,7 +168,7 @@ fn is_remote(directives: &[Directive]) -> bool {
 }
 
 /// The absolute path a `Path=` directive names, as a read or a write.
-fn path_grant(directive: &Directive, writes: bool) -> Vec<Grant> {
+fn path_grant(directive: &Directive, writes: bool) -> impl Iterator<Item = Grant> {
     absolute_path(&directive.value)
         .map(|path| {
             let permission = if writes {
@@ -179,7 +179,6 @@ fn path_grant(directive: &Directive, writes: bool) -> Vec<Grant> {
             grant(permission, directive)
         })
         .into_iter()
-        .collect()
 }
 
 /// One grant, with the evidence line pm prefixes with the file and the plugin name.
