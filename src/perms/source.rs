@@ -203,28 +203,42 @@ fn collect(dir: &Path, plugins: &Registry) -> Result<Vec<(PathBuf, Option<Scanne
 /// no grants and a `debug` line, and a scanner that traps costs this file's grants and a
 /// `warn` line. Source trees are full of such files and none of them is a reason to
 /// abandon the scan.
-fn scan_file(root: &Path, path: &Path, scanner: Option<Scanner>, plugins: &Registry) -> Vec<Grant> {
+///
+/// Every scanner has run by the time this returns, plugins first and then the bundled
+/// one, so the order of their log lines does not depend on how the result is consumed.
+fn scan_file(
+    root: &Path,
+    path: &Path,
+    scanner: Option<Scanner>,
+    plugins: &Registry,
+) -> impl Iterator<Item = Grant> + use<> {
+    let grants = read_source(path).map(|source| {
+        let relative = path
+            .strip_prefix(root)
+            .unwrap_or(path)
+            .display()
+            .to_string();
+        let from_plugins = plugins.scan_source(&relative, &source);
+        let from_bundled = scanner.map(|scanner| bundled::scan_source(scanner, &relative, &source));
+        from_plugins.chain(from_bundled.into_iter().flatten())
+    });
+    grants.into_iter().flatten()
+}
+
+/// The text of the file at `path`, or `None` with a `debug` line when it is unreadable,
+/// binary or not UTF-8.
+fn read_source(path: &Path) -> Option<String> {
     let Ok(bytes) = fs::read(path) else {
         debug!(path = %path.display(), "skipping unreadable file");
-        return Vec::new();
+        return None;
     };
     if bytes.iter().take(BINARY_SNIFF).any(|byte| *byte == 0) {
         debug!(path = %path.display(), "skipping binary file");
-        return Vec::new();
+        return None;
     }
     let Ok(source) = String::from_utf8(bytes) else {
         debug!(path = %path.display(), "skipping non-UTF-8 file");
-        return Vec::new();
+        return None;
     };
-    let relative = path
-        .strip_prefix(root)
-        .unwrap_or(path)
-        .display()
-        .to_string();
-
-    let mut grants = plugins.scan_source(&relative, &source);
-    if let Some(scanner) = scanner {
-        grants.extend(bundled::scan_source(scanner, &relative, &source));
-    }
-    grants
+    Some(source)
 }

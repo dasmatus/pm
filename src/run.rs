@@ -1794,7 +1794,6 @@ fn library_directories(host_bin: &Path, needed: &[String]) -> impl Iterator<Item
     let origin = host_bin.parent().unwrap_or(Path::new("."));
     let mut search: Vec<PathBuf> = match runpath(host_bin) {
         Ok(entries) => entries
-            .iter()
             .map(|entry| PathBuf::from(entry.replace("$ORIGIN", &origin.to_string_lossy())))
             .collect(),
         Err(error) => {

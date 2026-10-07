@@ -134,9 +134,11 @@ fn parallel_plugin_hooks_match_their_serial_results() {
     );
 
     let source = "read /etc/toy.conf\nstd.net\n";
-    let serial = registry.scan_source("fixture.zig", source);
+    let serial: Vec<_> = registry.scan_source("fixture.zig", source).collect();
     assert_eq!(
-        registry.scan_source_parallel("fixture.zig", source, &parallelism),
+        registry
+            .scan_source_parallel("fixture.zig", source, &parallelism)
+            .collect::<Vec<_>>(),
         serial
     );
     assert_eq!(

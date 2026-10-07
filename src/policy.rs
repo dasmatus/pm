@@ -178,7 +178,7 @@ impl BuildPolicy {
                     "these commands"
                 },
                 unknown.join(", "),
-                comma_join(bundled::fingerprint_names_iter()?)
+                comma_join(bundled::fingerprint_names()?)
             );
             if permissive {
                 warn!("{report:?}");
@@ -427,7 +427,7 @@ fn static_name(name: &str) -> Option<&'static str> {
     if name == UNMATCHED {
         return Some(UNMATCHED);
     }
-    bundled::fingerprint_names_iter()
+    bundled::fingerprint_names()
         .ok()
         .and_then(|mut names| names.find(|known| *known == name))
         .or_else(|| interned(name))

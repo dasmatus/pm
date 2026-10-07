@@ -120,17 +120,12 @@ pub fn needed_libraries(path: &Path) -> miette::Result<Vec<String>> {
 ///
 /// # Errors
 ///
-/// Diagnostic if the file cannot be read or is a malformed ELF; see [`inspect`].
-pub fn runpath(path: &Path) -> miette::Result<Vec<String>> {
+/// Diagnostic if the file cannot be read or is a malformed ELF; see [`inspect`]. The
+/// whole file is read before this returns, so the iterator itself cannot fail.
+pub fn runpath(path: &Path) -> miette::Result<impl Iterator<Item = String> + use<>> {
     Ok(inspect(path)?
-        .map(|inspection| {
-            inspection
-                .search_paths
-                .into_iter()
-                .map(|(_, value)| value)
-                .collect()
-        })
-        .unwrap_or_default())
+        .into_iter()
+        .flat_map(|inspection| inspection.search_paths.into_iter().map(|(_, value)| value)))
 }
 
 /// The program interpreter named by `PT_INTERP`, if the object has one.
