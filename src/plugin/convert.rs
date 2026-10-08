@@ -22,8 +22,8 @@ use tracing::warn;
 use super::{
     Hook, Manifest, RecipeFunction, RecipeValue, Symbol,
     wit::{
-        WitCapability, WitGrant, WitHook, WitManifest, WitPermission, WitRecipeFunction,
-        WitRecipeValue, WitSymbol, WitVerdict,
+        WitCapability, WitGrant, WitHook, WitLaunch, WitMachine, WitManifest, WitPermission,
+        WitRecipeFunction, WitRecipeValue, WitSymbol, WitVerdict,
     },
 };
 use crate::{
@@ -147,6 +147,99 @@ pub(super) fn manifest(from: WitManifest, file: &str) -> Result<Manifest, String
         source_extensions,
         symbols,
         recipe_functions: BTreeMap::new(),
+        launchers: BTreeSet::new(),
+    })
+}
+
+/// The most programs a plugin may list in `launchers`.
+const LAUNCHERS_MAX: usize = 8;
+
+/// Read the programs a `vm-plugin` may have pm run, dropping any that is not a bare
+/// program name.
+///
+/// A bare name, so that what `pm plugins` prints is what runs: a path could point
+/// anywhere, and pm finds the name on `PATH` the way a shell would. At most
+/// [`NAME_MAX`] characters of letters, digits, `.`, `_`, `+` and `-`, not starting
+/// with `.` or `-`.
+pub(super) fn launchers(from: Vec<String>, plugin: &str) -> BTreeSet<String> {
+    let mut kept = BTreeSet::new();
+    for name in from {
+        let usable = !name.is_empty()
+            && name.len() <= NAME_MAX
+            && !name.starts_with(['.', '-'])
+            && name.bytes().all(|byte| {
+                byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'+' | b'-')
+            });
+        if !usable {
+            warn!(plugin, launcher = %name, "not a bare program name; ignoring it");
+            continue;
+        }
+        if kept.len() == LAUNCHERS_MAX {
+            warn!(
+                plugin,
+                "lists more than {LAUNCHERS_MAX} launchers; the rest were dropped"
+            );
+            break;
+        }
+        kept.insert(name);
+    }
+    kept
+}
+
+/// The machine as the `vm-plugin` world spells it.
+pub(super) fn machine(from: &pm_vm::Machine<'_>) -> WitMachine {
+    let text = |path: &std::path::Path| path.to_string_lossy().into_owned();
+    WitMachine {
+        name: from.name.to_owned(),
+        title: from.title.to_owned(),
+        directory: text(from.directory),
+        kernel: text(from.kernel),
+        initramfs: text(from.initramfs),
+        cmdline: from.cmdline.to_owned(),
+        memory_mib: from.memory_mib,
+        cpus: u32::try_from(from.cpus).unwrap_or(u32::MAX),
+        kvm: from.kvm,
+        status_socket: text(from.status_socket),
+    }
+}
+
+/// A plugin's launch, checked against the programs it listed.
+///
+/// # Errors
+///
+/// The program is not one of `launchers`, or an argument holds a NUL byte, which no
+/// program could be handed.
+pub(super) fn launch(
+    from: WitLaunch,
+    plugin: &str,
+    launchers: &BTreeSet<String>,
+) -> std::result::Result<pm_vm::Launch, String> {
+    if !launchers.contains(&from.program) {
+        return Err(format!(
+            "the plugin {plugin} asked pm to run `{}`, which is not among the launchers it \
+             listed ({})",
+            from.program,
+            launchers.iter().cloned().collect::<Vec<_>>().join(", ")
+        ));
+    }
+    if from.args.iter().any(|arg| arg.contains('\0')) {
+        return Err(format!(
+            "the plugin {plugin} gave {} an argument with a NUL byte",
+            from.program
+        ));
+    }
+    Ok(pm_vm::Launch {
+        by: plugin.to_owned(),
+        program: from.program.into(),
+        args: from.args,
+        files: from
+            .files
+            .into_iter()
+            .map(|file| pm_vm::LaunchFile {
+                name: file.name,
+                contents: file.contents.into_bytes(),
+            })
+            .collect(),
     })
 }
 

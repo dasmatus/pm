@@ -12,6 +12,10 @@
 //! ```sh
 //! PM_TEST_KERNEL=/boot/vmlinuz-$(uname -r) cargo test --test vm -- --ignored
 //! ```
+//!
+//! That also boots the probe through the `libvirt` plugin, which needs `virsh` and a
+//! libvirt daemon that lets this user start a QEMU domain at libvirt's default URI
+//! (`LIBVIRT_DEFAULT_URI` picks another).
 
 use std::fs::{create_dir_all, read, read_to_string, set_permissions, write};
 use std::os::unix::fs::PermissionsExt;
@@ -22,9 +26,10 @@ use pm::bf::{BuildFile, BuildOptions};
 use pm::context::BuildContext;
 use pm::metadata::{Metadata, Type};
 use pm::perms::{Enforcement, Permissions};
+use pm::plugin::Loader;
 use pm::progress::Progress;
 use pm::run::PackageRunner;
-use pm::vm::Kernel;
+use pm::vm::{Kernel, Launch, LaunchFile, Launcher, Machine};
 use serde_yaml::{from_str, to_string};
 use tempfile::{TempDir, tempdir};
 
@@ -297,19 +302,26 @@ fn cpio_names(bytes: &[u8]) -> Vec<String> {
     names
 }
 
-/// A runner that boots with the stand-in QEMU.
+/// The guest's init when no guest runs.
 ///
-/// Nothing executes the guest's init here, so any small host ELF stands in for
-/// it: an unoptimised `pm-vm-init` carries hundreds of megabytes of debug info,
-/// and every test would copy it into an initramfs twice.
-fn runner(archive: PathBuf, qemu: PathBuf) -> PackageRunner {
-    let init = ["/bin/true", "/usr/bin/true"]
+/// Nothing executes it in these tests, so any small host ELF stands in for it: an
+/// unoptimised `pm-vm-init` carries hundreds of megabytes of debug info, and every
+/// test would copy it into an initramfs twice.
+fn stand_in_init() -> PathBuf {
+    ["/bin/true", "/usr/bin/true"]
         .into_iter()
         .map(PathBuf::from)
         .find(|path| path.is_file())
-        .expect("a `true` binary to stand in for init");
+        .expect("a `true` binary to stand in for init")
+}
+
+/// A runner that boots with the stand-in QEMU.
+fn runner(archive: PathBuf, qemu: PathBuf) -> PackageRunner {
     let mut runner = PackageRunner::new(archive);
-    runner.allow_unsigned(true).qemu(qemu).guest_init(init);
+    runner
+        .allow_unsigned(true)
+        .qemu(qemu)
+        .guest_init(stand_in_init());
     runner
 }
 
@@ -455,6 +467,219 @@ fn a_cmdline_in_the_metadata_that_picks_init_is_refused() {
     );
 }
 
+/// A launcher that checks the machine pm laid out, then has pm run `program` with
+/// `args` and write `files`. Whatever the launcher saw is written to `<out>/machine`.
+struct TestLauncher {
+    out: PathBuf,
+    program: PathBuf,
+    files: Vec<LaunchFile>,
+}
+
+impl Launcher for TestLauncher {
+    fn launch(&self, machine: &Machine<'_>) -> miette::Result<Option<Launch>> {
+        let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode(machine.directory),
+            0o711,
+            "a launcher's program may run QEMU as another user, who has to reach the files"
+        );
+        assert_eq!(mode(machine.kernel), 0o600);
+        assert_eq!(mode(machine.initramfs), 0o600);
+        assert!(machine.kernel.starts_with(machine.directory));
+        assert!(machine.name.starts_with("pm-"), "{}", machine.name);
+        assert_eq!(machine.title, "pm run: usr/bin/hello");
+        assert!(
+            machine.cmdline.contains("console=ttyS0"),
+            "{}",
+            machine.cmdline
+        );
+        write(
+            self.out.join("machine"),
+            format!("{}\n", machine.directory.display()),
+        )
+        .unwrap();
+        Ok(Some(Launch {
+            by: "test".into(),
+            program: self.program.clone(),
+            args: vec![
+                self.out.display().to_string(),
+                machine.status_socket.display().to_string(),
+            ],
+            files: self.files.clone(),
+        }))
+    }
+}
+
+/// A stand-in for a launcher's program, run with `<out> <status socket>`: it
+/// records its directory and whether it has a terminal, copies `domain.xml`, and
+/// reports `exit 9` the way pm's init would, unless `report` is false, in which case
+/// it exits 3 without reporting.
+fn fake_launcher_program(out: &Path, report: bool) -> PathBuf {
+    let script = out.join("launch");
+    write(
+        &script,
+        format!(
+            r#"#!/usr/bin/env python3
+import os, shutil, socket, sys
+out, status = sys.argv[1], sys.argv[2]
+with open(out + "/cwd", "w") as f:
+    f.write(os.getcwd() + "\n")
+with open(out + "/tty", "w") as f:
+    f.write(str(os.isatty(0) and os.isatty(1)))
+if os.path.exists("domain.xml"):
+    shutil.copy("domain.xml", out + "/domain.xml")
+print("hello from the console")
+if {report}:
+    report = socket.socket(socket.AF_UNIX)
+    report.connect(status)
+    report.sendall(b"exit 9\r\n")
+    report.close()
+else:
+    sys.exit(3)
+"#,
+            report = if report { "True" } else { "False" }
+        ),
+    )
+    .unwrap();
+    set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    script
+}
+
+/// A runner with no QEMU of its own, so the launcher is asked.
+fn launched(archive: PathBuf, launcher: impl Launcher + 'static) -> PackageRunner {
+    let mut runner = PackageRunner::new(archive);
+    runner
+        .allow_unsigned(true)
+        .guest_init(stand_in_init())
+        .launcher(Box::new(launcher));
+    runner
+}
+
+#[test]
+fn a_launcher_starts_the_machine_and_the_guests_report_is_the_exit_status() {
+    let work = tempdir().unwrap();
+    let archive = kernelled_package(
+        work.path(),
+        Kernel {
+            image: PathBuf::from("boot/vmlinuz"),
+            cmdline: None,
+        },
+    );
+    let program = fake_launcher_program(work.path(), true);
+    let launcher = TestLauncher {
+        out: work.path().to_path_buf(),
+        program,
+        files: vec![LaunchFile {
+            name: "domain.xml".into(),
+            contents: b"<domain/>".to_vec(),
+        }],
+    };
+    let status = launched(archive, launcher)
+        .run(Some("hello".into()))
+        .expect("the launcher must run");
+    assert_eq!(status.code, 9, "{}", status.reason);
+
+    let machine = read_to_string(work.path().join("machine")).unwrap();
+    assert_eq!(
+        read_to_string(work.path().join("cwd")).unwrap(),
+        machine,
+        "the program runs in the machine's directory"
+    );
+    assert_eq!(
+        read_to_string(work.path().join("tty")).unwrap(),
+        "True",
+        "the program owns a terminal even when pm has none"
+    );
+    assert_eq!(read(work.path().join("domain.xml")).unwrap(), b"<domain/>");
+}
+
+#[test]
+fn a_launcher_that_exits_before_the_guest_reports_fails_the_run() {
+    let work = tempdir().unwrap();
+    let archive = kernelled_package(
+        work.path(),
+        Kernel {
+            image: PathBuf::from("boot/vmlinuz"),
+            cmdline: None,
+        },
+    );
+    let program = fake_launcher_program(work.path(), false);
+    let launcher = TestLauncher {
+        out: work.path().to_path_buf(),
+        program,
+        files: Vec::new(),
+    };
+    let error = launched(archive, launcher)
+        .run(Some("hello".into()))
+        .unwrap_err();
+    assert!(
+        chain(&error).contains("before the guest reported anything"),
+        "{}",
+        chain(&error)
+    );
+}
+
+#[test]
+fn a_launcher_cannot_write_outside_the_machine_or_over_its_files() {
+    for name in ["../escape", "kernel", ".hidden", ""] {
+        let work = tempdir().unwrap();
+        let archive = kernelled_package(
+            work.path(),
+            Kernel {
+                image: PathBuf::from("boot/vmlinuz"),
+                cmdline: None,
+            },
+        );
+        let program = fake_launcher_program(work.path(), true);
+        let launcher = TestLauncher {
+            out: work.path().to_path_buf(),
+            program,
+            files: vec![LaunchFile {
+                name: name.into(),
+                contents: b"x".to_vec(),
+            }],
+        };
+        let error = launched(archive, launcher)
+            .run(Some("hello".into()))
+            .unwrap_err();
+        let message = chain(&error);
+        assert!(
+            message.contains("not a plain file name") || message.contains("cannot be replaced"),
+            "{name:?}: {message}"
+        );
+        assert!(
+            !work.path().join("cwd").exists(),
+            "{name:?}: the program must not have started"
+        );
+    }
+}
+
+#[test]
+fn a_launcher_that_fails_fails_the_boot_instead_of_starting_qemu() {
+    struct Broken;
+    impl Launcher for Broken {
+        fn launch(&self, _machine: &Machine<'_>) -> miette::Result<Option<Launch>> {
+            Err(miette::miette!("the hypervisor is not there"))
+        }
+    }
+    let work = tempdir().unwrap();
+    let archive = kernelled_package(
+        work.path(),
+        Kernel {
+            image: PathBuf::from("boot/vmlinuz"),
+            cmdline: None,
+        },
+    );
+    let error = launched(archive, Broken)
+        .run(Some("hello".into()))
+        .unwrap_err();
+    assert!(
+        chain(&error).contains("the hypervisor is not there"),
+        "{}",
+        chain(&error)
+    );
+}
+
 /// Boots a real kernel and runs a real program in it.
 ///
 /// The probe exits 40, plus 1 if it can read a file from its own package and 2 if
@@ -462,6 +687,27 @@ fn a_cmdline_in_the_metadata_that_picks_init_is_refused() {
 #[test]
 #[ignore = "needs qemu-system-x86_64 and a kernel image in PM_TEST_KERNEL"]
 fn a_real_kernel_runs_the_entrypoint_and_reports_its_exit() {
+    boot_the_probe(None);
+}
+
+/// The same probe, started by the `libvirt` plugin through `virsh` instead of by pm.
+#[test]
+#[ignore = "needs virsh, a libvirt daemon with QEMU, and a kernel image in PM_TEST_KERNEL"]
+fn a_real_kernel_runs_through_the_libvirt_plugin() {
+    let plugins = tempdir().unwrap();
+    std::fs::copy(
+        Path::new(env!("PM_TEST_PLUGIN_DIR")).join("libvirt.wasm"),
+        plugins.path().join("libvirt.wasm"),
+    )
+    .unwrap();
+    let registry = Loader::new(plugins.path().to_path_buf())
+        .allow_unsigned(true)
+        .load()
+        .expect("the libvirt plugin must load");
+    boot_the_probe(Some(Box::new(registry)));
+}
+
+fn boot_the_probe(launcher: Option<Box<dyn Launcher>>) {
     let kernel = PathBuf::from(
         std::env::var_os("PM_TEST_KERNEL").expect("set PM_TEST_KERNEL to a kernel image"),
     );
@@ -536,6 +782,9 @@ int main(void) {
     runner
         .allow_unsigned(true)
         .guest_init(PathBuf::from(env!("CARGO_BIN_EXE_pm-vm-init")));
+    if let Some(launcher) = launcher {
+        runner.launcher(launcher);
+    }
     let status = runner.run(Some("probe".into())).expect("the VM must run");
     assert_eq!(status.code, 41, "{}", status.reason);
 }

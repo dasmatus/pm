@@ -221,6 +221,12 @@ pub struct Manifest {
     /// Only a plugin built against the `recipe-plugin` world has any; see
     /// [`RecipeFunction`].
     pub recipe_functions: BTreeMap<String, RecipeFunction>,
+    /// Programs the plugin may have pm run to start a virtual machine, by bare name.
+    ///
+    /// Only a plugin built against the `vm-plugin` world has any. A launch naming a
+    /// program outside this set is refused, so what a plugin can make pm execute is
+    /// fixed at load and printed by `pm plugins`, not decided per call.
+    pub launchers: BTreeSet<String>,
 }
 
 /// What a [`RecipeFunction`] returns, which decides what a recipe receives.
@@ -911,6 +917,44 @@ impl Registry {
     }
 }
 
+/// A registry starts virtual machines through its `vm-plugin` plugins.
+///
+/// Each is asked in load order and the first to answer with a launch starts the
+/// machine; when none does, pm starts QEMU itself. A plugin that refuses (an error
+/// string) or traps fails the boot instead of falling through: it was asked because
+/// it launches machines, and quietly booting under different hands than the one
+/// installed would hide why the machine is not where its owner expects.
+impl pm_vm::Launcher for Registry {
+    fn launch(&self, machine: &pm_vm::Machine<'_>) -> Result<Option<pm_vm::Launch>> {
+        let Some(runtime) = self.runtime.as_ref() else {
+            return Ok(None);
+        };
+        let offered = convert::machine(machine);
+        for plugin in self
+            .plugins
+            .iter()
+            .filter(|plugin| !plugin.manifest.launchers.is_empty())
+        {
+            let name = &plugin.manifest.name;
+            let answer = runtime
+                .enter_vm(name, &plugin.component, |bindings, store| {
+                    bindings.call_launch_machine(store, &offered)
+                })
+                .wrap_err_with(|| format!("the plugin {name} could not start the machine"))?
+                .map_err(|message| {
+                    miette!("the plugin {name} could not start the machine: {message}")
+                })?;
+            if let Some(answer) = answer {
+                let launch = convert::launch(answer, name, &plugin.manifest.launchers)
+                    .map_err(|reason| miette!("{reason}"))?;
+                debug!(plugin = %name, program = %launch.program.display(), "a plugin launches the machine");
+                return Ok(Some(launch));
+            }
+        }
+        Ok(None)
+    }
+}
+
 fn classify_one(
     runtime: &Runtime,
     plugin: &Plugin,
@@ -1062,6 +1106,17 @@ fn load_one(runtime: &Runtime, path: &Path, trust: Option<&TrustStore>) -> Resul
             })
             .wrap_err_with(|| format!("the plugin {file} could not list its recipe functions"))?;
         manifest.recipe_functions = convert::recipe_functions(offered, &manifest.name);
+    }
+
+    // And a `vm-plugin` lists the programs it may launch once, so a later call cannot
+    // widen what it is allowed to run.
+    if Runtime::has_launchers(&component) {
+        let offered = runtime
+            .enter_vm(&manifest.name, &component, |bindings, store| {
+                bindings.call_launchers(store)
+            })
+            .wrap_err_with(|| format!("the plugin {file} could not list its launchers"))?;
+        manifest.launchers = convert::launchers(offered, &manifest.name);
     }
 
     Ok(Plugin {

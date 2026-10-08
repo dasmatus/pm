@@ -48,7 +48,8 @@ const BUNDLED: [&str; 14] = [
 ];
 
 /// Example and adversarial plugins used by integration tests, not embedded in pm.
-const TEST_PLUGINS: [&str; 9] = [
+const TEST_PLUGINS: [&str; 11] = [
+    "libvirt",
     "systemd",
     "sysext",
     "sysupdate",
@@ -58,6 +59,7 @@ const TEST_PLUGINS: [&str; 9] = [
     "nameless",
     "scanner",
     "recipes",
+    "launcher",
 ];
 
 /// Variables cargo sets for this build script that describe pm's own build. Passed
@@ -82,6 +84,7 @@ fn main() {
         "plugins/Cargo.lock",
         "plugins/bundled",
         "plugins/fixtures",
+        "plugins/libvirt",
         "plugins/systemd",
         "plugins/sysext",
         "plugins/sysupdate",

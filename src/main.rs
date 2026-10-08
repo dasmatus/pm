@@ -294,6 +294,14 @@ enum Commands {
         /// effect on a package that ships none.
         #[arg(long)]
         host_kernel: bool,
+        /// Boot a package's own kernel by starting qemu-system-x86_64 from PATH
+        /// yourself, without asking plugins.
+        ///
+        /// Normally a plugin that launches machines, such as libvirt, is asked
+        /// first and pm starts QEMU itself only when none answers. No effect on a
+        /// package that ships no kernel.
+        #[arg(long, conflicts_with = "host_kernel")]
+        qemu: bool,
     },
     /// Print the permission profile recorded in a package.
     ///
@@ -493,6 +501,7 @@ fn main() -> miette::Result<()> {
             audit,
             enforce,
             host_kernel,
+            qemu,
         } => {
             if !package.exists() {
                 return Err(miette!("The path {} does not exist.", package.display()));
@@ -532,6 +541,9 @@ fn main() -> miette::Result<()> {
                     .audit(audit)
                     .enforce(enforce)
                     .host_kernel(host_kernel);
+                if !qemu {
+                    runner.launcher(Box::new(PluginLauncher(plugin_args.clone())));
+                }
                 runner.run(bin)?
             };
             if !status.success() {
@@ -629,6 +641,19 @@ fn build(
     )?;
     info!(archive = %archive.display(), "packaged");
     Ok(())
+}
+
+/// Asks the installed plugins to start a package's kernel, loading them only then.
+///
+/// `pm run` of a package with no kernel, or one run with `--host-kernel`, never boots
+/// a machine, so it should not pay for compiling every plugin or fail on a plugin
+/// directory it had no use for.
+struct PluginLauncher(PluginArgs);
+
+impl pm::vm::Launcher for PluginLauncher {
+    fn launch(&self, machine: &pm::vm::Machine<'_>) -> miette::Result<Option<pm::vm::Launch>> {
+        self.0.load()?.launch(machine)
+    }
 }
 
 /// Prints the installed plugins, one block each.
@@ -749,6 +774,13 @@ fn list_plugins(plugins: &Registry, digests: bool) -> miette::Result<()> {
                     function.returns.label()
                 );
             }
+        }
+        if !manifest.launchers.is_empty() {
+            println!(
+                "{:<LABEL_WIDTH$}{}",
+                "launchers:",
+                comma_join(manifest.launchers.iter().cloned())
+            );
         }
         println!("{:<LABEL_WIDTH$}{}", "file:", plugin.path().display());
         if digests {

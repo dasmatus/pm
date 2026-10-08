@@ -165,6 +165,54 @@ interface types {
         doc: string,
     }
 
+    /// A machine pm is about to boot for a package that ships its own kernel, laid
+    /// out in a directory of its own. Every path is absolute and already exists.
+    record machine {
+        /// A name unique on the host: `pm-vm-` and random characters.
+        name: string,
+        /// One line saying what runs in it, for a list of machines.
+        title: string,
+        /// The machine's directory, where `launch.files` are written. Searchable
+        /// but not listable, and every file in it private to its owner.
+        directory: string,
+        /// The package's kernel image.
+        kernel: string,
+        /// The initramfs pm assembled: the package, its libraries and pm's init.
+        initramfs: string,
+        /// The whole kernel command line, pm's parameters included.
+        cmdline: string,
+        /// Memory the guest needs.
+        memory-mib: u64,
+        /// Virtual CPUs.
+        cpus: u32,
+        /// Whether pm itself can use KVM.
+        kvm: bool,
+        /// The Unix socket the guest's second serial port has to connect to: pm's
+        /// init reports there how the entrypoint exited.
+        status-socket: string,
+    }
+
+    /// A file `launch-machine` wants in the machine's directory.
+    record launch-file {
+        /// A plain file name: letters, digits, `.`, `_` and `-`, not starting with
+        /// `.`, and not one of the machine's own files.
+        name: string,
+        /// What it holds.
+        contents: string,
+    }
+
+    /// How to start a machine: one program from the plugin's `launchers`, found on
+    /// `PATH`, with these arguments, run in the machine's directory.
+    ///
+    /// The program owns the guest's console and must live exactly as long as the
+    /// machine: pm waits for it to exit, gives it pm's terminal or a pseudo-terminal
+    /// it copies, and sends it SIGTERM if pm dies first.
+    record launch {
+        program: string,
+        args: list<string>,
+        files: list<launch-file>,
+    }
+
     /// A hook a plugin implements.
     ///
     /// pm calls a hook only if the manifest lists it. The exports are all
@@ -290,4 +338,28 @@ world recipe-plugin {
     /// the function's `returns` names, or a message for the recipe's author, which
     /// fails the recipe with that message.
     export call-recipe-function: func(name: string, args: list<string>) -> result<string, string>;
+}
+
+/// The world of a plugin that can start the virtual machine a package that ships its
+/// own kernel boots in, instead of pm starting QEMU itself.
+///
+/// Everything `plugin` exports, plus the programs it may have pm run and the one
+/// call that decides how. This is the only world in which a plugin's answer makes
+/// pm run anything: the answer names a program, and pm runs it only if it is one of
+/// `launchers`, which pm reads once at load and prints under `pm plugins`, so what
+/// a reviewer sees there is the most the plugin can ever start. Like every other
+/// call, `launch-machine` runs in a fresh, metered instance with nothing but `log`:
+/// it describes the machine, it does not reach it.
+world vm-plugin {
+    include plugin;
+
+    use types.{machine, launch};
+
+    /// Every program `launch-machine` may name: bare names, found on `PATH`.
+    /// Called once, at load.
+    export launchers: func() -> list<string>;
+
+    /// How to start `machine`, or `none` to leave it to the next plugin, and in the
+    /// end to pm's own QEMU. An error fails the boot with the plugin's message.
+    export launch-machine: func(machine: machine) -> result<option<launch>, string>;
 }

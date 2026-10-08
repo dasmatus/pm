@@ -23,9 +23,10 @@ pub(super) use self::{
         host::{Host as LogHost, Level as WitLevel},
         types::{
             Capability as WitCapability, Grant as WitGrant, Hook as WitHook, Host as TypesHost,
-            Manifest as WitManifest, Permission as WitPermission,
-            RecipeFunction as WitRecipeFunction, RecipeValue as WitRecipeValue,
-            SourceFile as WitSourceFile, Symbol as WitSymbol, Verdict as WitVerdict,
+            Launch as WitLaunch, Machine as WitMachine, Manifest as WitManifest,
+            Permission as WitPermission, RecipeFunction as WitRecipeFunction,
+            RecipeValue as WitRecipeValue, SourceFile as WitSourceFile, Symbol as WitSymbol,
+            Verdict as WitVerdict,
         },
     },
 };
@@ -69,4 +70,24 @@ pub(super) mod recipe {
     });
 
     pub(in crate::plugin) use self::RecipePlugin as RecipeBindings;
+}
+
+/// The bindings for the `vm-plugin` world: everything a plugin exports, plus the
+/// programs it may have pm run and the call that starts a virtual machine.
+///
+/// Mapped onto the same shared interfaces as [`bundled`], so one linker serves every
+/// world.
+pub(super) mod vm {
+    #![allow(clippy::all, clippy::pedantic, missing_docs, unreachable_pub)]
+
+    wasmtime::component::bindgen!({
+        path: "wit",
+        world: "vm-plugin",
+        with: {
+            "pm:plugin/types": super::pm::plugin::types,
+            "pm:plugin/host": super::pm::plugin::host,
+        },
+    });
+
+    pub(in crate::plugin) use self::VmPlugin as VmBindings;
 }

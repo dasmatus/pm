@@ -143,6 +143,12 @@ running it in the namespace jail on the host's kernel:
 * It needs `qemu-system-x86_64` on `PATH`, and uses KVM when `/dev/kvm` is
   usable (emulation otherwise, which is slow). Only x86-64 hosts can boot a
   package kernel today.
+* An installed plugin may start the machine instead: the `libvirt` plugin
+  (`plugins/libvirt/`) hands it to libvirt through `virsh`, so it runs as a
+  transient domain at libvirt's default URI, shows up in `virsh list` and
+  virt-manager, and stops with `pm run`. `pm run --qemu` skips plugins and
+  starts QEMU directly. See "Starting virtual machines" in
+  `plugins/README.md`.
 * The kernel needs initramfs support, an 8250/16550 serial console and ELF
   support built in, which distribution `generic` and `virtual` kernels have.
 * `--network` and `--audit` are refused, because the guest has no NIC and a

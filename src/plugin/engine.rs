@@ -55,6 +55,7 @@ use wasmtime::{
 
 use super::wit::{
     Bindings, LogHost, TypesHost, WitLevel, bundled::BundledBindings, recipe::RecipeBindings,
+    vm::VmBindings,
 };
 
 /// Instructions one call may execute before it traps.
@@ -231,6 +232,34 @@ impl Runtime {
     /// [`Runtime::enter_recipe`] can instantiate it.
     pub(super) fn has_recipe_functions(component: &Component) -> bool {
         ["recipe-functions", "call-recipe-function"]
+            .into_iter()
+            .all(|export| component.get_export_index(None, export).is_some())
+    }
+
+    /// [`Runtime::enter`] for a plugin built against the `vm-plugin` world, to call
+    /// the exports that world adds.
+    ///
+    /// # Errors
+    ///
+    /// As [`Runtime::enter`].
+    pub(super) fn enter_vm<T>(
+        &self,
+        plugin: &str,
+        component: &Component,
+        call: impl FnOnce(&VmBindings, &mut Store<State>) -> wasmtime::Result<T>,
+    ) -> Result<T> {
+        self.enter_as(
+            plugin,
+            component,
+            |store, component, linker| VmBindings::instantiate(store, component, linker),
+            call,
+        )
+    }
+
+    /// Whether `component` exports what the `vm-plugin` world adds, so
+    /// [`Runtime::enter_vm`] can instantiate it.
+    pub(super) fn has_launchers(component: &Component) -> bool {
+        ["launchers", "launch-machine"]
             .into_iter()
             .all(|export| component.get_export_index(None, export).is_some())
     }

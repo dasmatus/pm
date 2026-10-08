@@ -214,6 +214,9 @@ pub struct PackageRunner {
     guest_init: Option<PathBuf>,
     /// The QEMU to boot a package's kernel with; found on `PATH` when `None`.
     qemu: Option<PathBuf>,
+    /// Plugins that may start a package's kernel instead; see
+    /// [`PackageRunner::launcher`].
+    launcher: Option<Box<dyn crate::vm::Launcher>>,
 }
 
 impl PackageRunner {
@@ -233,6 +236,7 @@ impl PackageRunner {
             host_kernel: false,
             guest_init: None,
             qemu: None,
+            launcher: None,
         }
     }
 
@@ -259,9 +263,20 @@ impl PackageRunner {
     }
 
     /// Boot a package's kernel with this QEMU instead of `qemu-system-x86_64`
-    /// from `PATH`.
+    /// from `PATH`. A QEMU named here is always started directly, so no launcher
+    /// is asked.
     pub fn qemu(&mut self, qemu: PathBuf) -> &mut Self {
         self.qemu = Some(qemu);
+        self
+    }
+
+    /// Ask `launcher` to start a package's kernel before starting QEMU directly.
+    ///
+    /// `pm run` passes its plugin [`Registry`](crate::plugin::Registry), so a
+    /// plugin such as `libvirt` can hand the machine to a hypervisor; one that
+    /// answers with nothing leaves it to QEMU. See [`crate::vm::Launcher`].
+    pub fn launcher(&mut self, launcher: Box<dyn crate::vm::Launcher>) -> &mut Self {
+        self.launcher = Some(launcher);
         self
     }
 
@@ -676,6 +691,7 @@ impl PackageRunner {
             programs,
             init: &init,
             qemu: self.qemu.as_deref(),
+            launcher: self.launcher.as_deref(),
         })
     }
 
