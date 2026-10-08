@@ -7,6 +7,16 @@
 //! guest's only program, instead of running it in the namespace jail on the host's
 //! kernel. `pm run --host-kernel` keeps the jail.
 //!
+//! # Launchers
+//!
+//! By default pm starts QEMU itself. A [`Launcher`] can start the machine instead -
+//! pm's plugins are one, and the `libvirt` plugin uses that to hand the machine to
+//! libvirt - and is asked first: pm writes the initramfs, copies the kernel next to
+//! it, describes the machine ([`Machine`]) and runs whatever program the launcher
+//! names, with the files it asks for written into the machine's directory. The
+//! program owns the console and lives exactly as long as the machine. When no
+//! launcher answers, pm starts QEMU as before. See [`launch`].
+//!
 //! # What the guest sees
 //!
 //! The guest's root filesystem is an initramfs pm assembles for each run ([`boot`]):
@@ -34,7 +44,8 @@
 //!   silently ignored.
 //! * **Auditing.** `--audit` traces a host process with `ptrace`, which cannot see
 //!   into a VM, so it is refused too.
-//! * **Confining QEMU.** QEMU runs as the calling user, outside any jail. The
+//! * **Confining QEMU.** Started by pm, QEMU runs as the calling user, outside any
+//!   jail; a launcher may run it elsewhere, as libvirt's system daemon does. The
 //!   package's code only ever runs inside the guest.
 //! * **Trusting the exit status.** Init reports how the entrypoint exited on the
 //!   second serial port. Code running in the guest could write to that port too, so
@@ -52,6 +63,10 @@ pub mod closure;
 pub mod cpio;
 /// pm as the guest's init.
 pub mod guest;
+/// Starting the machine with a program a [`Launcher`] names.
+pub mod launch;
+
+pub use launch::{Launch, LaunchFile, Launcher, Machine};
 
 use std::{
     collections::BTreeMap,
@@ -62,14 +77,11 @@ use std::{
     os::unix::{
         ffi::{OsStrExt, OsStringExt},
         fs::PermissionsExt,
-        net::UnixListener,
+        net::{UnixListener, UnixStream},
     },
     path::{Component, Path, PathBuf},
     process::{Command, Stdio},
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    },
+    sync::atomic::{AtomicBool, Ordering},
     thread,
     time::Duration,
 };
@@ -309,11 +321,31 @@ pub struct Boot<'a> {
     /// The binary that runs as the guest's init. Must be a pm binary whose `main`
     /// starts with [`guest::is_guest_init`].
     pub init: &'a Path,
-    /// The QEMU binary, or `None` to find `qemu-system-x86_64` on `PATH`.
+    /// The QEMU to start directly, skipping any launcher; `None` asks the launcher
+    /// first and falls back to `qemu-system-x86_64` from `PATH`.
     pub qemu: Option<&'a Path>,
+    /// What is asked to start the machine before pm starts QEMU itself.
+    pub launcher: Option<&'a dyn Launcher>,
 }
 
-/// Boot the package's kernel in QEMU and run the entrypoint as its only program.
+/// A machine ready to start: the initramfs is written, the status socket is
+/// listening, and what the guest gets is decided. QEMU started directly and a
+/// launcher's program both boot exactly this.
+struct Prepared {
+    /// Holds the initramfs and the sockets. Removed when this is dropped, which
+    /// each starter does only once the machine is gone.
+    scratch: Workspace,
+    image: PathBuf,
+    initramfs: PathBuf,
+    memory_mib: u64,
+    cpus: usize,
+    cmdline: String,
+    status: UnixListener,
+    status_socket: PathBuf,
+}
+
+/// Boot the package's kernel in a virtual machine and run the entrypoint as its
+/// only program.
 ///
 /// The console is this process's stdin and stdout, so the entrypoint reads and
 /// writes the terminal as it would in the jail. Returns how the entrypoint exited,
@@ -323,7 +355,8 @@ pub struct Boot<'a> {
 ///
 /// Fails on a non-x86-64 host, when the kernel image is missing, escapes the package
 /// or is not an x86 image, when no QEMU is found, when the initramfs cannot be
-/// written, or when QEMU cannot be started. A guest that stops without init
+/// written, when a launcher's answer is unusable, or when the machine cannot be
+/// started. A guest that stops without init
 /// reporting anything - a kernel panic, a kernel without a serial console - is not
 /// an error: it comes back as exit code 125 with the reason.
 pub fn boot(request: &Boot<'_>) -> miette::Result<ExitStatus> {
@@ -344,7 +377,61 @@ pub fn boot(request: &Boot<'_>) -> miette::Result<ExitStatus> {
             "the package's kernel is an {format:?} image, which an x86-64 host cannot boot"
         ));
     }
-    let qemu = match request.qemu {
+    if let (None, Some(launcher)) = (request.qemu, request.launcher) {
+        let machine = Prepared::prepare(request, &image)?;
+        match launch::ask(launcher, &machine, request)? {
+            Some(plan) => return launch::run(plan, machine),
+            None => debug!("no launcher answered; starting QEMU directly"),
+        }
+    }
+    boot_qemu(request, &image, request.qemu)
+}
+
+impl Prepared {
+    /// Write the initramfs, listen on the status socket, and size the machine.
+    fn prepare(request: &Boot<'_>, image: &Path) -> miette::Result<Self> {
+        let scratch = Workspace::new("vm")?;
+        let initramfs = scratch.path().join("initramfs.cpio");
+        let tree = Tree::assemble(request, image)?;
+        let size = tree.write(&initramfs)?;
+        let memory_mib = BASE_MEMORY_MIB + 3 * size.div_ceil(1024 * 1024);
+
+        // The status port goes to a socket pm reads, not to a file: the guest can
+        // write as much as it likes to the port, and only the last [`MAX_REPORT`]
+        // bytes are kept. The hypervisor connects to it as a client when it starts.
+        let status_socket = scratch.path().join("status.sock");
+        let status = UnixListener::bind(&status_socket)
+            .into_diagnostic()
+            .wrap_err_with(|| format!("cannot listen on {}", status_socket.display()))?;
+        status.set_nonblocking(true).into_diagnostic()?;
+
+        // pm's defaults, then the package's parameters, then the ones pm relies on.
+        // The kernel keeps the last value of a repeated parameter, so a package can
+        // turn the log level up but cannot change `panic`, nor which console is
+        // `/dev/console`; `rdinit` it cannot set at all.
+        let cmdline = format!(
+            "quiet loglevel=1 {} console=ttyS0 panic=-1 rdinit=/init -- {}",
+            request.kernel.cmdline.as_deref().unwrap_or(""),
+            guest::INIT_ARG
+        );
+        let cpus = std::thread::available_parallelism().map_or(1, |n| n.get().min(MAX_CPUS));
+        Ok(Self {
+            scratch,
+            image: image.to_path_buf(),
+            initramfs,
+            memory_mib,
+            cpus,
+            cmdline,
+            status,
+            status_socket,
+        })
+    }
+}
+
+/// Start QEMU directly, as the calling user, with the console on this process's
+/// stdin and stdout.
+fn boot_qemu(request: &Boot<'_>, image: &Path, qemu: Option<&Path>) -> miette::Result<ExitStatus> {
+    let qemu = match qemu {
         Some(qemu) => qemu.to_path_buf(),
         None => find_on_path("qemu-system-x86_64").ok_or_else(|| {
             miette!(
@@ -354,35 +441,10 @@ pub fn boot(request: &Boot<'_>) -> miette::Result<ExitStatus> {
             )
         })?,
     };
-
     // Declared before the child below, so it is removed only after QEMU is gone.
-    let scratch = Workspace::new("vm")?;
-    let initramfs = scratch.path().join("initramfs.cpio");
-    let tree = Tree::assemble(request, &image)?;
-    let size = tree.write(&initramfs)?;
-    let memory = BASE_MEMORY_MIB + 3 * size.div_ceil(1024 * 1024);
-
-    // The status port goes to a socket pm reads, not to a file: the guest can write
-    // as much as it likes to the port, and only the last [`MAX_REPORT`] bytes are
-    // kept. QEMU connects to it as a client when it starts.
-    let socket = scratch.path().join("status.sock");
-    let listener = UnixListener::bind(&socket)
-        .into_diagnostic()
-        .wrap_err_with(|| format!("cannot listen on {}", socket.display()))?;
-    listener.set_nonblocking(true).into_diagnostic()?;
+    let machine = Prepared::prepare(request, image)?;
     let mut status_device = OsString::from("socket,id=status,path=");
-    status_device.push(qemu_option_value(&socket));
-
-    // pm's defaults, then the package's parameters, then the ones pm relies on. The
-    // kernel keeps the last value of a repeated parameter, so a package can turn
-    // the log level up but cannot change `panic`, nor which console is
-    // `/dev/console`; `rdinit` it cannot set at all.
-    let cmdline = format!(
-        "quiet loglevel=1 {} console=ttyS0 panic=-1 rdinit=/init -- {}",
-        request.kernel.cmdline.as_deref().unwrap_or(""),
-        guest::INIT_ARG
-    );
-    let cpus = std::thread::available_parallelism().map_or(1, |n| n.get().min(MAX_CPUS));
+    status_device.push(qemu_option_value(&machine.status_socket));
 
     let mut command = Command::new(&qemu);
     command
@@ -395,25 +457,25 @@ pub fn boot(request: &Boot<'_>) -> miette::Result<ExitStatus> {
         ])
         .args(["-machine", "pc"])
         .args(accelerator())
-        .args(["-m", &format!("{memory}M")])
-        .args(["-smp", &cpus.to_string()])
+        .args(["-m", &format!("{}M", machine.memory_mib)])
+        .args(["-smp", &machine.cpus.to_string()])
         .args(["-nic", "none"])
         .args(["-serial", "stdio"])
         .arg("-chardev")
         .arg(status_device)
         .args(["-serial", "chardev:status"])
         .arg("-kernel")
-        .arg(&image)
+        .arg(&machine.image)
         .arg("-initrd")
-        .arg(&initramfs)
-        .args(["-append", &cmdline])
+        .arg(&machine.initramfs)
+        .args(["-append", &machine.cmdline])
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
-    debug!(?command, "starting QEMU");
+    debug!(?command, scratch = %machine.scratch.path().display(), "starting QEMU");
     info!(
         kernel = %request.kernel.image.display(),
-        memory_mib = memory,
+        memory_mib = machine.memory_mib,
         "booting the package's own kernel in a virtual machine"
     );
 
@@ -422,16 +484,15 @@ pub fn boot(request: &Boot<'_>) -> miette::Result<ExitStatus> {
         .spawn()
         .into_diagnostic()
         .wrap_err_with(|| format!("cannot start {program}"))?;
-    // Declared after `scratch`, therefore dropped - and QEMU killed - before it.
+    // Declared after `machine`, therefore dropped - and QEMU killed - before it.
     let child = HostChild::new(child, program.clone());
-    let done = Arc::new(AtomicBool::new(false));
-    let reader = {
-        let done = Arc::clone(&done);
-        thread::spawn(move || read_report(&listener, &done))
-    };
-    let exited = child.wait();
-    done.store(true, Ordering::Release);
-    let report = reader.join().unwrap_or_default();
+    let done = AtomicBool::new(false);
+    let (exited, report) = thread::scope(|scope| {
+        let reader = scope.spawn(|| read_report(&machine.status, &done));
+        let exited = child.wait();
+        done.store(true, Ordering::Release);
+        (exited, reader.join().unwrap_or_default())
+    });
     let exited = exited?;
 
     let status = parse_report(&report);
@@ -440,38 +501,48 @@ pub fn boot(request: &Boot<'_>) -> miette::Result<ExitStatus> {
             "{program} exited with {exited} before the guest reported anything"
         ));
     }
-    Ok(status.unwrap_or_else(|| {
-        exit_status(
-            NO_REPORT,
-            None,
-            "the guest stopped without reporting how the entrypoint exited; the kernel may \
-             have panicked, or lacks a built-in serial console or initramfs support"
-                .to_owned(),
-        )
-    }))
+    Ok(status.unwrap_or_else(no_report))
 }
 
-/// Accept QEMU's connection on the status socket and read it until QEMU closes it,
-/// keeping only the last [`MAX_REPORT`] bytes.
-///
-/// Gives up on accepting once `done` is set, which is after QEMU has exited: a QEMU
-/// that never connected is not going to.
-fn read_report(listener: &UnixListener, done: &AtomicBool) -> String {
-    let mut stream = loop {
+/// The status of a guest that stopped without init saying how the entrypoint
+/// exited.
+fn no_report() -> ExitStatus {
+    exit_status(
+        NO_REPORT,
+        None,
+        "the guest stopped without reporting how the entrypoint exited; the kernel may \
+         have panicked, or lacks a built-in serial console or initramfs support"
+            .to_owned(),
+    )
+}
+
+/// Accept the hypervisor's connection on `listener`, giving up once `done` is set,
+/// which is after the machine has stopped: a hypervisor that never connected is not
+/// going to.
+fn accept(listener: &UnixListener, done: &AtomicBool) -> Option<UnixStream> {
+    loop {
         match listener.accept() {
-            Ok((stream, _)) => break stream,
+            Ok((stream, _)) => return Some(stream),
             Err(error) if error.kind() == ErrorKind::WouldBlock => {
                 if done.load(Ordering::Acquire) {
-                    return String::new();
+                    return None;
                 }
                 thread::sleep(POLL);
             }
             Err(error) if error.kind() == ErrorKind::Interrupted => {}
             Err(error) => {
-                warn!(%error, "cannot accept QEMU's status connection");
-                return String::new();
+                warn!(%error, "cannot accept the hypervisor's connection");
+                return None;
             }
         }
+    }
+}
+
+/// Accept the hypervisor's connection on the status socket and read it until the
+/// machine stops, keeping only the last [`MAX_REPORT`] bytes.
+fn read_report(listener: &UnixListener, done: &AtomicBool) -> String {
+    let Some(mut stream) = accept(listener, done) else {
+        return String::new();
     };
     if stream.set_nonblocking(false).is_err() || stream.set_read_timeout(Some(POLL)).is_err() {
         return String::new();
@@ -500,7 +571,7 @@ fn read_report(listener: &UnixListener, done: &AtomicBool) -> String {
                 }
             }
             Err(error) => {
-                warn!(%error, "cannot read QEMU's status connection");
+                warn!(%error, "cannot read the guest's status connection");
                 break;
             }
         }
@@ -508,7 +579,7 @@ fn read_report(listener: &UnixListener, done: &AtomicBool) -> String {
     String::from_utf8_lossy(&kept).into_owned()
 }
 
-/// How often the status reader checks whether QEMU has exited.
+/// How often pm checks whether the machine has stopped.
 const POLL: Duration = Duration::from_millis(50);
 
 /// `path` as a value inside a QEMU `key=value,...` option, where a literal comma is
@@ -803,6 +874,8 @@ fn relative(path: &Path) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
 
     fn kernel(image: &str, cmdline: Option<&str>) -> Kernel {

@@ -162,6 +162,45 @@ most six parameters; a plugin built against plain `plugin` loads exactly as
 before. The `systemd` plugin here adds `install_unit(file)` and
 `install_units(files)`; see its source.
 
+## Starting virtual machines
+
+A plugin built against the **`vm-plugin`** world starts the virtual machine a
+package that ships its own kernel boots in, instead of pm starting QEMU itself.
+It exports everything a plugin does, plus:
+
+```wit
+export launchers: func() -> list<string>;
+export launch-machine: func(machine: machine) -> result<option<launch>, string>;
+```
+
+`launchers` is called once, at load, and names every program the plugin may
+have pm run: bare names, found on `PATH`, at most eight. `pm plugins` prints
+them, and a launch naming anything else is refused, so that line is the most a
+plugin can ever start. This is the only world whose answer makes pm run
+anything.
+
+`launch-machine` gets the machine pm laid out: its name and title, its
+directory, the kernel, the initramfs, the command line, memory, CPUs, whether
+KVM is usable, and the Unix socket init reports the entrypoint's exit on. It
+answers with a program, its arguments and files to write into the directory (a
+domain definition, say), or `none` to leave the machine to the next plugin and
+in the end to pm's own QEMU. An `err` fails the boot with the plugin's message
+rather than quietly booting under different hands. pm then holds the program
+to one contract:
+
+* It lives exactly as long as the machine. pm waits for it, and sends it
+  `SIGTERM` if pm dies first.
+* It owns the console: pm's terminal, or a pseudo-terminal pm copies when
+  stdin or stdout is not one.
+* The guest's second serial port connects to the status socket. Init's report
+  there, not the program's exit status, is what `pm run` returns.
+
+The directory is searchable but not listable and every file in it is private
+to its owner, because the program may run QEMU as another user: whoever does
+has to be handed each file, which is what libvirt does. `libvirt/` is the
+example: one launcher, `virsh`, and a transient domain started with
+`virsh create --console --autodestroy`. `pm run --qemu` asks no plugin.
+
 ## Trust
 
 **A plugin must be signed**, by a key in the same trust store that governs build
@@ -244,6 +283,7 @@ Rust-specific; Rust is simply what these examples are written in.
 | `systemd/`    | classifies systemd tooling, reads unit files, publishes the install dirs  |
 | `sysupdate/`  | classifies `systemd-sysupdate` and reads its transfer definitions         |
 | `sysext/`     | classifies the system-extension image toolchain; one hook, on purpose     |
+| `libvirt/`    | boots a package's own kernel as a libvirt machine, through `virsh`        |
 | `unitfile/`   | the unit-file parser the three systemd plugins share - an ordinary lib    |
 | `encoder/`    | core module → component, so `build.sh` needs no `cargo install`           |
 | `fixtures/*`  | deliberately badly behaved plugins, for `tests/plugins.rs`                |
@@ -251,7 +291,7 @@ Rust-specific; Rust is simply what these examples are written in.
 The fixtures are the interesting reading if you want to know what pm does when
 a plugin misbehaves: `greedy` asks for more than it published, `runaway` never
 returns, `nameless` cannot be attributed, `wasi` wants more of the host than pm
-lends anybody, and `scanner` contributes run-time grants from a file type pm has
+lends anybody, `launcher` names programs it never listed, and `scanner` contributes run-time grants from a file type pm has
 no grammar for.
 
 ## Three things the systemd plugins are worth reading for
